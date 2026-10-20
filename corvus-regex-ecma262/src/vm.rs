@@ -646,6 +646,10 @@ impl Program {
                 return None;
             }
             tried = Some(s);
+            if sets.len() == 1 {
+                // Every occurrence in the rest of the loop's run walks back to the start just tried.
+                next = next.max(self.end_of_run::<T>(&sets[0], input, q));
+            }
         }
     }
 
