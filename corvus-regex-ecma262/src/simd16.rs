@@ -40,10 +40,18 @@ impl UnitSet {
         self.ranges[..self.n as usize].iter().any(|&(lo, len)| u.wrapping_sub(lo) <= len)
     }
 
-    /// The first unit at or after `from` in the set.
-    #[inline]
+    /// The first unit at or after `from` in the set. The few units looked at first are looked at here, inline, since
+    /// where the set's units are common (a class of letters) the search ends there; the vector search is called past
+    /// them.
+    #[inline(always)]
     pub(crate) fn find(&self, units: &[u16], from: usize) -> Option<usize> {
-        let probe = units.get(from..)?.iter().take(PROBE).position(|&u| self.contains(u));
+        let probe = if self.n == 1 && self.ranges[0].1 == 0 {
+            // One unit: compared for equality.
+            let one = self.ranges[0].0;
+            units.get(from..)?.iter().take(PROBE).position(|&u| u == one)
+        } else {
+            units.get(from..)?.iter().take(PROBE).position(|&u| self.contains(u))
+        };
         if let Some(i) = probe {
             return Some(from + i);
         }
@@ -51,6 +59,12 @@ impl UnitSet {
         if at >= units.len() {
             return None;
         }
+        self.find_far(units, at)
+    }
+
+    /// [`UnitSet::find`] past the units it looks at first.
+    #[inline]
+    fn find_far(&self, units: &[u16], at: usize) -> Option<usize> {
         #[cfg(target_arch = "x86_64")]
         if self.ranges[..self.n as usize].iter().all(|&(_, len)| len == 0) {
             // Single units: compared for equality, as `memchr` does.
@@ -121,23 +135,37 @@ fn tail(units: &[u16], from: usize, hit: impl Fn(u16) -> bool) -> Option<usize> 
 /// The first `i` at or after `from` with `units[i + ia] == a` and `units[i + ib] == b`, `i` at most `last` (with
 /// `last + max(ia, ib) < units.len()`).
 #[inline]
-fn find_pair(units: &[u16], from: usize, last: usize, a: u16, ia: usize, b: u16, ib: usize) -> Option<usize> {
+#[allow(clippy::too_many_arguments)]
+fn find_pair(
+    units: &[u16],
+    from: usize,
+    last: usize,
+    a: u16,
+    ia: usize,
+    b: u16,
+    ib: usize,
+    needle: &[u16],
+) -> Option<usize> {
+    let rest = |from: usize| (from..=last).find(|&i| units[i..i + needle.len()] == *needle);
     #[cfg(target_arch = "x86_64")]
     {
         let at = if std::is_x86_feature_detected!("avx2") {
             // SAFETY: the processor has AVX2.
-            unsafe { x86::pair_avx2(units, from, last, a, ia, b, ib) }
+            unsafe { x86::pair_avx2(units, from, last, a, ia, b, ib, needle) }
         } else {
             // SAFETY: SSE2 is part of x86-64.
-            unsafe { x86::pair_sse2(units, from, last, a, ia, b, ib) }
+            unsafe { x86::pair_sse2(units, from, last, a, ia, b, ib, needle) }
         };
         match at {
             Ok(found) => return found,
-            Err(rest) => return (rest..=last).find(|&i| units[i + ia] == a && units[i + ib] == b),
+            Err(next) => return rest(next),
         }
     }
     #[allow(unreachable_code)]
-    (from..=last).find(|&i| units[i + ia] == a && units[i + ib] == b)
+    {
+        let _ = (a, ia, b, ib);
+        rest(from)
+    }
 }
 
 /// The vector kernels. Each returns `Ok` with what it found in the blocks it read, or `Err` with where the blocks
@@ -297,8 +325,21 @@ mod x86 {
                 ia: usize,
                 b: u16,
                 ib: usize,
+                needle: &[u16],
             ) -> Result<Option<usize>, usize> {
                 let (va, vb) = ($set1(a as i16), $set1(b as i16));
+                // Each candidate of a block is compared with the needle here, without leaving the kernel.
+                let hit = |at: usize, m: u32| -> Option<usize> {
+                    let mut m = m & 0x5555_5555;
+                    while m != 0 {
+                        let i = at + (m.trailing_zeros() / 2) as usize;
+                        if units[i..i + needle.len()].iter().zip(needle).all(|(x, y)| x == y) {
+                            return Some(i);
+                        }
+                        m &= m - 1;
+                    }
+                    None
+                };
                 let p = units.as_ptr();
                 let mut at = from;
                 // One unaligned block, then the first unit's loads on vector boundaries.
@@ -307,8 +348,10 @@ mod x86 {
                     let (x, y) =
                         unsafe { ($loadu(p.add(at + ia).cast::<$vec>()), $loadu(p.add(at + ib).cast::<$vec>())) };
                     let m = $movemask($and($cmpeq(x, va), $cmpeq(y, vb))) as u32;
-                    if m != 0 {
-                        return Ok(Some(at + (m.trailing_zeros() / 2) as usize));
+                    if m != 0
+                        && let Some(i) = hit(at, m)
+                    {
+                        return Ok(Some(i));
                     }
                     let misaligned = (p as usize + 2 * (at + ia)) & (2 * $lanes - 1);
                     at += $lanes - misaligned / 2;
@@ -318,8 +361,10 @@ mod x86 {
                     let (x, y) =
                         unsafe { ($loadu(p.add(at + ia).cast::<$vec>()), $loadu(p.add(at + ib).cast::<$vec>())) };
                     let m = $movemask($and($cmpeq(x, va), $cmpeq(y, vb))) as u32;
-                    if m != 0 {
-                        return Ok(Some(at + (m.trailing_zeros() / 2) as usize));
+                    if m != 0
+                        && let Some(i) = hit(at, m)
+                    {
+                        return Ok(Some(i));
                     }
                     at += $lanes;
                 }
@@ -504,6 +549,8 @@ pub(crate) struct Needle16 {
     needle: Vec<u16>,
     ia: usize,
     ib: usize,
+    /// The search for a needle of one unit.
+    one: UnitSet,
 }
 
 impl Needle16 {
@@ -515,12 +562,14 @@ impl Needle16 {
                 ia = k;
             }
         }
-        // The second is the rarest of the others, a unit other than the first where there is one.
+        // The second is the rarest of the others, a unit other than the first where there is one, and of those as
+        // rare the furthest from it (a pair of neighbours, such as the t and h of "the", is common in text).
         let ib = (0..needle.len())
             .filter(|&k| k != ia)
-            .min_by_key(|&k| (needle[k] == needle[ia], rank(needle[k]), k))
+            .min_by_key(|&k| (needle[k] == needle[ia], rank(needle[k]), usize::MAX - k.abs_diff(ia)))
             .unwrap_or(ia);
-        Needle16 { needle, ia, ib }
+        let one = UnitSet::new(&[(needle[0], needle[0])]).expect("one range");
+        Needle16 { needle, ia, ib, one }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -532,25 +581,14 @@ impl Needle16 {
     pub(crate) fn find(&self, units: &[u16], from: usize) -> Option<usize> {
         let n = self.needle.len();
         if n == 1 {
-            let u = self.needle[0];
-            return UnitSet::new(&[(u, u)]).and_then(|s| s.find(units, from));
+            return self.one.find(units, from);
         }
         if from + n > units.len() {
             return None;
         }
         let last = units.len() - n;
         let (a, b) = (self.needle[self.ia], self.needle[self.ib]);
-        let mut at = from;
-        loop {
-            let i = find_pair(units, at, last, a, self.ia, b, self.ib)?;
-            if units[i..i + n] == self.needle[..] {
-                return Some(i);
-            }
-            at = i + 1;
-            if at > last {
-                return None;
-            }
-        }
+        find_pair(units, from, last, a, self.ia, b, self.ib, &self.needle)
     }
 }
 
@@ -628,10 +666,10 @@ mod tests {
                     let last = t.len() - needle.len();
                     let (a, b) = (needle[0], needle[needle.len() - 1]);
                     let ib = needle.len() - 1;
-                    let want = (0..=last).find(|&i| t[i] == a && t[i + ib] == b);
-                    match unsafe { x86::pair_sse2(&t, 0, last, a, 0, b, ib) } {
+                    let want = (0..=last).find(|&i| t[i..].starts_with(&needle));
+                    match unsafe { x86::pair_sse2(&t, 0, last, a, 0, b, ib, &needle) } {
                         Ok(found) => assert_eq!(found, want, "pair sse2 seed {seed}"),
-                        Err(rest) => assert_eq!((rest..=last).find(|&i| t[i] == a && t[i + ib] == b), want),
+                        Err(rest) => assert_eq!((rest..=last).find(|&i| t[i..].starts_with(&needle)), want),
                     }
                 }
             }
