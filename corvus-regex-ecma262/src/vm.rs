@@ -395,10 +395,14 @@ impl Program {
     #[inline]
     fn next_member<T: Text>(&self, set: &CharSet, input: &[T::Unit], mut at: usize) -> Option<(usize, usize)> {
         let first_bytes = if T::UTF8 { self.search.first_bytes.as_ref() } else { None };
+        let first_units = if T::UTF8 { None } else { self.search.first_units.as_ref() };
         let bytes = T::bytes(input);
+        let units16 = T::units16(input);
         loop {
             if let Some(fb) = first_bytes {
                 at = fb.find(bytes, at)?;
+            } else if let Some(fu) = first_units {
+                at = fu.find(units16, at)?;
             }
             if at >= input.len() {
                 return None;
@@ -577,11 +581,15 @@ impl Program {
         let search = &self.search;
         let mut at = start;
         let first_bytes = if T::UTF8 { search.first_bytes.as_ref() } else { None };
+        let first_units = if T::UTF8 { None } else { search.first_units.as_ref() };
         let bytes = T::bytes(input);
+        let units16 = T::units16(input);
         loop {
             if let Some(fb) = first_bytes {
                 // Every match starts with a member of the first set, which starts with one of these bytes.
                 at = fb.find(bytes, at)?;
+            } else if let Some(fu) = first_units {
+                at = fu.find(units16, at)?;
             }
             if len - at < need {
                 return None;
@@ -1127,7 +1135,19 @@ impl Program {
                         }
                         // Give back the last character taken. The characters between a and pos were decoded going
                         // forward, and decoding the last of them going backward finds the same boundary.
-                        let at = e.pos - T::give_back(input, e.a, e.pos, units);
+                        let mut at = e.pos - T::give_back(input, e.a, e.pos, units);
+                        if T::UTF8 && !rep.back.is_empty() && at > e.a && !quick[e.pc as usize].allows(input, at) {
+                            // What follows the loop can only start with one of a few ASCII bytes: the last of them
+                            // before here is found by memrchr, and the positions after it are passed over at once.
+                            let run = &T::bytes(input)[e.a..at];
+                            let found = match rep.back[..] {
+                                [x] => memchr::memrchr(x, run),
+                                [x, y] => memchr::memrchr2(x, y, run),
+                                [x, y, z] => memchr::memrchr3(x, y, z, run),
+                                _ => None,
+                            };
+                            at = e.a + found.unwrap_or(0);
+                        }
                         stack[top].pos = at;
                         (pc, pos) = (e.pc as usize, at);
                         let last = at <= e.a;

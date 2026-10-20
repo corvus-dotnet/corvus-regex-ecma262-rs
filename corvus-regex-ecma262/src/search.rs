@@ -138,10 +138,12 @@ impl memchr::arch::all::packedpair::HeuristicFrequencyRank for Utf16Rank {
 pub(crate) struct Literals {
     utf8: Finder,
     utf16: Finder,
-    /// Every literal is ASCII, so over UTF-16 the low bytes of the units are packed into bytes and searched for by the
-    /// UTF-8 search (a unit beyond ASCII packs to 0x80, which no literal holds), as the .NET reference engine's packed
-    /// fingerprint search does: the zero high bytes of ASCII units are then not looked at.
-    ascii: bool,
+    /// The search over UTF-16 of packed units, for several literals whose units are ASCII or among a few others: the
+    /// units of a chunk of text are packed into bytes (an ASCII unit as itself, one of the few others as a byte of its
+    /// own from 0x81 on, any other as 0x80, which no literal holds) and the packed literals searched for, as the .NET
+    /// reference engine's packed fingerprint search does, so that the zero high bytes of ASCII units are not looked at.
+    /// (One literal is found by `memmem` over the units' bytes, ranked for UTF-16.)
+    packed: Option<(Finder, Vec<(u16, u8)>)>,
     /// The most code units of a literal.
     longest: usize,
 }
@@ -157,12 +159,40 @@ impl Literals {
         let utf8: Vec<Vec<u8>> = literals.iter().map(|l| as_string(l).into_bytes()).collect();
         let utf16: Vec<Vec<u8>> =
             literals.iter().map(|l| as_string(l).encode_utf16().flat_map(u16::to_ne_bytes).collect()).collect();
-        let ascii = literals.iter().all(|l| l.iter().all(|&r| r < 0x80));
-        let longest = literals.iter().map(Vec::len).max().unwrap_or(0);
+        let longest = literals.iter().map(|l| as_string(l).encode_utf16().count()).max().unwrap_or(0);
+        let mut map: Vec<(u16, u8)> = Vec::new();
+        let mut packable = literals.len() > 1 && longest < 64;
+        let packed_literals: Vec<Vec<u8>> = literals
+            .iter()
+            .map(|l| {
+                as_string(l)
+                    .encode_utf16()
+                    .map(|u| {
+                        if u < 0x80 {
+                            return u as u8;
+                        }
+                        if let Some(&(_, b)) = map.iter().find(|(m, _)| *m == u) {
+                            return b;
+                        }
+                        if map.len() >= 64 {
+                            packable = false;
+                            return 0x80;
+                        }
+                        let b = 0x81 + map.len() as u8;
+                        map.push((u, b));
+                        b
+                    })
+                    .collect()
+            })
+            .collect();
+        // Packing pays for ASCII literals: a unit beyond them is then one compare away from its byte. Measured, a map of
+        // even two units (the long s and the Kelvin sign of a case-insensitive literal) made the search slower than the
+        // fingerprint search over the units' bytes, and a Cyrillic literal's map made it twenty times slower.
+        let packed = (packable && map.is_empty()).then(|| (Finder::new(&packed_literals, fingerprint, false), map));
         Literals {
             utf8: Finder::new(&utf8, fingerprint, false),
             utf16: Finder::new(&utf16, fingerprint, true),
-            ascii,
+            packed,
             longest,
         }
     }
@@ -180,8 +210,8 @@ impl Literals {
         if utf8 {
             return self.utf8.find(bytes, from);
         }
-        if self.ascii && self.longest < PACK {
-            return self.find_packed(bytes, from);
+        if let Some((finder, map)) = &self.packed {
+            return self.find_packed(finder, map, bytes, from);
         }
         let mut at = 2 * from;
         loop {
@@ -196,20 +226,35 @@ impl Literals {
     /// The search over UTF-16 for ASCII literals: the low bytes of a chunk of units packed into bytes, searched by the
     /// UTF-8 search. An occurrence that starts so near the end of a chunk that a longer one could start before it and
     /// end beyond the chunk is looked for again in the next chunk, which starts that far back.
-    fn find_packed(&self, bytes: &[u8], from: usize) -> Option<(usize, usize)> {
-        let units = bytes.len() / 2;
+    fn find_packed(&self, finder: &Finder, map: &[(u16, u8)], bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+        // SAFETY: the bytes are those of a slice of u16 (`Text::bytes` of UTF-16 text), so they are aligned for u16
+        // and their length is even.
+        let text: &[u16] = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u16>(), bytes.len() / 2) };
+        let units = text.len();
         let overlap = self.longest.saturating_sub(1);
         let mut buf = [0u8; PACK];
         let mut at = from;
+        // The first chunk is small, and each is four times the one before, so a search whose occurrence is near
+        // packs little more than it reads.
+        let mut size = 64;
         while at <= units {
-            let end = (at + PACK).min(units);
-            for (k, slot) in buf[..end - at].iter_mut().enumerate() {
-                let i = 2 * (at + k);
-                let u = u16::from_ne_bytes([bytes[i], bytes[i + 1]]);
-                *slot = if u < 0x80 { u as u8 } else { 0x80 };
+            let end = (at + size).min(units);
+            size = (size * 4).min(PACK);
+            // A unit beyond ASCII packs to 0x80; the loop is one the compiler makes into vector instructions.
+            for (slot, &u) in buf[..end - at].iter_mut().zip(&text[at..end]) {
+                *slot = u.min(0x80) as u8;
+            }
+            if !map.is_empty() {
+                for (slot, &u) in buf[..end - at].iter_mut().zip(&text[at..end]) {
+                    if u >= 0x80
+                        && let Some(&(_, b)) = map.iter().find(|(m, _)| *m == u)
+                    {
+                        *slot = b;
+                    }
+                }
             }
             let last = end == units;
-            if let Some((s, e)) = self.utf8.find(&buf[..end - at], 0)
+            if let Some((s, e)) = finder.find(&buf[..end - at], 0)
                 && (last || s < end - at - overlap)
             {
                 return Some((at + s, at + e));
@@ -339,6 +384,8 @@ pub(crate) struct Search {
     pub(crate) first_bytes: Option<FirstBytes>,
     /// The shape of a pattern the search answers without the matcher (see [`Shape`]).
     pub(crate) shape: Shape,
+    /// The code units a match can start with over UTF-16, where they can be tested for many at a time.
+    pub(crate) first_units: Option<FirstUnits>,
 }
 
 /// A search for any of a few bytes: `memchr` for up to three, and the fingerprint search of one-byte literals for
@@ -351,6 +398,65 @@ pub(crate) enum FirstBytes {
     /// The fingerprint search, and the bytes as a table for the few bytes looked at before it is called: where the
     /// bytes are common a call costs more than it passes over.
     Packed(packed::Searcher, Box<[bool; 256]>),
+}
+
+/// A test for the code units a match can start with over UTF-16: up to four ranges of ASCII units, and with `wide` every
+/// unit beyond ASCII (which the first set then has a member among). Sixteen units are tested at once, in a loop the
+/// compiler makes into vector instructions, and a candidate is then tested against the first set itself.
+#[derive(Clone, Debug)]
+pub(crate) struct FirstUnits {
+    ranges: [(u16, u16); 4],
+    wide: bool,
+}
+
+impl FirstUnits {
+    fn new(set: &CharSet) -> Option<FirstUnits> {
+        let mut ranges = [(u16::MAX, 0u16); 4];
+        let mut n = 0;
+        let mut wide = false;
+        for &[lo, hi] in set.ranges.as_chunks::<2>().0 {
+            if hi >= 0x80 {
+                wide = true;
+            }
+            if lo < 0x80 {
+                if n == 4 {
+                    return None;
+                }
+                ranges[n] = (lo as u16, (hi.min(0x7F) - lo) as u16);
+                n += 1;
+            }
+        }
+        Some(FirstUnits { ranges, wide })
+    }
+
+    #[inline(always)]
+    fn hit(&self, u: u16) -> bool {
+        let r = &self.ranges;
+        (self.wide & (u >= 0x80))
+            | (u.wrapping_sub(r[0].0) <= r[0].1)
+            | (u.wrapping_sub(r[1].0) <= r[1].1)
+            | (u.wrapping_sub(r[2].0) <= r[2].1)
+            | (u.wrapping_sub(r[3].0) <= r[3].1)
+    }
+
+    /// The first unit at or after `from` that can begin a match.
+    #[inline]
+    pub(crate) fn find(&self, units: &[u16], from: usize) -> Option<usize> {
+        // Where the units are common a few are looked at one by one first.
+        let probe = units.get(from..)?.iter().take(8).position(|&u| self.hit(u));
+        if let Some(i) = probe {
+            return Some(from + i);
+        }
+        let mut at = from + 8;
+        while at + 16 <= units.len() {
+            let chunk: &[u16; 16] = units[at..at + 16].try_into().expect("sixteen units");
+            if chunk.iter().fold(false, |any, &u| any | self.hit(u)) {
+                break;
+            }
+            at += 16;
+        }
+        units.get(at..)?.iter().position(|&u| self.hit(u)).map(|i| at + i)
+    }
 }
 
 /// The bytes looked at one by one before the fingerprint search is called.
@@ -669,7 +775,11 @@ pub(crate) fn plan(root: &Node, backrefs: bool, first: Option<&CharSet>, units: 
     if NO_SEARCH.with(std::cell::Cell::get) {
         return Search::default();
     }
-    let mut search = Search { first_bytes: first.and_then(|f| FirstBytes::new(f, units)), ..Search::default() };
+    let mut search = Search {
+        first_bytes: first.and_then(|f| FirstBytes::new(f, units)),
+        first_units: first.and_then(FirstUnits::new),
+        ..Search::default()
+    };
     let ts = terms(root);
     // A leading \b before characters that are all ASCII word characters.
     let boundary = ts.first().is_some_and(|t| t.kind == NodeKind::WordBoundary && !t.fold);

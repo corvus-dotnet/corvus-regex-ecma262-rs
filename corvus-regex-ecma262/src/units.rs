@@ -198,6 +198,8 @@ pub trait Text: Copy + 'static {
     fn encode(s: &str) -> Vec<Self::Unit>;
     /// The bytes of the text, as the searches for literals read them (the native bytes of each UTF-16 code unit).
     fn bytes(input: &[Self::Unit]) -> &[u8];
+    /// The code units of UTF-16 text (empty for UTF-8).
+    fn units16(input: &[Self::Unit]) -> &[u16];
 
     /// The character at the position: a code unit with `units` set, and a code point otherwise.
     #[inline(always)]
@@ -335,6 +337,11 @@ impl Text for Utf8 {
     fn bytes(input: &[u8]) -> &[u8] {
         input
     }
+
+    #[inline(always)]
+    fn units16(_: &[u8]) -> &[u16] {
+        &[]
+    }
 }
 
 /// Whether the position is the one between the halves of a character of four bytes: its third byte.
@@ -444,6 +451,11 @@ impl Text for Utf16 {
     fn bytes(input: &[u16]) -> &[u8] {
         // SAFETY: a u16 is two initialised bytes with no padding, and a u8 has no alignment to keep.
         unsafe { std::slice::from_raw_parts(input.as_ptr().cast::<u8>(), 2 * input.len()) }
+    }
+
+    #[inline(always)]
+    fn units16(input: &[u16]) -> &[u16] {
+        input
     }
 }
 

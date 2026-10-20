@@ -73,6 +73,9 @@ pub(crate) struct Inst {
     /// The literal run of a `Lit`, in UTF-8 and in UTF-16.
     pub lit: Box<[u8]>,
     pub lit16: Box<[u16]>,
+    /// For a `Rep`, the ASCII bytes (up to three) what follows it can start with, when those are all it can start
+    /// with: its give-back looks for them with memrchr (see `set_back`).
+    pub back: Box<[u8]>,
     /// `x` and `y` are jump targets.
     pub x: i32,
     pub y: i32,
@@ -105,6 +108,7 @@ impl Inst {
             set: None,
             lit: Box::default(),
             lit16: Box::default(),
+            back: Box::default(),
             x: 0,
             y: 0,
             a: 0,
@@ -229,6 +233,7 @@ pub(crate) fn compile_program(root: Node, unicode: bool, groups: Option<usize>) 
     let mut insts = c.insts;
     let (need, need16) = set_needs(&mut insts);
     let quick = set_quick(&insts);
+    set_back(&mut insts, &quick);
     let mut p = Program {
         insts,
         groups: c.tracked.len(),
@@ -994,6 +999,24 @@ pub(crate) fn quicks(insts: &[Inst]) -> (Vec<Quick>, usize) {
         }
     }
     (q, passes)
+}
+
+/// Gives each greedy single-character loop the ASCII bytes what follows it can start with, when there are one to three
+/// and nothing else can follow: the vectorised give-back of the .NET reference engine.
+fn set_back(insts: &mut [Inst], quick: &[Quick]) {
+    for pc in 0..insts.len() {
+        if insts[pc].op != Op::Rep || pc + 1 >= quick.len() {
+            continue;
+        }
+        let q = quick[pc + 1];
+        if q.other || q.mid {
+            continue;
+        }
+        let bytes: Vec<u8> = (0..0x80u8).filter(|&c| (q.ascii[(c >> 6) as usize] >> (c & 63)) & 1 != 0).collect();
+        if (1..=3).contains(&bytes.len()) {
+            insts[pc].back = bytes.into_boxed_slice();
+        }
+    }
 }
 
 /// Whether a code point can be matched by comparing its UTF-8 bytes. A surrogate has no encoding, and U+FFFD is
