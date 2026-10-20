@@ -388,7 +388,10 @@ pub(crate) fn build(root: &Node) -> Option<Anchored> {
         }
         id += 1;
     }
-    let fast = trans.iter().map(|&t| (u32::from(t & !MATCHED) << shift) | if t & MATCHED != 0 { FAST_MATCHED } else { 0 }).collect();
+    let fast = trans
+        .iter()
+        .map(|&t| (u32::from(t & !MATCHED) << shift) | if t & MATCHED != 0 { FAST_MATCHED } else { 0 })
+        .collect();
     Some(Anchored { class, shift: shift as u32, fast, at_end, starts })
 }
 

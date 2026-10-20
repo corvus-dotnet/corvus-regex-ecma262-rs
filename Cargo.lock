@@ -43,7 +43,6 @@ dependencies = [
 name = "corvus-regex-ecma262-tools"
 version = "0.0.0"
 dependencies = [
- "aho-corasick",
  "corvus-regex-ecma262",
  "flate2",
  "regex",

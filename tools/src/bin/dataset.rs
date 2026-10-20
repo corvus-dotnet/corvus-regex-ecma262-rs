@@ -12,12 +12,13 @@
 //!
 //! The judging rules are those of `Corvus.Regex.Ecma262.DatasetRunner`, the runner of the .NET engine.
 //!
-//! With `--engine regress` the `regress` crate is judged instead, on the answers of `test` (not on
-//! `captures.jsonl`): over UTF-16 by its UTF-16 search with the u or v flag and its UCS-2 search without, which is
-//! how ECMA-262 reads the text, and over UTF-8 by its search of a `str`. regress has no limit on a match, so each
-//! file is run in child processes that report each record as they go, each with its address space capped at 2 GB; a
-//! record that makes no progress for ten seconds, or whose child dies, is counted at the limit and the child is
-//! started again after it.
+//! With `--engine regress` the `regress` crate is judged instead: over UTF-16 by its UTF-16 search with the u or v
+//! flag and its UCS-2 search without, which is how ECMA-262 reads the text, and over UTF-8 by its search of a `str`.
+//! On `captures.jsonl` it is judged over UTF-16 alone (exec, the global search, the sticky flag, replace, replaceAll,
+//! split and split3), since it has no UTF-8 interface for them. regress has no limit on a match, so each file is run
+//! in child processes that report each record as they go, each with its address space capped at 2 GB; a record that
+//! makes no progress for ten seconds, or whose child dies, is counted at the limit once for every answer it would have
+//! had, and the child is started again after it.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -109,9 +110,6 @@ fn main() {
         let name = file.file_name().unwrap().to_string_lossy().to_string();
         let counts = Counts::default();
         if engine == EngineKind::Regress {
-            if name == "captures.jsonl" {
-                continue;
-            }
             supervise(file.to_str().unwrap(), encodings, &counts, &wrong_cases, &records, &skipped);
         } else {
             let text = std::fs::read_to_string(file).unwrap();
@@ -282,8 +280,11 @@ impl Engine for Regress {
 fn judge_record(name: &str, r: &Json, options: &Options, counts: &Counts, wrong: &mut Vec<String>) {
     let pattern = r.get("pattern").and_then(Json::as_string).unwrap();
     if name == "captures.jsonl" {
-        if options.utf16 && options.engine == EngineKind::Corvus {
-            judge_captures(r, &pattern, counts, wrong);
+        if options.utf16 {
+            match options.engine {
+                EngineKind::Corvus => judge_captures(r, &pattern, counts, wrong),
+                EngineKind::Regress => judge_captures_regress(r, &pattern, counts, wrong),
+            }
         }
         return;
     }
@@ -612,7 +613,10 @@ fn supervise(
     records: &AtomicI64,
     skipped: &AtomicI64,
 ) {
-    let lines = std::fs::read_to_string(file).unwrap().lines().count();
+    let text = std::fs::read_to_string(file).unwrap();
+    let all_lines: Vec<&str> = text.lines().collect();
+    let lines = all_lines.len();
+    let utf8 = matches!(encodings, "both" | "utf8");
     let name = std::path::Path::new(file).file_name().unwrap().to_string_lossy().to_string();
     // Four children, each over a quarter of the file.
     let quarter = lines.div_ceil(4);
@@ -620,6 +624,7 @@ fn supervise(
         for part in 0..4 {
             let (from, to) = (part * quarter, ((part + 1) * quarter).min(lines));
             let name = &name;
+            let all_lines = &all_lines;
             scope.spawn(move || {
                 let mut next = from;
                 while next < to {
@@ -690,9 +695,11 @@ fn supervise(
                     if finished {
                         break;
                     }
-                    // The record `current` made no progress or killed the child: counted at the limit.
+                    // The record `current` made no progress or killed the child: every answer it would have had is
+                    // unanswered (the judging rule of the test data).
                     records.fetch_add(1, Ordering::Relaxed);
-                    counts.limited.fetch_add(1, Ordering::Relaxed);
+                    let answers = json::parse(all_lines[current]).map_or(1, |r| answers_of(name, &r, utf8).max(1));
+                    counts.limited.fetch_add(answers, Ordering::Relaxed);
                     wrong_cases
                         .lock()
                         .unwrap()
@@ -702,4 +709,270 @@ fn supervise(
             });
         }
     });
+}
+
+/// The answers a record would have had from an engine that answers over UTF-16 and, with `utf8`, over UTF-8 (on
+/// `captures.jsonl`, seven over UTF-16 for each test and grammar, as regress, which has no UTF-8 interface, gives them).
+fn answers_of(name: &str, r: &Json, utf8: bool) -> i64 {
+    if r.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
+        return 0;
+    }
+    let Some(tests) = r.get("tests").and_then(Json::as_array) else { return 0 };
+    let valid = r.get("valid").unwrap();
+    let mut n = 0;
+    for t in tests {
+        if t.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
+            continue;
+        }
+        let text = t.get("text").and_then(Json::as_units).unwrap_or(&[]);
+        for (_, mode, _) in modes(r) {
+            if valid.get(mode).and_then(Json::as_bool) != Some(true) || t.get(mode).is_none() {
+                continue;
+            }
+            n += if name == "captures.jsonl" { 7 } else { 1 + i64::from(utf8 && !has_lone_surrogate(text)) };
+        }
+    }
+    n
+}
+
+/// One match of regress over UTF-16, as the groups' bounds (`None` for a group that did not take part).
+type Groups16 = Vec<Option<(usize, usize)>>;
+
+/// The named groups of one match of regress, by name.
+type Names16 = Vec<(String, Option<(usize, usize)>)>;
+
+/// regress over UTF-16: the first match at or after `from` (its UTF-16 search with the u or v flag, its UCS-2 search
+/// without).
+fn regress_exec(re: &regress::Regex, unicode: bool, text: &[u16], from: usize) -> Option<(Groups16, Names16)> {
+    if from > text.len() {
+        return None;
+    }
+    let m = if unicode { re.find_from_utf16(text, from).next() } else { re.find_from_ucs2(text, from).next() }?;
+    let groups: Groups16 = (0..m.captures.len() + 1).map(|i| m.group(i).map(|r| (r.start, r.end))).collect();
+    let names = m.named_groups().map(|(n, r)| (n.to_string(), r.map(|r| (r.start, r.end)))).collect();
+    Some((groups, names))
+}
+
+/// After an empty match at `pos`, the next position: a code point with the u or v flag, a code unit without.
+fn advance16(text: &[u16], pos: usize, unicode: bool) -> usize {
+    if unicode
+        && pos + 1 < text.len()
+        && (0xD800..=0xDBFF).contains(&text[pos])
+        && (0xDC00..=0xDFFF).contains(&text[pos + 1])
+    {
+        pos + 2
+    } else {
+        pos + 1
+    }
+}
+
+/// GetSubstitution over UTF-16.
+fn substitute16(out: &mut Vec<u16>, text: &[u16], groups: &Groups16, names: &Names16, template: &[u16]) {
+    let (from, to) = groups[0].unwrap();
+    let m = groups.len() - 1;
+    let push = |out: &mut Vec<u16>, g: Option<(usize, usize)>| {
+        if let Some((a, b)) = g {
+            out.extend_from_slice(&text[a..b]);
+        }
+    };
+    let digit = |k: usize| template.get(k).filter(|&&u| (0x30..=0x39).contains(&u)).map(|&u| (u - 0x30) as usize);
+    let mut k = 0;
+    while k < template.len() {
+        if template[k] != u16::from(b'$') || k + 1 >= template.len() {
+            out.push(template[k]);
+            k += 1;
+            continue;
+        }
+        match u8::try_from(template[k + 1]).unwrap_or(0) {
+            b'$' => {
+                out.push(template[k]);
+                k += 2;
+            }
+            b'&' => {
+                out.extend_from_slice(&text[from..to]);
+                k += 2;
+            }
+            b'`' => {
+                out.extend_from_slice(&text[..from]);
+                k += 2;
+            }
+            b'\'' => {
+                out.extend_from_slice(&text[to..]);
+                k += 2;
+            }
+            b'0'..=b'9' => {
+                let d1 = digit(k + 1).unwrap();
+                if let Some(d2) = digit(k + 2)
+                    && (1..=m).contains(&(d1 * 10 + d2))
+                {
+                    push(out, groups[d1 * 10 + d2]);
+                    k += 3;
+                } else if (1..=m).contains(&d1) {
+                    push(out, groups[d1]);
+                    k += 2;
+                } else {
+                    out.push(template[k]);
+                    k += 1;
+                }
+            }
+            b'<' => match template[k + 2..].iter().position(|&u| u == u16::from(b'>')) {
+                Some(n) if !names.is_empty() => {
+                    let name = String::from_utf16_lossy(&template[k + 2..k + 2 + n]);
+                    if let Some((_, g)) = names.iter().find(|(nm, g)| *nm == name && g.is_some()) {
+                        push(out, *g);
+                    }
+                    k += n + 3;
+                }
+                _ => {
+                    out.push(template[k]);
+                    k += 1;
+                }
+            },
+            _ => {
+                out.push(template[k]);
+                k += 1;
+            }
+        }
+    }
+}
+
+/// Judges regress on `captures.jsonl` over UTF-16 (it has no UTF-8 interface): exec, the global search, the sticky
+/// flag (a match at 1, which regress has no flag for, is its leftmost match from 1 when that starts at 1), replace,
+/// replaceAll, split and split3, each one answer. A panic is an error.
+fn judge_captures_regress(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<String>) {
+    let flags = r.get("flags").and_then(Json::as_string).unwrap();
+    let valid = r.get("valid").unwrap();
+    let shown = escape(&pattern.encode_utf16().collect::<Vec<u16>>());
+    let Some(tests) = r.get("tests").and_then(Json::as_array) else { return };
+    let template: Vec<u16> = REPLACEMENT.encode_utf16().collect();
+    for t in tests {
+        if t.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
+            continue;
+        }
+        let text = t.get("text").and_then(Json::as_units).unwrap();
+        for mode in ["unicode", "legacy"] {
+            if valid.get(mode).and_then(Json::as_bool) != Some(true) {
+                continue;
+            }
+            let Some(a) = t.get(mode) else { continue };
+            let unicode = mode == "unicode";
+            let mode_flags = if unicode { format!("{flags}u") } else { flags.clone() };
+            let where_ = format!("/{shown}/{mode_flags}\t{}", escape(text));
+            let Ok(Ok(re)) = std::panic::catch_unwind(|| regress::Regex::with_flags(pattern, mode_flags.as_str()))
+            else {
+                counts.refused.fetch_add(1, Ordering::Relaxed);
+                wrong.push(format!("REFUSED\tcaptures.jsonl\t{where_}"));
+                continue;
+            };
+            let judged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut results: Vec<(&str, bool)> = Vec::new();
+                let same = |e: &Exec, g: &Option<Groups16>| -> bool {
+                    match (e, g) {
+                        (None, None) => true,
+                        (Some(e), Some(g)) => e == g,
+                        _ => false,
+                    }
+                };
+                let exec = regress_exec(&re, unicode, text, 0);
+                results.push(("exec", same(&exec_of(a.get("exec").unwrap()), &exec.as_ref().map(|x| x.0.clone()))));
+                // The global search.
+                let all: Vec<Exec> = a.get("all").and_then(Json::as_array).unwrap().iter().map(exec_of).collect();
+                let mut found: Vec<Groups16> = Vec::new();
+                let mut pos = 0;
+                while found.len() < 20 {
+                    let Some((g, _)) = regress_exec(&re, unicode, text, pos) else { break };
+                    let (s, e) = g[0].unwrap();
+                    pos = if s == e { advance16(text, e, unicode) } else { e };
+                    found.push(g);
+                }
+                let ok_all = if all.len() < 20 { found.len() == all.len() } else { found.len() >= 20 }
+                    && all.iter().zip(&found).all(|(e, g)| e.as_ref() == Some(g));
+                results.push(("all", ok_all));
+                if !text.is_empty() {
+                    let sticky = regress_exec(&re, unicode, text, 1).filter(|(g, _)| g[0].unwrap().0 == 1).map(|x| x.0);
+                    results.push(("sticky", same(&exec_of(a.get("sticky").unwrap()), &sticky)));
+                }
+                // replace and replaceAll.
+                for (what, global) in [("replace", false), ("replaceAll", true)] {
+                    let mut out = Vec::new();
+                    let (mut last, mut pos) = (0, 0);
+                    while let Some((g, names)) = regress_exec(&re, unicode, text, pos) {
+                        let (s, e) = g[0].unwrap();
+                        out.extend_from_slice(&text[last..s]);
+                        substitute16(&mut out, text, &g, &names, &template);
+                        last = e;
+                        if !global {
+                            break;
+                        }
+                        pos = if s == e { advance16(text, e, unicode) } else { e };
+                    }
+                    out.extend_from_slice(&text[last..]);
+                    results.push((what, a.get(what).and_then(Json::as_units).unwrap() == out));
+                }
+                // split and split3.
+                for (what, limit) in [("split", u32::MAX as usize), ("split3", 3)] {
+                    let mut out: Vec<Option<Vec<u16>>> = Vec::new();
+                    let size = text.len();
+                    if size == 0 {
+                        if regress_exec(&re, unicode, text, 0).is_none() {
+                            out.push(Some(Vec::new()));
+                        }
+                    } else {
+                        let (mut p, mut q) = (0, 0);
+                        'split: while q < size {
+                            let Some((g, _)) = regress_exec(&re, unicode, text, q) else { break };
+                            let (s, e) = g[0].unwrap();
+                            if s >= size {
+                                break;
+                            }
+                            if e.min(size) == p {
+                                q = advance16(text, s, unicode);
+                                continue;
+                            }
+                            out.push(Some(text[p..s].to_vec()));
+                            if out.len() == limit {
+                                break 'split;
+                            }
+                            p = e.min(size);
+                            for c in &g[1..] {
+                                out.push(c.map(|(x, y)| text[x..y].to_vec()));
+                                if out.len() == limit {
+                                    break 'split;
+                                }
+                            }
+                            q = p;
+                        }
+                        if out.len() < limit {
+                            out.push(Some(text[p..].to_vec()));
+                        }
+                    }
+                    let expected = a.get(what).and_then(Json::as_array).unwrap();
+                    let ok = expected.len() == out.len()
+                        && expected.iter().zip(&out).all(|(e, g)| match (e, g) {
+                            (Json::Null, None) => true,
+                            (Json::String(x), Some(y)) => x == y,
+                            _ => false,
+                        });
+                    results.push((what, ok));
+                }
+                results
+            }));
+            match judged {
+                Ok(results) => {
+                    for (what, ok) in results {
+                        if ok {
+                            counts.right.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            counts.wrong.fetch_add(1, Ordering::Relaxed);
+                            wrong.push(format!("WRONG\tcaptures.jsonl\t{where_}\t{what}"));
+                        }
+                    }
+                }
+                Err(_) => {
+                    counts.errors.fetch_add(1, Ordering::Relaxed);
+                    wrong.push(format!("ERROR\tcaptures.jsonl\t{where_}\tpanic"));
+                }
+            }
+        }
+    }
 }

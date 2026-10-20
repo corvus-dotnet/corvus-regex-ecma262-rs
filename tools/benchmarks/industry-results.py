@@ -39,20 +39,27 @@ workloads = json.load(open(args.workloads or os.path.join(root, "tools", "benchm
 ids = [w["id"] for w in workloads]
 
 
-def compliance(path):
-    """The counts of a data-set runner's last line of counts."""
+def compliance(path, note=None):
+    """The counts of a data-set runner's last line of counts. Every answer the engine never gave (a limit, a crash, a
+    hang or a worker that gave up) is in `limited`, as the judging rule of the test data counts it: the runner's
+    limit and errors."""
     lines = [l for l in open(path, encoding="utf-8").read().splitlines() if l.startswith("records ")]
     if not lines:
         raise SystemExit(f"{path} has no line of counts")
-    c = {k: int(v) for k, v in re.findall(r"(right|wrong|refused-valid|accepted-invalid|limit) (\d+)", lines[-1])}
-    return {"right": c["right"], "wrong": c["wrong"], "refused": c["refused-valid"], "acceptedInvalid": c["accepted-invalid"]}
+    c = {k: int(v) for k, v in re.findall(r"(right|wrong|refused-valid|accepted-invalid|limit|errors) (\d+)", lines[-1])}
+    out = {"right": c["right"], "wrong": c["wrong"], "refused": c["refused-valid"], "acceptedInvalid": c["accepted-invalid"],
+           "limited": c.get("limit", 0) + c.get("errors", 0)}
+    if note:
+        out["note"] = note
+    return out
 
 
 ENGINES = [
     ("corvus-utf8", "corvus-regex-ecma262 UTF-8", "Rust", facts.get("corvus-regex-ecma262", ""), compliance(args.compliance_corvus)),
     ("corvus-utf16", "corvus-regex-ecma262 UTF-16", "Rust", facts.get("corvus-regex-ecma262", ""), compliance(args.compliance_corvus)),
     ("regex", "regex", "Rust", facts.get("regex", ""), "not ECMA-262"),
-    ("regress", "regress", "Rust", facts.get("regress", ""), compliance(args.compliance_regress)),
+    ("regress", "regress", "Rust", facts.get("regress", ""), compliance(args.compliance_regress,
+        "captures.jsonl is judged over UTF-16 only, since regress has no UTF-8 interface")),
 ]
 results = {}
 for key, name, _, _, _ in ENGINES:
