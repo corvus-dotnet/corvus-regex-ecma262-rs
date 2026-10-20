@@ -1,0 +1,75 @@
+# Build, clippy (warnings denied), the tests, the ECMA-262 test data and the C smoke test, on Linux and Windows. The
+# data (github.com/corvus-dotnet/ecma262-regex-test-data) is pinned to a commit; the pass is 0 wrong answers, 0
+# refusals of a valid pattern, 0 acceptances of an invalid one and 0 matches at their limit, in both encodings.
+name: ci
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+  schedule:
+  - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
+    - name: Install the toolchain of rust-toolchain.toml
+      run: rustup show
+    - name: Format
+      if: runner.os == 'Linux'
+      run: cargo fmt --all --check
+    - name: Build
+      run: cargo build -j 4 --workspace --all-targets
+    - name: Clippy
+      run: cargo clippy -j 4 --workspace --all-targets -- -D warnings
+    - name: Test
+      run: cargo test -j 4 --workspace
+    - name: Test with the memory of failed places from the first step
+      if: runner.os == 'Linux'
+      run: cargo test -j 4 -p corvus-regex-ecma262
+      env:
+        RUSTFLAGS: --cfg corvus_memo_from_the_start
+        CARGO_TARGET_DIR: target/memo
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        repository: corvus-dotnet/ecma262-regex-test-data
+        ref: 41ed6db477c0d57192673a3a1a76a3b7a194603b
+        path: ecma262-regex-test-data
+        persist-credentials: false
+    - name: Run the ECMA-262 test data
+      run: cargo run -j 4 --release --bin dataset -- ecma262-regex-test-data/data wrong-cases.tsv
+    - name: Run the ECMA-262 test data with the memory of failed places from the first step
+      if: runner.os == 'Linux'
+      run: cargo run -j 4 --release --bin dataset -- ecma262-regex-test-data/data wrong-cases-memo.tsv
+      env:
+        RUSTFLAGS: --cfg corvus_memo_from_the_start
+        CARGO_TARGET_DIR: target/memo
+    - name: Keep the wrong cases
+      if: failure()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: wrong-cases-${{ matrix.os }}
+        path: wrong-cases*.tsv
+    - name: Build the C library
+      run: cargo build -j 4 --release -p corvus-regex-ecma262-capi
+    - name: The C smoke test
+      shell: bash
+      run: |
+        cmake -S corvus-regex-ecma262-capi/tests/native -B build/native -DCRE_LIB_DIR="$PWD/target/release"
+        cmake --build build/native --config Release
+        ctest --test-dir build/native -C Release --output-on-failure

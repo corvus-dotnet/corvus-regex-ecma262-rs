@@ -15,8 +15,9 @@
 //! With `--engine regress` the `regress` crate is judged instead, on the answers of `test` (not on
 //! `captures.jsonl`): over UTF-16 by its UTF-16 search with the u or v flag and its UCS-2 search without, which is
 //! how ECMA-262 reads the text, and over UTF-8 by its search of a `str`. regress has no limit on a match, so each
-//! file is run in a child process that reports each record as it goes; a record that makes no progress for ten
-//! seconds is counted at the limit and the child is started again after it.
+//! file is run in child processes that report each record as they go, each with its address space capped at 2 GB; a
+//! record that makes no progress for ten seconds, or whose child dies, is counted at the limit and the child is
+//! started again after it.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -622,11 +623,22 @@ fn supervise(
             scope.spawn(move || {
                 let mut next = from;
                 while next < to {
-                    let mut child = Command::new(std::env::current_exe().unwrap())
-                        .args(["--worker", file, &next.to_string(), encodings])
-                        .stdout(Stdio::piped())
-                        .spawn()
-                        .unwrap();
+                    let exe = std::env::current_exe().unwrap();
+                    let next_text = next.to_string();
+                    let worker_args = ["--worker", file, &next_text, encodings];
+                    // regress has no limit on a match, and some patterns take memory until the process is stopped:
+                    // the child's address space is capped (2 GB), and a child that dies counts its record at the
+                    // limit.
+                    let mut command = if cfg!(unix) {
+                        let mut c = Command::new("sh");
+                        c.arg("-c").arg("ulimit -v 2097152 && exec \"$0\" \"$@\"").arg(&exe).args(worker_args);
+                        c
+                    } else {
+                        let mut c = Command::new(&exe);
+                        c.args(worker_args);
+                        c
+                    };
+                    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
                     let stdout = child.stdout.take().unwrap();
                     let (tx, rx) = std::sync::mpsc::channel::<String>();
                     std::thread::spawn(move || {

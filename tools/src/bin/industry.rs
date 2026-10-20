@@ -176,7 +176,7 @@ fn first_line(cmd: &str, args: &[&str]) -> String {
 }
 
 /// What the run is: the host, the compiler, the affinity, the load and the commit, read from the run itself.
-fn facts() -> String {
+fn facts(seconds: &str, passes: &str) -> String {
     let cpu = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|c| {
@@ -206,6 +206,8 @@ fn facts() -> String {
         ("rustc", env!("CORVUS_RUSTC_VERSION").to_string()),
         ("commit", first_line("git", &["rev-parse", "HEAD"])),
         ("date", first_line("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])),
+        ("seconds", seconds.to_string()),
+        ("passes", passes.to_string()),
     ];
     let body: Vec<String> = fields.iter().map(|(k, v)| format!("{}:{}", quote(k), quote(v))).collect();
     format!("{{{}}}", body.join(","))
@@ -226,7 +228,7 @@ fn main() {
     let passes = opt("--passes").unwrap_or_else(|| "5".into());
     let filter = opt("--filter");
     let all = workloads(path);
-    let facts = facts();
+    let facts = facts(&seconds, &passes);
     let mut results: Vec<String> = Vec::new();
     for engine in &engines {
         let mut rows = Vec::new();

@@ -326,3 +326,8 @@ pub(crate) fn valid(pattern: &str) -> bool {
 pub(crate) fn check(pattern: &str) -> Result<Facts, Error> {
     on_a_deep_stack(pattern, || read(pattern).map(|(_, facts, _)| facts)).unwrap_or(Err(NO_DEEP_STACK))
 }
+
+/// The examples of the README, run as tests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeExamples;
