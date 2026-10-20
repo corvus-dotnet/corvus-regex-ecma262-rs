@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["corvus-regex-ecma262"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/corvus-dotnet/corvus-regex-ecma262-rs"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+
+[profile.bench]
+codegen-units = 1
+lto = "fat"
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

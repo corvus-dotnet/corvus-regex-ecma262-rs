@@ -3,8 +3,8 @@
 //!
 //! Nothing in the engine takes Unicode properties from the Rust standard library or from the `regex` crate, because
 //! those follow the toolchain and the version of the dependency. With its own tables the crate gives the same
-//! answers whatever builds it, and the answers change only when the tables are generated again. [`VERSION`] names
-//! the version of Unicode they hold.
+//! answers whatever builds it, and the answers change only when the tables are generated again. `VERSION` in
+//! `tables_gen.rs` names the version of Unicode they hold.
 //!
 //! The tables are in `tables_gen.rs`, which `tools/gen-ucd-tables.ps1` writes from the tables of the Go module, so
 //! the ports hold the same data. Each is a sorted list of inclusive ranges, the code points up to U+FFFF as 16-bit
@@ -15,9 +15,6 @@ use std::sync::LazyLock;
 
 use super::Rune;
 use super::tables_gen as tables;
-
-#[cfg(test)]
-pub(crate) use super::tables_gen::VERSION;
 
 /// The last Unicode code point.
 pub(crate) const MAX_RUNE: Rune = 0x10FFFF;

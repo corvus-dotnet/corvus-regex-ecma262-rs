@@ -1,6 +1,7 @@
-//! Patterns that an engine answered differently from ECMA-262 at some point, with V8's answers. The patterns no
-//! other matcher takes are matched by the crate's own engine (`src/ecmaregex`), which answers each as it is
-//! written. Until 0.1.7 they were matched by the `regress` crate, which this file's classes are from:
+//! Patterns that an engine answered differently from ECMA-262 at some point, with V8's answers. They come from the
+//! engine's first home, the Corvus JSON Schema evaluator for Rust, where a pattern is read as JSON Schema reads one:
+//! with the u flag grammar, and when that refuses it, with the Annex B grammar (`json_schema` below). Until that
+//! crate's 0.1.7 they were matched by the `regress` crate, which this file's classes are from:
 //!
 //! - A repetition inside a repetition. That engine lost the iteration count of the inner one when it came back into
 //!   it by backtracking. It then gave wrong answers, and for a body that can match nothing it did not end:
@@ -19,9 +20,116 @@
 //! Every answer is asked through `try_validate`, so a match that reaches its limit fails a test here and is not
 //! taken for an answer.
 
-use corvus_json_schema::{CompileOptions, SchemaEvaluationError, Validator, compile, compile_with};
+use json_schema::{CompileOptions, SchemaEvaluationError, Validator, compile, compile_with};
 use serde_json::json;
 use std::time::Duration;
+
+/// The few parts of the JSON Schema evaluator's surface the tests were written against, over the engine: a schema
+/// of one `pattern`, a validator that answers for a string, and a limit on each match (one second unless the options
+/// say otherwise).
+mod json_schema {
+    use corvus_regex_ecma262::{Error, MatchError, Regex};
+    use serde_json::Value;
+    use std::time::Duration;
+
+    pub struct CompileOptions {
+        pub pattern_match_limit: Option<Duration>,
+    }
+
+    impl Default for CompileOptions {
+        fn default() -> Self {
+            CompileOptions { pattern_match_limit: Some(Duration::from_secs(1)) }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct Validator {
+        re: Regex,
+        limit: Option<Duration>,
+    }
+
+    #[derive(Debug)]
+    pub struct CompileError {
+        message: String,
+    }
+
+    impl CompileError {
+        pub fn message(&self) -> &str {
+            &self.message
+        }
+    }
+
+    impl std::fmt::Display for CompileError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct LimitError {
+        pattern: String,
+        limit: Duration,
+    }
+
+    impl LimitError {
+        pub fn pattern(&self) -> &str {
+            &self.pattern
+        }
+
+        pub fn limit(&self) -> Duration {
+            self.limit
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum SchemaEvaluationError {
+        PatternMatchLimit(LimitError),
+    }
+
+    impl std::fmt::Display for SchemaEvaluationError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let SchemaEvaluationError::PatternMatchLimit(e) = self;
+            write!(f, "the match of {:?} reached its limit of {:?}", e.pattern, e.limit)
+        }
+    }
+
+    /// Reads a pattern as JSON Schema does: the u flag grammar, then the Annex B grammar.
+    pub fn read(pattern: &str) -> Result<Regex, Error> {
+        match Regex::new(pattern, "u") {
+            Err(Error::Invalid(_)) => Regex::new(pattern, ""),
+            other => other,
+        }
+    }
+
+    pub fn compile(schema: &Value) -> Result<Validator, CompileError> {
+        compile_with(schema, &CompileOptions::default())
+    }
+
+    pub fn compile_with(schema: &Value, options: &CompileOptions) -> Result<Validator, CompileError> {
+        let pattern = schema["pattern"].as_str().expect("a schema of one pattern");
+        match read(pattern) {
+            Ok(re) => Ok(Validator { re, limit: options.pattern_match_limit }),
+            Err(Error::Invalid(_)) => {
+                Err(CompileError { message: format!("Invalid regular expression '{pattern}' in pattern.") })
+            }
+            Err(e) => Err(CompileError { message: e.to_string() }),
+        }
+    }
+
+    impl Validator {
+        pub fn try_validate(&self, instance: &Value) -> Result<bool, SchemaEvaluationError> {
+            let text = instance.as_str().expect("a string");
+            let limit = self.limit.unwrap_or(Duration::ZERO);
+            self.re.try_is_match(text, limit).map_err(|_: MatchError| {
+                SchemaEvaluationError::PatternMatchLimit(LimitError { pattern: self.re.as_str().to_string(), limit })
+            })
+        }
+
+        pub fn is_valid(&self, instance: &Value) -> bool {
+            self.try_validate(instance).unwrap_or(false)
+        }
+    }
+}
 
 /// Whether the text matches the pattern of the validator. A match that reaches its limit is not an answer, and
 /// fails the test.
@@ -186,27 +294,13 @@ fn a_reference_to_a_name_of_two_groups_reads_the_one_that_matched() {
     check(GROUPS_WITH_ONE_NAME);
 }
 
-/// The patterns of `patternProperties` and `propertyNames` go the same way.
-#[test]
-fn a_repetition_inside_a_repetition_in_a_pattern_of_property_names() {
-    let v = compile(&json!({ "patternProperties": { "^(?!-)(?:(?:a*)*)*x": false } })).unwrap();
-    assert!(v.is_valid(&json!({ "a": 1, "-x": 1 })));
-    assert!(!v.is_valid(&json!({ "aax": 1 })));
-    let v = compile(&json!({ "propertyNames": { "pattern": r"^(?:(?:(a)|x){1,2}\1-)+$" } })).unwrap();
-    assert!(v.is_valid(&json!({ "xaa-": 1, "x-": 1 })));
-    assert!(!v.is_valid(&json!({ "xa-": 1 })));
-}
-
 /// An assertion takes no quantifier. regress allows one on `\b` and `\B`.
 #[test]
 fn a_quantifier_on_a_word_boundary_is_not_valid() {
-    let format = CompileOptions { assert_format: Some(true), ..CompileOptions::default() };
-    let format = compile_with(&json!({ "format": "regex" }), &format).unwrap();
     for pattern in [r"\b+", r"\B*", r"a\b?", r"^\b{2}a", r"\B{1,}?x", r"(a\b*)", r"[a]\b+\&", r"(?=a\B+)"] {
         let e = compile(&json!({ "pattern": pattern })).expect_err(pattern);
         assert_eq!(e.message(), format!("Invalid regular expression '{pattern}' in pattern."));
-        assert!(compile(&json!({ "patternProperties": { pattern: true } })).is_err(), "{pattern}");
-        assert!(!format.is_valid(&json!(pattern)), "{pattern}");
+        assert!(corvus_regex_ecma262::Regex::new(pattern, "u").is_err(), "{pattern}");
     }
     // A quantifier on a group that holds one, an escaped backslash before a `b`, and a backspace in a class.
     for (pattern, text) in [(r"(?:\b)+a", "a"), (r"\\b+", r"\bb"), (r"[\b+]", "+"), (r"a\b", "a"), (r"\b{", "a{")] {
@@ -214,7 +308,7 @@ fn a_quantifier_on_a_word_boundary_is_not_valid() {
         assert!(v.is_valid(&json!(text)), "{pattern} on {text:?}");
     }
     for pattern in [r"(?:\b)+a", r"\\b+", r"[\b+]", r"a\b"] {
-        assert!(format.is_valid(&json!(pattern)), "{pattern}");
+        assert!(corvus_regex_ecma262::Regex::new(pattern, "u").is_ok(), "{pattern}");
     }
 }
 
@@ -669,7 +763,7 @@ fn many_iterations_of_a_character_that_may_be_left_out_keep_their_count() {
     // The pattern no engine finishes: the right answer, or the error of the limit, and never a wrong answer.
     let &(pattern, short_answers, long_answers) =
         A_CHARACTER_THAT_MAY_BE_LEFT_OUT.iter().find(|case| case.0 == NO_ENGINE_FINISHES).unwrap();
-    let limit = CompileOptions { pattern_match_limit: Some(Duration::from_millis(100)), ..CompileOptions::default() };
+    let limit = CompileOptions { pattern_match_limit: Some(Duration::from_millis(100)) };
     let v = compile_with(&json!({ "pattern": pattern }), &limit).unwrap();
     let (mut answered, mut abandoned) = (0, 0);
     for (text, want) in texts().iter().zip(short_answers.chars()).chain(long.iter().zip(long_answers.chars())) {
@@ -684,7 +778,6 @@ fn many_iterations_of_a_character_that_may_be_left_out_keep_their_count() {
                 assert!(!v.is_valid(&json!(text)), "is_valid is true for a match that reached its limit");
                 abandoned += 1;
             }
-            Err(e) => panic!("{pattern} on {text:?}: {e}"),
         }
     }
     assert!(answered > 0 && abandoned > 0, "{answered} answered, {abandoned} abandoned");
@@ -698,7 +791,7 @@ fn many_iterations_of_a_character_that_may_be_left_out_keep_their_count() {
 /// with an error, never with an answer.
 #[test]
 fn a_large_repetition_inside_a_repetition_compiles() {
-    let limit = CompileOptions { pattern_match_limit: Some(Duration::from_millis(200)), ..CompileOptions::default() };
+    let limit = CompileOptions { pattern_match_limit: Some(Duration::from_millis(200)) };
     for (pattern, text, want) in [
         (r"^(?!-)(?:(?:a|x){4294967295}-)+$", "ax-", Some(false)),
         (r"^(?!-)(?:(?:(?:a|x){200}-|a){200}x)+$", "ax-", Some(false)),

@@ -14,7 +14,7 @@ use super::fold::canonicalize;
 use super::parse::{self, Limit, MAX_NESTING, MAX_PATTERN_LENGTH, MAX_SIZE};
 use super::units::{has_supplementary, unit_at, unit_before};
 use super::vm::{MatchError, set_memo_from_the_start};
-use super::{Error, Regexp, Rune, check, compile, ucd, valid};
+use super::{Error, Regex, Rune, check, compile, ucd, valid};
 
 const NODE_SIZE: usize = 32;
 const RANGE_SIZE: usize = 8;
@@ -23,11 +23,11 @@ const RANGE_SIZE: usize = 8;
 const GENEROUS: Duration = Duration::from_secs(20);
 
 fn go_file(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src-go/corvus-json-schema/internal").join(name)
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name)
 }
 
 fn testdata(name: &str) -> Value {
-    let path = go_file("ecmaregex/testdata").join(name);
+    let path = go_file(name);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
@@ -66,7 +66,7 @@ fn cases(set: &str) -> Vec<V8Case> {
 
 /// Compares the validity of a pattern with V8's. It returns the pattern compiled, or `None` when the pattern is
 /// not valid.
-fn check_verdict(p: &str, valid_unicode: bool, valid_legacy: bool) -> Option<Regexp> {
+fn check_verdict(p: &str, valid_unicode: bool, valid_legacy: bool) -> Option<Regex> {
     assert_eq!(valid(p), valid_unicode, "valid({p:?})");
     let re = compile(p);
     assert_eq!(re.is_ok(), valid_unicode || valid_legacy, "compile({p:?}): {:?}", re.as_ref().err());
@@ -80,7 +80,7 @@ fn check_verdict(p: &str, valid_unicode: bool, valid_legacy: bool) -> Option<Reg
 /// Compares the answers of the pattern with V8's on one text: through the automaton when the pattern has one, on
 /// the backtracking matcher alone, and with a limit of a nanosecond, where a match that reaches its first check is
 /// abandoned and says nothing. A match has `limit`, and one that does not answer within it fails the test.
-fn check_answer(re: &Regexp, text: &str, want: bool, limit: Duration) {
+fn check_answer(re: &Regex, text: &str, want: bool, limit: Duration) {
     let p = re.as_str();
     assert_eq!(re.match_limit(text, Some(limit)), Ok(want), "{p:?} on {text:?}");
     assert_eq!(re.match_backtrack(text, Some(limit)), Ok(want), "{p:?} on {text:?} (the backtracking matcher)");
@@ -393,7 +393,7 @@ const V8_MODIFIER_BUGS: &[&str] =
 
 /// Compares the answers of the pattern with the oracle's on every text, the texts with a character beyond the Basic
 /// Multilingual Plane among them. It returns the number of answers compared.
-fn check_answers(re: &Regexp, inputs: &[String], bits: &str) -> usize {
+fn check_answers(re: &Regex, inputs: &[String], bits: &str) -> usize {
     for (i, s) in inputs.iter().enumerate() {
         check_answer(re, s, bit(bits, i), GENEROUS);
     }
@@ -722,7 +722,7 @@ fn suite_corpus_is_read_the_same_by_valid_and_compile() {
         let re = compile(p);
         if ok {
             valid_count += 1;
-            assert!(re.as_ref().is_ok_and(Regexp::unicode), "valid({p:?}) but compile gives {:?}", re.as_ref().err());
+            assert!(re.as_ref().is_ok_and(Regex::unicode), "valid({p:?}) but compile gives {:?}", re.as_ref().err());
         }
         if let Ok(re) = re {
             compiled += 1;
@@ -1586,87 +1586,5 @@ fn needs_settle() {
         let (_, need_passes) = needs(&mut p.insts);
         let (_, quick_passes) = quicks(&p.insts);
         assert!(need_passes <= 2 && quick_passes <= 3, "{}: {need_passes} and {quick_passes} passes", short(&pattern));
-    }
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
-// The tables.
-
-/// The tables of `tables_gen.rs` are those of the Go module: every table of `tables_gen.go`, by its name, has the
-/// same ranges here, and the two case mappings have the same rows. `tools/gen-ucd-tables.ps1` writes one file from
-/// the other, and this is what fails when one of them is generated again and the other is not.
-#[test]
-fn tables_are_those_of_the_go_module() {
-    let go = std::fs::read_to_string(go_file("ucd/tables_gen.go")).unwrap();
-    assert!(go.contains(&format!("const Version = \"{}\"", ucd::VERSION)));
-    let number = |s: &str| -> i64 {
-        let s = s.trim();
-        match s.strip_prefix("0x") {
-            Some(hex) => i64::from_str_radix(hex, 16).unwrap(),
-            None => s.parse().unwrap(),
-        }
-    };
-    // The tables, by the name of the Go variable.
-    let mut tables: HashMap<&str, Vec<Rune>> = HashMap::new();
-    let mut cases: HashMap<&str, Vec<[i64; 4]>> = HashMap::new();
-    let mut lookups: Vec<(&str, Vec<&str>, &str)> = Vec::new();
-    let (mut table, mut lookup, mut names) = ("", "", Vec::new());
-    for line in go.lines() {
-        if let Some(rest) = line.strip_prefix("var ") {
-            table = rest.split(' ').next().unwrap();
-        } else if let Some(rest) = line.strip_prefix("func ") {
-            lookup = rest.split('(').next().unwrap();
-        } else if let Some(rest) = line.strip_prefix("\tcase ") {
-            names = rest.trim_end_matches(':').split(", ").map(|n| n.trim_matches('"')).collect();
-        } else if let Some(rest) = line.strip_prefix("\t\treturn &") {
-            lookups.push((lookup, std::mem::take(&mut names), rest));
-        } else if let Some(row) = line.strip_prefix("\t{").and_then(|r| r.strip_suffix("},"))
-            && (table == "caseFolds" || table == "upperCases")
-        {
-            let row: Vec<i64> = row.split(',').map(number).collect();
-            cases.entry(table).or_default().push([row[0], row[1], row[2], row[3]]);
-        } else if line.starts_with("\t\t0x") {
-            tables
-                .entry(table)
-                .or_default()
-                .extend(line.split(',').filter(|s| !s.trim().is_empty()).map(|s| number(s) as Rune));
-        }
-    }
-    assert!(tables.len() > 300 && lookups.len() > 400, "{} tables, {} lookups", tables.len(), lookups.len());
-    for (lookup, names, table) in lookups {
-        // The ranges of the Go table, the part up to U+FFFF and the part beyond it joined where they touch.
-        let mut want: Vec<Rune> = Vec::new();
-        for &[lo, hi] in tables.get(table).map_or(&[][..], |t| &t[..]).as_chunks::<2>().0 {
-            match want.last_mut() {
-                Some(last) if *last == 0xFFFF && lo == 0x10000 => *last = hi,
-                _ => want.extend_from_slice(&[lo, hi]),
-            }
-        }
-        for name in names {
-            let found = match lookup {
-                "categoryTable" => ucd::category(name),
-                "binaryTable" => ucd::binary(name),
-                "scriptTable" => ucd::script(name),
-                "scriptExtensionsTable" => ucd::script_extensions(name),
-                other => panic!("an unknown lookup {other}"),
-            };
-            assert_eq!(
-                found.map(|t| t.pairs()),
-                Some(want.clone()),
-                "{lookup}({name:?}) is not {table} of the Go module"
-            );
-        }
-    }
-    // The case mappings, by what they do to every code point.
-    let map = |rows: &[[i64; 4]], r: i64| -> i64 {
-        let row = rows.iter().rev().find(|row| row[0] <= r);
-        match row {
-            Some(row) if r - row[0] < row[2] && (r - row[0]) & row[3] == 0 => r + row[1],
-            _ => r,
-        }
-    };
-    for r in 0x80..=ucd::MAX_RUNE {
-        assert_eq!(ucd::fold(r) as i64, map(&cases["caseFolds"], r as i64), "the folding of U+{r:04X}");
-        assert_eq!(ucd::to_upper(r) as i64, map(&cases["upperCases"], r as i64), "the uppercase of U+{r:04X}");
     }
 }

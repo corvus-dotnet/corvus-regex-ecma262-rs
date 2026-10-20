@@ -217,9 +217,27 @@ static NOT_WORD_SET: LazyLock<Arc<CharSet>> = LazyLock::new(|| CharSet::shared(W
 static SPACE_SET: LazyLock<Arc<CharSet>> = LazyLock::new(|| CharSet::shared(SPACE_PAIRS, false));
 static NOT_SPACE_SET: LazyLock<Arc<CharSet>> = LazyLock::new(|| CharSet::shared(SPACE_PAIRS, true));
 
+/// The grammar a pattern is read with and the flags that change what its atoms mean.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Syntax {
+    /// The grammar of the u flag. Without it, the Annex B grammar of a pattern with no u or v flag.
+    pub unicode: bool,
+    /// The i, m and s flags: the modifiers in force at the start of the pattern.
+    pub icase: bool,
+    pub multiline: bool,
+    pub dot_all: bool,
+}
+
+/// Reads the pattern with no flag but the grammar's (see [`parse_with`]).
+#[cfg(test)]
+pub(crate) fn parse(pattern: &str, unicode: bool) -> Parse<(Node, Parser)> {
+    parse_with(pattern, Syntax { unicode, ..Syntax::default() })
+}
+
 /// Reads the pattern. It returns an error for a pattern that is not valid under the chosen grammar, and a
 /// `TooLargeError` for a pattern over a limit of size, which it stops reading at the limit.
-pub(crate) fn parse(pattern: &str, unicode: bool) -> Parse<(Node, Parser)> {
+pub(crate) fn parse_with(pattern: &str, syntax: Syntax) -> Parse<(Node, Parser)> {
+    let unicode = syntax.unicode;
     if pattern.len() > MAX_PATTERN_LENGTH {
         return Err(ParseError::TooLarge(TooLargeError { limit: Limit::Length, value: MAX_PATTERN_LENGTH }));
     }
@@ -239,9 +257,9 @@ pub(crate) fn parse(pattern: &str, unicode: bool) -> Parse<(Node, Parser)> {
         named_refs: false,
         path: Vec::new(),
         disjunctions: 0,
-        icase: false,
-        multiline: false,
-        dot_all: false,
+        icase: syntax.icase,
+        multiline: syntax.multiline,
+        dot_all: syntax.dot_all,
         needs_backtracking: false,
         size: 0,
     };

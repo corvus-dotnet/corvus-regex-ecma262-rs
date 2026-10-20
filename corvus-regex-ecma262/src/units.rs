@@ -109,6 +109,7 @@ pub(crate) fn low_surrogate(c: Rune) -> Rune {
 /// Whether the text has a character beyond the Basic Multilingual Plane, which is the only kind of text that code
 /// units and code points read differently. Such a character starts with a byte of 0xF0 or more.
 #[inline]
+#[cfg(test)]
 pub(crate) fn has_supplementary(input: &[u8]) -> bool {
     input.iter().any(|&c| c >= 0xF0)
 }

@@ -1,0 +1,23 @@
+[package]
+name = "corvus-regex-ecma262"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ECMA-262 (JavaScript) regular expressions for Rust: the grammar and the answers of RegExp, every flag, over UTF-8 and UTF-16, with no allocation per match."
+homepage = "https://github.com/corvus-dotnet/corvus-regex-ecma262-rs"
+readme = "README.md"
+documentation = "https://docs.rs/corvus-regex-ecma262"
+keywords = ["regex", "ecmascript", "javascript", "regexp", "ecma262"]
+categories = ["text-processing", "parser-implementations"]
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
+
+[dependencies]
+
+[dev-dependencies]
+serde_json = "1.0.151"
+
+[lints.rust]
+# `--cfg corvus_memo_from_the_start` runs every match with the memory of failed places from its first step.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(corvus_memo_from_the_start)"] }
