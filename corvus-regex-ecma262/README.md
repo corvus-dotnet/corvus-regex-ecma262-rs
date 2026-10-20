@@ -109,7 +109,7 @@ browser, a configuration written for Node, or anything that must give the answer
 The Industry workloads of dotnet/performance (the Sherlock Holmes, Leipzig and mariomka texts, the rebar names), this
 crate against `regex`, `regress` (an ECMA-262 engine) and V8, each engine with its compliance with the test data
 beside its figures: see [docs/benchmarks](docs/benchmarks/README.md), and the results on the central page,
-[corvus-oss.org/regex-benchmarks](https://corvus-oss.org/regex-benchmarks/).
+[corvus-oss.org/corvus-regex-ecma262-benchmarks](https://corvus-oss.org/corvus-regex-ecma262-benchmarks/).
 
 ## Repository
 

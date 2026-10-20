@@ -15,7 +15,7 @@ Beside its figures each engine carries its compliance with the
 [ECMA-262 test data](https://github.com/corvus-dotnet/ecma262-regex-test-data): the counts of right and wrong answers,
 of valid patterns refused and of invalid ones accepted, or "not ECMA-262" for regex, which does not claim it.
 
-**The results** are on the central page, [corvus-oss.org/regex-benchmarks](https://corvus-oss.org/regex-benchmarks/),
+**The results** are on the central page, [corvus-oss.org/corvus-regex-ecma262-benchmarks](https://corvus-oss.org/corvus-regex-ecma262-benchmarks/),
 beside the engines of the other languages. This repository publishes the data of its nightly run, a GitHub-hosted
 runner with every engine in one job, as
 [benchmarks/latest.json](https://raw.githubusercontent.com/corvus-dotnet/corvus-regex-ecma262-rs/gh-pages/benchmarks/latest.json)
