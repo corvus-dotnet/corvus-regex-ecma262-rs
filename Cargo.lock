@@ -33,6 +33,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "corvus-regex-ecma262-capi"
+version = "0.1.0"
+dependencies = [
+ "corvus-regex-ecma262",
+]
+
+[[package]]
 name = "corvus-regex-ecma262-tools"
 version = "0.0.0"
 dependencies = [
