@@ -51,6 +51,24 @@ impl UnitSet {
         if at >= units.len() {
             return None;
         }
+        #[cfg(target_arch = "x86_64")]
+        if self.ranges[..self.n as usize].iter().all(|&(_, len)| len == 0) {
+            // Single units: compared for equality, as `memchr` does.
+            let v: [u16; 4] = std::array::from_fn(|k| self.ranges[k.min(self.n as usize - 1)].0);
+            if self.n <= 4 && std::is_x86_feature_detected!("avx2") {
+                // SAFETY: the processor has AVX2.
+                let found = match self.n {
+                    1 => unsafe { x86::eq_avx2::<1>(units, at, &v) },
+                    2 => unsafe { x86::eq_avx2::<2>(units, at, &v) },
+                    3 => unsafe { x86::eq_avx2::<3>(units, at, &v) },
+                    _ => unsafe { x86::eq_avx2::<4>(units, at, &v) },
+                };
+                return match found {
+                    Ok(found) => found,
+                    Err(rest) => tail(units, rest, |u| v.contains(&u)),
+                };
+            }
+        }
         let na = usize::from(self.na);
         match self.n {
             1 => find_ranges::<1>(units, at, &self.ranges, na),
@@ -161,6 +179,17 @@ mod x86 {
                     miss
                 };
                 let full = ((1u64 << (2 * $lanes)) - 1) as u32;
+                // One unaligned block, then blocks on vector boundaries, which a load reads in one go.
+                if at + $lanes <= units.len() {
+                    // SAFETY: the block is within the slice.
+                    let x = unsafe { $loadu(p.add(at).cast::<$vec>()) };
+                    let m = !($movemask(miss(x)) as u32) & full;
+                    if m != 0 {
+                        return Ok(Some(at + (m.trailing_zeros() / 2) as usize));
+                    }
+                    let misaligned = (p as usize + 2 * at) & (2 * $lanes - 1);
+                    at += $lanes - misaligned / 2;
+                }
                 // Four blocks at a time while nothing is found, as `memchr` reads.
                 while at + 4 * $lanes <= units.len() {
                     // SAFETY: the four blocks are within the slice.
@@ -196,6 +225,65 @@ mod x86 {
         };
     }
 
+    /// The first unit at or after `from` equal to one of four (repeated where there are fewer), sixty-four units a
+    /// step as `memchr` reads.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn eq_avx2<const N: usize>(
+        units: &[u16],
+        from: usize,
+        v: &[u16; 4],
+    ) -> Result<Option<usize>, usize> {
+        let w: [__m256i; N] = std::array::from_fn(|k| _mm256_set1_epi16(v[k] as i16));
+        let hit = |x: __m256i| {
+            let mut h = _mm256_cmpeq_epi16(x, w[0]);
+            for wk in &w[1..] {
+                h = _mm256_or_si256(h, _mm256_cmpeq_epi16(x, *wk));
+            }
+            h
+        };
+        let p = units.as_ptr();
+        let mut at = from;
+        // One unaligned block, then blocks on 32-byte boundaries, which a load reads in one go.
+        if at + 16 <= units.len() {
+            // SAFETY: the block is within the slice.
+            let m = _mm256_movemask_epi8(hit(unsafe { _mm256_loadu_si256(p.add(at).cast::<__m256i>()) })) as u32;
+            if m != 0 {
+                return Ok(Some(at + (m.trailing_zeros() / 2) as usize));
+            }
+            let misaligned = (p as usize + 2 * at) & 31;
+            at += 16 - misaligned / 2;
+        }
+        while at + 64 <= units.len() {
+            // SAFETY: the four blocks are within the slice (and aligned when the slice is, as u16 always is).
+            let (h0, h1, h2, h3) = unsafe {
+                (
+                    hit(_mm256_loadu_si256(p.add(at).cast::<__m256i>())),
+                    hit(_mm256_loadu_si256(p.add(at + 16).cast::<__m256i>())),
+                    hit(_mm256_loadu_si256(p.add(at + 32).cast::<__m256i>())),
+                    hit(_mm256_loadu_si256(p.add(at + 48).cast::<__m256i>())),
+                )
+            };
+            if _mm256_movemask_epi8(_mm256_or_si256(_mm256_or_si256(h0, h1), _mm256_or_si256(h2, h3))) != 0 {
+                for (k, h) in [h0, h1, h2, h3].into_iter().enumerate() {
+                    let m = _mm256_movemask_epi8(h) as u32;
+                    if m != 0 {
+                        return Ok(Some(at + 16 * k + (m.trailing_zeros() / 2) as usize));
+                    }
+                }
+            }
+            at += 64;
+        }
+        while at + 16 <= units.len() {
+            // SAFETY: the block is within the slice.
+            let m = _mm256_movemask_epi8(hit(unsafe { _mm256_loadu_si256(p.add(at).cast::<__m256i>()) })) as u32;
+            if m != 0 {
+                return Ok(Some(at + (m.trailing_zeros() / 2) as usize));
+            }
+            at += 16;
+        }
+        Err(at)
+    }
+
     macro_rules! pair_kernel {
         ($name:ident, $feature:literal, $vec:ty, $lanes:expr, $set1:ident, $loadu:ident, $cmpeq:ident, $and:ident,
          $movemask:ident) => {
@@ -213,6 +301,18 @@ mod x86 {
                 let (va, vb) = ($set1(a as i16), $set1(b as i16));
                 let p = units.as_ptr();
                 let mut at = from;
+                // One unaligned block, then the first unit's loads on vector boundaries.
+                if at + $lanes <= last + 1 {
+                    // SAFETY: as below.
+                    let (x, y) =
+                        unsafe { ($loadu(p.add(at + ia).cast::<$vec>()), $loadu(p.add(at + ib).cast::<$vec>())) };
+                    let m = $movemask($and($cmpeq(x, va), $cmpeq(y, vb))) as u32;
+                    if m != 0 {
+                        return Ok(Some(at + (m.trailing_zeros() / 2) as usize));
+                    }
+                    let misaligned = (p as usize + 2 * (at + ia)) & (2 * $lanes - 1);
+                    at += $lanes - misaligned / 2;
+                }
                 while at + $lanes <= last + 1 {
                     // SAFETY: at + lanes - 1 <= last, and last + max(ia, ib) is within the slice.
                     let (x, y) =
@@ -487,8 +587,9 @@ mod tests {
 
     #[test]
     fn the_vector_searches_find_what_a_loop_finds() {
-        let sets: [&[(u16, u16)]; 4] = [
+        let sets: [&[(u16, u16)]; 5] = [
             &[(b'@' as u16, b'@' as u16)],
+            &[(0x017F, 0x017F), (0x212A, 0x212A), (b'S' as u16, b'S' as u16)],
             &[(b'a' as u16, b'b' as u16), (0x017F, 0x017F)],
             &[(0x0400, 0x04FF), (0xD800, 0xDBFF), (b'S' as u16, b'S' as u16)],
             &[(1, 1), (2, 2), (3, 3), (0x80, 0x80), (0xE9, 0xE9), (0x212A, 0x212A), (0xFFFE, 0xFFFE)],
