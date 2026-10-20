@@ -20,7 +20,7 @@ The host is "pinned" for the procedure of tools/benchmarks/run.sh (the machine q
 affinity names, after a settle) or "ci" for the daily run on a GitHub-hosted runner, where nothing is pinned; the two
 are kept apart and never read against each other.
 """
-import argparse, json, math, os, re, statistics, string
+import argparse, json, math, os, re, statistics
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--run", required=True)
@@ -60,9 +60,11 @@ corvus_counts = compliance(args.compliance_corvus)
 regress_counts = compliance(args.compliance_regress)
 
 
-def counts_text(c, scope):
+def counts_text(c, scope, records_at_limit=False):
+    limit = (f"{c['limit']:,} records with no answer (no progress in ten seconds, or the process stopped at its memory cap of 2 GB)"
+             if records_at_limit else f"{c['limit']:,} at a limit")
     return (f"{c['right']:,} right, {c['wrong']:,} wrong, {c['refused-valid']:,} valid patterns refused, "
-            f"{c['accepted-invalid']:,} invalid patterns accepted, {c['limit']:,} at a limit ({scope})")
+            f"{c['accepted-invalid']:,} invalid patterns accepted, {limit} ({scope})")
 
 
 # The engines: the harness's names, the names the page shows, their group and their compliance.
@@ -73,7 +75,7 @@ ENGINES = [
      counts_text(corvus_counts, "both encodings, every file") if corvus_counts else ""),
     ("regex", "regex", "Rust", "not ECMA-262"),
     ("regress", "regress", "Rust",
-     counts_text(regress_counts, "test answers over UTF-16 and UTF-8, every file but captures.jsonl") if regress_counts else ""),
+     counts_text(regress_counts, "the answers of test over UTF-16 and UTF-8, every file but captures.jsonl", True) if regress_counts else ""),
 ]
 results = {}
 counts = {}
@@ -189,7 +191,8 @@ def cell(name, w):
 lines = []
 apart = []
 for w in ids:
-    ww = "<code>" + "".join("\\" + ch if ch in string.punctuation else ch for ch in w) + "</code>"
+    # A code span with its pipes escaped, which a table cell needs.
+    ww = "`" + w.replace("|", "\\|") + "`"
     row = [ww]
     c8 = cell(C8, w)
     for _, name, _, _ in ENGINES:
@@ -204,7 +207,7 @@ for w in ids:
         theirs = counts.get((name, w))
         if theirs is not None and mine is not None and theirs != mine:
             apart.append(f"- {ww}: {name} counts {theirs:,} to this crate's {mine:,}.")
-absent = [f"- {name} on <code>{w}</code>: {e}" for (name, w), e in sorted(errors.items())]
+absent = [f"- {name} on `{w}`: {e}" for (name, w), e in sorted(errors.items())]
 
 summary = []
 for other in ["regex", "regress"] + ([V8[0]] if V8 else []):

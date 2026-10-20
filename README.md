@@ -19,7 +19,7 @@ its C library, for any language that calls C.
   program hang.
 
 **Compliance.** Over the [ECMA-262 test data](https://github.com/corvus-dotnet/ecma262-regex-test-data) (what V8
-says about 109,000 patterns and 5 million texts, `exec`, the global search, `replace` and `split` among them), the
+says about 109,547 patterns and 5,325,026 texts, `exec`, the global search, `replace` and `split` among them), the
 crate gives 23,647,077 right answers and none wrong, refuses no valid pattern, accepts no invalid one and reaches no
 limit, over UTF-8 and over UTF-16. CI runs the whole data on every change.
 
