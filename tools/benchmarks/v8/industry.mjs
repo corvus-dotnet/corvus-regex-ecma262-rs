@@ -3,7 +3,10 @@
 // {workload id: {median, min, max}} in nanoseconds per Count, the figures of several timed passes after a warm-up.
 //
 //   node industry.mjs <workloads.json> [seconds per workload] [passes]
+//   node industry.mjs --one <workloads.json> <index> <seconds> <passes>
 //
+// With --one it times the one workload and prints one line of JSON ({median, min, max, count, reps, engine}): the
+// figure of one turn of the interleaved run of tools/src/bin/industry.rs, which starts it in a process of its own.
 // Run it as the pinned procedure runs the .NET benchmark: on the performance cores, after a settle, nothing else on
 // the host. Node 24 (V8 13.6) is the oracle of the test data, so the same build is used here.
 import { readFileSync } from "node:fs";
@@ -11,12 +14,20 @@ import { gunzipSync } from "node:zlib";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const workloads = JSON.parse(readFileSync(process.argv[2], "utf8"));
-const seconds = Number(process.argv[3] ?? 1.5);
-const passes = Number(process.argv[4] ?? 5);
+const one = process.argv[2] === "--one";
+const args = one ? process.argv.slice(3) : process.argv.slice(2);
+const workloads = JSON.parse(readFileSync(args[0], "utf8"));
+const index = one ? Number(args[1]) : -1;
+const seconds = Number((one ? args[2] : args[1]) ?? 1.5);
+const passes = Number((one ? args[3] : args[2]) ?? 5);
 const dir = process.env.CORVUS_REGEX_TEXTS ?? join(homedir(), ".local", "share", "corvus-regex-benchmarks");
 const texts = new Map();
 function text(file) {
+  if (!texts.has(file) && process.env.CORVUS_REGEX_PLAIN) {
+    try {
+      texts.set(file, readFileSync(join(process.env.CORVUS_REGEX_PLAIN, file.replace(/\.gz$/, "")), "utf8"));
+    } catch { /* unzipped below */ }
+  }
   if (!texts.has(file)) {
     let bytes = gunzipSync(readFileSync(join(dir, file)));
     if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) bytes = bytes.subarray(3);
@@ -43,8 +54,9 @@ function count(re, s) {
   }
 }
 
+const engine = "V8 " + process.versions.v8 + " (Node " + process.versions.node + ")";
 const results = {};
-for (const w of workloads) {
+for (const w of one ? [workloads[index]] : workloads) {
   const s = text(w.file);
   const flags = [...new Set((w.flags + "gu").split(""))].join("");
   const re = new RegExp(w.pattern, flags);
@@ -62,6 +74,10 @@ for (const w of workloads) {
   }
   times.sort((a, b) => a - b);
   results[w.id] = { median: times[passes >> 1], min: times[0], max: times[passes - 1], count: expected, reps: perPass * passes };
+  if (one) {
+    process.stdout.write(JSON.stringify({ ...results[w.id], engine }) + "\n");
+    process.exit(0);
+  }
   process.stderr.write(`${w.id.padEnd(60)} ${(times[passes >> 1] / 1000).toFixed(1).padStart(10)} us  (${expected} matches)\n`);
 }
-process.stdout.write(JSON.stringify({ engine: "V8 " + process.versions.v8 + " (Node " + process.versions.node + ")", results }, null, 1));
+process.stdout.write(JSON.stringify({ engine, results }, null, 1));

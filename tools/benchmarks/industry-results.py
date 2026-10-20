@@ -22,7 +22,7 @@ import argparse, json, os, re
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--run", required=True)
-ap.add_argument("--v8", required=True)
+ap.add_argument("--v8", help="the V8 harness's own results, for a run whose harness did not run V8 itself")
 ap.add_argument("--out", required=True)
 ap.add_argument("--compliance-corvus", required=True)
 ap.add_argument("--compliance-regress", required=True)
@@ -33,8 +33,12 @@ args = ap.parse_args()
 
 root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 run = json.load(open(args.run, encoding="utf-8"))
-v8 = json.load(open(args.v8, encoding="utf-8"))
 facts = run["facts"]
+# V8 runs inside the interleaved run (results["v8"], its engine in the facts); a separate V8 run is still read.
+if "v8" in run["results"]:
+    v8 = {"engine": facts.get("v8", "V8"), "results": run["results"]["v8"]}
+else:
+    v8 = json.load(open(args.v8, encoding="utf-8"))
 workloads = json.load(open(args.workloads or os.path.join(root, "tools", "benchmarks", "workloads.json"), encoding="utf-8"))
 ids = [w["id"] for w in workloads]
 
@@ -75,13 +79,25 @@ ENGINES.append(("v8", v8_name, "V8", v8["engine"], compliance(args.compliance_v8
 results[v8_name] = {}
 for w in ids:
     r = v8["results"].get(w)
-    results[v8_name][w] = {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}} if r else None
+    results[v8_name][w] = {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}} if r and "error" not in r else None
+# Where regex counts otherwise than V8 (the oracle), the row says so; an ECMA-262 engine that does is an error above.
+differs = {w: r["differs"] for w, r in run["results"].get("regex", {}).items() if isinstance(r, dict) and "differs" in r}
 
 TEXTS = {"sherlock": "Sherlock Holmes (0.6 M chars)", "leipzig": "Leipzig corpus (16 M chars)", "mariomka": "mariomka (0.05 M chars)",
          "rebar-ru": "OpenSubtitles ru (1.2 M chars)", "rebar-zh": "OpenSubtitles zh (0.3 M chars)"}
 runner = " ".join(x for x in (facts.get("runner", ""), facts.get("runner_os", ""), facts.get("image", "")) if x)
 host = f"{facts.get('cpu', '')}, {facts.get('os', '')}, {facts.get('cores', '')} cores (affinity {facts.get('affinity', '')}), load {facts.get('load', '')} at the start"
-job = f"each figure the median of {facts.get('passes')} passes after a warm-up, {facts.get('seconds')} s for each workload of each engine, each in a process of its own"
+if facts.get("protocol") == "interleaved":
+    job = (f"interleaved: {facts.get('rounds')} rounds, each over every workload with the engines in turn (their order "
+           f"turned each round), each figure a process of its own warmed and timed for {facts.get('seconds')} s "
+           f"({facts.get('passes')} passes); a workload's figure is the median of its rounds, the spread its fastest "
+           f"and slowest round")
+    over = facts.get("spread_over", "")
+    spread = (f"over {float(facts.get('spread_limit', 0)) * 100:.0f}% (slowest - fastest) / median: {over}" if over
+              else f"every figure within {float(facts.get('spread_limit', 0)) * 100:.0f}% (slowest - fastest) / median")
+else:
+    job = f"each figure the median of {facts.get('passes')} passes after a warm-up, {facts.get('seconds')} s for each workload of each engine, each in a process of its own"
+    spread = ""
 data = {
     "meta": {
         "title": "corvus-regex-ecma262: the Industry benchmarks",
@@ -97,7 +113,9 @@ data = {
         "runUrl": args.run_url,
         "runs": int(facts.get("passes") or 0),
         "versions": {name: version for _, name, _, version, _ in ENGINES},
-        "facts": [["Host", host]] + ([["Runner", runner]] if runner else []) + [["Runtime", facts.get("rustc", "") + "; " + v8["engine"]], ["Harness", job]],
+        "facts": [["Host", host]] + ([["Runner", runner]] if runner else []) + [["Runtime", facts.get("rustc", "") + "; " + v8["engine"]], ["Harness", job]]
+                 + ([["Spread", spread]] if spread else [])
+                 + ([["Counts", "regex counts otherwise than V8 on " + str(len(differs)) + " workloads (each says so)"]] if differs else []),
         "method": "<p>Each figure is one count of every match a global search finds over the whole text, after an empty match going on one character later. "
                   "This crate and regress run with the workload's flags and u, regex with the pattern as it is and the flags i, m and s, V8 with gu added.</p>",
     },
@@ -109,7 +127,8 @@ data = {
     },
     "measures": {"time": {"label": "Time", "long": "time per count", "parts": ["time"]}},
     "impls": [{"id": name, "name": name, "group": group, "version": version, "compliance": c} for _, name, group, version, c in ENGINES],
-    "schemas": [{"name": w, "note": "", "meta": [["text", TEXTS.get(w.split(":")[0], w.split(":")[0])]]} for w in ids],
+    "schemas": [{"name": w, "note": ("counts differ: " + differs[w]) if w in differs else "",
+                 "meta": [["text", TEXTS.get(w.split(":")[0], w.split(":")[0])]]} for w in ids],
     "results": results,
 }
 os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

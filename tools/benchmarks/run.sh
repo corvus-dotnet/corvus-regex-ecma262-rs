@@ -14,8 +14,9 @@
 # - test data directory: the data/ directory of github.com/corvus-dotnet/ecma262-regex-test-data; without it the
 #   repository is cloned at depth 1.
 #
-# Optional settings: SECONDS_EACH (2) and PASSES (5) for each figure, or JOB=short for a quick look (0.1 s, one pass); CORES, a taskset core list to run the timed parts
-# on; SETTLE, seconds to wait between the builds and the timed parts (0; 180 for a measured run on a quiet machine);
+# Optional settings: ROUNDS (7), SECONDS_EACH (0.3) and PASSES (3) of the interleaved protocol and SPREAD (0.05),
+# the spread over which a figure is listed, or JOB=short for a quick look (3 rounds of 0.1 s, one pass); CORES, a
+# taskset core list to run the timed parts on; SETTLE, seconds to wait between the builds and the timed parts (0; 180 for a measured run on a quiet machine);
 # SKIP_BUILD=1 when the binaries are built (the image); REGRESS_COMPLIANCE=1 to work out regress's compliance again (over an hour) rather than take
 # tools/benchmarks/compliance-regress.txt; RUN_URL, the address of the run for the data file.
 set -euo pipefail
@@ -25,9 +26,13 @@ workloads="$(abs "${1:?workloads.json}")"
 texts="$(mkdir -p "${2:?texts directory}" && cd "$2" && pwd)"
 out_file="$(abs "${3:?out.json}")"
 data="${4:-}"
-if [ "${JOB:-}" = short ]; then short_seconds=0.1 short_passes=1; else short_seconds=2 short_passes=5; fi
-seconds="${SECONDS_EACH:-$short_seconds}"
-passes="${PASSES:-$short_passes}"
+# The interleaved protocol (tools/src/bin/industry.rs): ROUNDS rounds, each figure SECONDS_EACH seconds of PASSES
+# passes in a process of its own; a figure whose rounds spread over SPREAD is listed in the run's facts.
+if [ "${JOB:-}" = short ]; then d_rounds=3 d_seconds=0.1 d_passes=1; else d_rounds=7 d_seconds=0.3 d_passes=3; fi
+rounds="${ROUNDS:-$d_rounds}"
+seconds="${SECONDS_EACH:-$d_seconds}"
+passes="${PASSES:-$d_passes}"
+spread="${SPREAD:-0.05}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 timed() { if [ -n "${CORES:-}" ]; then taskset -c "$CORES" "$@"; else "$@"; fi; }
@@ -52,9 +57,10 @@ if [ "${SETTLE:-0}" -gt 0 ]; then
   sleep "$SETTLE"
 fi
 export CORVUS_REGEX_TEXTS="$texts"
-timed ./target/release/industry "$workloads" --seconds "$seconds" --passes "$passes" --out "$work/run.json" 2> "$work/run.log"
-timed node tools/benchmarks/v8/industry.mjs "$workloads" "$seconds" "$passes" > "$work/v8.json" 2> "$work/v8.log"
-python3 tools/benchmarks/industry-results.py --workloads "$workloads" --run "$work/run.json" --v8 "$work/v8.json" --out "$out_file" \
+timed ./target/release/industry "$workloads" --v8 tools/benchmarks/v8/industry.mjs --rounds "$rounds" --seconds "$seconds" \
+  --passes "$passes" --spread "$spread" --out "$work/run.json" 2> "$work/run.log"
+grep -E '^(SPREAD|COUNT) ' "$work/run.log" || true
+python3 tools/benchmarks/industry-results.py --workloads "$workloads" --run "$work/run.json" --out "$out_file" \
   --compliance-corvus "$work/compliance-corvus.txt" --compliance-regress "$work/compliance-regress.txt" \
   --compliance-v8 "$work/compliance-v8.txt" --run-url "${RUN_URL:-}"
 if [ -n "${KEEP:-}" ]; then mkdir -p "$KEEP" && cp "$work"/*.json "$work"/*.txt "$work"/*.log "$KEEP"/; fi

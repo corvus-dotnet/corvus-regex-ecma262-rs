@@ -5,11 +5,45 @@ and the rebar names), as the .NET reference engine's benchmarks run them, counte
 UTF-8 and over UTF-16, `regex` (Rust's standard engine, with RE2 semantics), `regress` (an ECMA-262 engine in Rust),
 and V8 (Node 24's `RegExp`, the oracle of the ECMA-262 test data).
 
-Each figure is one count of every match a global search finds over the whole text, after an empty match going on
-one character later, as `matchAll` does: the median of five passes after a warm-up, each workload of each engine in a
-process of its own. This crate and regress run with the workload's flags and `u`; regex is given the pattern as it is
-with the flags i, m and s (its row is absent where the pattern does not compile, and its counts differ where its
-`\w`, `.` and `$` do); V8 runs with `gu` added.
+Each figure is the time of one count of every match a global search finds over the whole text, after an empty match
+going on one character later, as `matchAll` does. This crate and regress run with the workload's flags and `u`; regex
+is given the pattern as it is with the flags i, m and s (its row is absent where the pattern does not compile); V8 runs
+with `gu` added.
+
+## The protocol
+
+The harness (`tools/src/bin/industry.rs`, driven by `tools/benchmarks/run.sh`) interleaves the engines, so that what
+changes on the host during a run (its clock, its heat, its other work) falls on every engine alike:
+
+- **Rounds outside, workloads next, engines inside.** The run is 7 rounds; each round goes over every workload, and for
+  each workload runs every engine in turn, the order of the engines turned by one each round. A workload's figures for
+  two engines are therefore seconds apart, not minutes.
+- **One process per figure.** Each turn is a process of its own (`industry --one`, or `node industry.mjs --one` for
+  V8), which warms for two fifths of 0.3 seconds and times 3 passes of as many counts as fit the rest, and reports
+  their median. The texts are unzipped once by the run and read by every process.
+- **The figure and its spread.** A workload's figure for an engine is the median of its 7 rounds; the fastest and the
+  slowest round are kept as its spread. Where (slowest - fastest) / median is over 5%, the run says so on its output
+  (`SPREAD` lines) and lists the figure in the data's facts (`spread_over`, and the page's Spread fact): such a figure
+  is not a clean one.
+- **The counts.** Every engine's count is compared with V8's, the oracle of the test data. An ECMA-262 engine that
+  counts otherwise is an error on that workload; regex, which does not claim ECMA-262, keeps its figure and the
+  workload carries "counts differ" with both counts.
+
+`ROUNDS`, `SECONDS_EACH`, `PASSES` and `SPREAD` change the protocol's numbers; `JOB=short` is 3 rounds of 0.1 s for a
+look. Measured on the reference machine (an unpinned i7-13800H laptop under WSL), two runs back to back on one build
+differ by a median of 2.3% a figure (90% within 5.1%), every figure within its spread; the spread itself is a median
+of 10% there, and more on the Leipzig text, whose 16 MB fills that machine's last-level cache. On that host most
+figures are therefore listed as over 5%; a pinned host is needed for clean figures.
+
+For the central results contract, every port's image follows the same protocol:
+
+> A run measures every engine on every workload in rounds: rounds are the outer loop, workloads the next and engines
+> the innermost, with the engine order turned by one each round, and each figure timed in a process of its own after
+> a warm-up. A workload's figure is the median over the rounds, and its spread is the fastest and the slowest round.
+> A figure whose spread, (slowest - fastest) / median, is over the run's limit (5% unless the run says otherwise) is
+> listed in the run's facts and is never presented as a clean figure. Every engine's match count is compared with
+> V8's: an ECMA-262 engine whose count differs is an error on that workload, and any other engine's differing count
+> is shown on the workload with both counts.
 
 Beside its figures each engine carries its compliance with the
 [ECMA-262 test data](https://github.com/corvus-dotnet/ecma262-regex-test-data), judged by the data's own rule: the

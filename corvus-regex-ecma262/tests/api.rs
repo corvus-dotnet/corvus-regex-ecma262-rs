@@ -172,3 +172,53 @@ fn modifiers_and_flags_mean_the_same() {
     assert!(Regex::new("a.b", "s").unwrap().is_match("a\nb"));
     assert!(!Regex::new("a.b", "").unwrap().is_match("a\nb"));
 }
+
+#[test]
+fn a_run_of_the_dot_with_the_s_flag_is_the_rest_of_the_text() {
+    // `.*` with the s flag is answered without reading the text: from where the search starts (a code point's start
+    // with the u or v flag, so a start between the halves of a pair moves back to the pair's start; any code unit
+    // without them) to the end. Each answer is compared with the matcher's, which a group in the pattern makes the
+    // search use, and with that rule written out, over UTF-16 text with lone halves anywhere, the last unit among
+    // them, and every start.
+    let texts: [&[u16]; 6] = [
+        &[],
+        &[0x61, 0xD800],
+        &[0x61, 0xDC00],
+        &[0xDC00, 0x61, 0xD83D, 0xDE00],
+        &[0xD83D, 0xDE00],
+        &[0xDC00, 0x62, 0xD83D, 0xDE00, 0xD800, 0x63, 0xDBFF],
+    ];
+    for flags in ["s", "su", "sv", "sy", "suy"] {
+        let unicode = flags.contains('u') || flags.contains('v');
+        let shortcut = Regex::new(".*", flags).unwrap();
+        let matcher = Regex::new("(.*)", flags).unwrap();
+        let plus = Regex::new(".+", flags).unwrap();
+        let plus_matcher = Regex::new("(.+)", flags).unwrap();
+        for text in texts {
+            for start in 0..=text.len() {
+                let mid_pair = start > 0
+                    && start < text.len()
+                    && (0xDC00..=0xDFFF).contains(&text[start])
+                    && (0xD800..=0xDBFF).contains(&text[start - 1]);
+                let from = if unicode && mid_pair { start - 1 } else { start };
+                let got = shortcut.find_at_utf16(text, start).map(|m| (m.start(), m.end()));
+                let want = matcher.find_at_utf16(text, start).map(|m| (m.start(), m.end()));
+                assert_eq!(got, want, "/.*/{flags} over {text:x?} from {start}");
+                assert_eq!(got, Some((from, text.len())), "/.*/{flags} over {text:x?} from {start}");
+                let got = plus.find_at_utf16(text, start).map(|m| (m.start(), m.end()));
+                let want = plus_matcher.find_at_utf16(text, start).map(|m| (m.start(), m.end()));
+                assert_eq!(got, want, "/.+/{flags} over {text:x?} from {start}");
+                assert_eq!(got, (from < text.len()).then_some((from, text.len())), "/.+/{flags} {text:x?} {start}");
+            }
+            // The global search: the rest of the text, then the empty match at its end.
+            let all: Vec<(usize, usize)> = shortcut.find_iter_utf16(text).map(|m| (m.start(), m.end())).collect();
+            let want: Vec<(usize, usize)> = matcher.find_iter_utf16(text).map(|m| (m.start(), m.end())).collect();
+            assert_eq!(all, want, "/.*/{flags} global over {text:x?}");
+            if !flags.contains('y') {
+                let expected: &[(usize, usize)] =
+                    if text.is_empty() { &[(0, 0)] } else { &[(0, text.len()), (text.len(), text.len())] };
+                assert_eq!(all, expected, "/.*/{flags} global over {text:x?}");
+            }
+        }
+    }
+}
