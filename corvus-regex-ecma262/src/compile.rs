@@ -70,7 +70,9 @@ pub(crate) struct Inst {
     pub flag: bool,
     pub r: Rune,
     pub set: Option<Arc<CharSet>>,
+    /// The literal run of a `Lit`, in UTF-8 and in UTF-16.
     pub lit: Box<[u8]>,
+    pub lit16: Box<[u16]>,
     /// `x` and `y` are jump targets.
     pub x: i32,
     pub y: i32,
@@ -82,9 +84,13 @@ pub(crate) struct Inst {
     pub max: i32,
     /// The least number of bytes of text that every way from this instruction to a match consumes going forward
     /// (see `set_needs`). It is set for a `Loop`, and counts none of the iterations the loop has still to make.
+    /// `need16` is the same in UTF-16 code units.
     pub need: i32,
-    /// The least number of bytes one iteration of the body of a `Loop` consumes going forward.
+    pub need16: i32,
+    /// The least number of bytes one iteration of the body of a `Loop` consumes going forward, and `iter16` the
+    /// least number of UTF-16 code units.
     pub iter: i32,
+    pub iter16: i32,
     /// The number of the instruction's memo point, counted from 1, or 0 when it has none (see [`MemoPoint`]). It is
     /// set for a `Split`, a `Loop`, a `Rep` and a `RepLazy`.
     pub m: i32,
@@ -98,6 +104,7 @@ impl Inst {
             r: 0,
             set: None,
             lit: Box::default(),
+            lit16: Box::default(),
             x: 0,
             y: 0,
             a: 0,
@@ -105,7 +112,9 @@ impl Inst {
             min: 0,
             max: 0,
             need: 0,
+            need16: 0,
             iter: 0,
+            iter16: 0,
             m: 0,
         }
     }
@@ -138,20 +147,23 @@ struct LoopContext {
 }
 
 /// A pattern compiled for the backtracking matcher.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Program {
     pub insts: Vec<Inst>,
-    /// The number of capturing groups some backreference names, and the number of counted loops.
+    /// The number of groups the program records (every capturing group, or those some backreference names), and the
+    /// number of counted loops.
     pub groups: usize,
     pub loops: usize,
     /// The pattern was read without the u flag, so the text is matched by UTF-16 code unit (see `units`).
     pub units: bool,
     /// Every match starts at the start of the text.
     pub anchored: bool,
-    /// Literal text every match starts with.
+    /// Literal text every match starts with, and the same in UTF-16.
     pub prefix: String,
-    /// The least number of bytes a match consumes (see `set_needs`).
+    pub prefix16: Vec<u16>,
+    /// The least number of bytes a match consumes (see `set_needs`), and of UTF-16 code units.
     pub need: usize,
+    pub need16: usize,
     /// The memo points of the program (see [`MemoPoint`]).
     pub points: Vec<MemoPoint>,
     /// For each instruction, which characters can come next on a way from it to the end of its match (see
@@ -178,8 +190,10 @@ struct Compiler {
 }
 
 /// Compiles a tree. Where the Go compiler copies the nodes it changes, because its tree is shared, this one takes
-/// the tree and changes it in place.
-pub(crate) fn compile_program(root: Node, unicode: bool) -> Program {
+/// the tree and changes it in place. With `groups` the program records every one of that many capturing groups,
+/// group `g` in slot `g - 1`, so that a match can report what each captured; without it, only the groups some
+/// backreference names.
+pub(crate) fn compile_program(root: Node, unicode: bool, groups: Option<usize>) -> Program {
     let mut open = Vec::new();
     let root = simplify(root, &mut open);
     let mut c = Compiler {
@@ -193,17 +207,27 @@ pub(crate) fn compile_program(root: Node, unicode: bool) -> Program {
     };
     let mut referenced = Vec::new();
     collect_backrefs(&root, &mut referenced);
-    // Slots follow group order, so the groups inside any one subtree take a contiguous range of slots.
-    referenced.sort_unstable();
-    referenced.dedup();
-    for (slot, g) in referenced.into_iter().enumerate() {
-        c.tracked.insert(g, slot as i32);
+    // A choice can be remembered to have failed only where what a group holds cannot change what follows.
+    c.memo = referenced.is_empty();
+    match groups {
+        Some(n) => {
+            for g in 1..=n as i32 {
+                c.tracked.insert(g, g - 1);
+            }
+        }
+        None => {
+            // Slots follow group order, so the groups inside any one subtree take a contiguous range of slots.
+            referenced.sort_unstable();
+            referenced.dedup();
+            for (slot, g) in referenced.into_iter().enumerate() {
+                c.tracked.insert(g, slot as i32);
+            }
+        }
     }
-    c.memo = c.tracked.is_empty();
     c.emit(&root, false);
     c.add(Inst::new(Op::Match));
     let mut insts = c.insts;
-    let need = set_needs(&mut insts);
+    let (need, need16) = set_needs(&mut insts);
     let quick = set_quick(&insts);
     let mut p = Program {
         insts,
@@ -212,13 +236,16 @@ pub(crate) fn compile_program(root: Node, unicode: bool) -> Program {
         units: !unicode,
         anchored: starts_at_bol(&root),
         prefix: String::new(),
+        prefix16: Vec::new(),
         need,
+        need16,
         points: c.points,
         quick,
         first: None,
     };
     if !p.anchored {
         literal_prefix(&root, &mut p.prefix);
+        p.prefix16 = p.prefix.encode_utf16().collect();
         if p.prefix.is_empty() {
             let mut pairs = Vec::new();
             if let Some(nullable) = first_chars(&root, &mut pairs)
@@ -375,7 +402,8 @@ impl Compiler {
                         j += 1;
                     }
                     if j - i >= 2 {
-                        self.add(Inst { lit: lit.into_bytes().into_boxed_slice(), ..Inst::new(Op::Lit) });
+                        let lit16 = lit.encode_utf16().collect();
+                        self.add(Inst { lit: lit.into_bytes().into_boxed_slice(), lit16, ..Inst::new(Op::Lit) });
                         i = j;
                         continue;
                     }
@@ -531,11 +559,20 @@ impl Compiler {
         let k = self.loops as i32;
         self.loops += 1;
         self.add(Inst { a: k, ..Inst::new(Op::LoopInit) });
-        let iter = if back { 0 } else { min_length(body) };
+        let (iter, iter16) = if back { (0, 0) } else { (min_length(body, true), min_length(body, false)) };
         let simple = max == UNBOUNDED && min <= 1;
         // The loop is left or entered from here, and what follows either depends on the loops around this one.
         let point = if simple { self.point() } else { 0 };
-        let loop_ = self.add(Inst { a: k, min, max, flag: n.lazy, iter: iter as i32, m: point, ..Inst::new(Op::Loop) });
+        let loop_ = self.add(Inst {
+            a: k,
+            min,
+            max,
+            flag: n.lazy,
+            iter: iter as i32,
+            iter16: iter16 as i32,
+            m: point,
+            ..Inst::new(Op::Loop)
+        });
         self.add(Inst { a: k, ..Inst::new(Op::LoopIter) });
         self.open.push(LoopContext { loop_: k, min, simple });
         self.emit_body(body, back, clear);
@@ -558,14 +595,18 @@ fn rune_len(r: Rune) -> i64 {
     }
 }
 
-/// The least number of bytes a match of `n` consumes, capped at `NO_MATCH`. Like the needs, it counts a character
-/// as its UTF-8 bytes when the matcher compares bytes for it and as one byte otherwise, so it can only be too
-/// small.
-fn min_length(n: &Node) -> i64 {
+/// The least number of units a match of `n` consumes, capped at `NO_MATCH`: bytes of UTF-8 with `utf8`, and UTF-16
+/// code units without it. Like the needs, it counts a character as its units when the matcher compares units for
+/// it and as one unit otherwise, so it can only be too small.
+fn min_length(n: &Node, utf8: bool) -> i64 {
     match n.kind {
         NodeKind::Char => {
-            if literal_rune(n.r) {
+            if !literal_rune(n.r) {
+                1
+            } else if utf8 {
                 rune_len(n.r)
+            } else if n.r > 0xFFFF {
+                2
             } else {
                 1
             }
@@ -580,16 +621,16 @@ fn min_length(n: &Node) -> i64 {
         NodeKind::Cat => {
             let mut total = 0;
             for sub in &n.subs {
-                total += min_length(sub);
+                total += min_length(sub, utf8);
                 if total >= NO_MATCH {
                     return NO_MATCH;
                 }
             }
             total
         }
-        NodeKind::Alt => n.subs.iter().map(min_length).min().unwrap_or(NO_MATCH).min(NO_MATCH),
-        NodeKind::Group => min_length(&n.subs[0]),
-        NodeKind::Repeat => times_need(n.min as i64, min_length(&n.subs[0])),
+        NodeKind::Alt => n.subs.iter().map(|sub| min_length(sub, utf8)).min().unwrap_or(NO_MATCH).min(NO_MATCH),
+        NodeKind::Group => min_length(&n.subs[0], utf8),
+        NodeKind::Repeat => times_need(n.min as i64, min_length(&n.subs[0], utf8)),
         _ => 0,
     }
 }
@@ -619,12 +660,21 @@ fn times_need(count: i64, need: i64) -> i64 {
 /// the figure can only be too small. The body of a lookaround ends at its own last instruction and the instruction
 /// that opens one goes straight to what follows it, so a body is counted by itself. An instruction that matches
 /// right to left, which is the body of a lookbehind, counts nothing.
-pub(crate) fn set_needs(insts: &mut [Inst]) -> usize {
-    needs(insts).0
+///
+/// The needs are worked out twice, in bytes of UTF-8 and in UTF-16 code units, and the two needs of the program are
+/// returned.
+pub(crate) fn set_needs(insts: &mut [Inst]) -> (usize, usize) {
+    let need16 = needs_in(insts, false).0;
+    (needs(insts).0, need16)
 }
 
-/// [`set_needs`], and also the number of passes over the instructions it made, the last of which changed nothing.
+/// [`set_needs`] in bytes of UTF-8 alone, and also the number of passes over the instructions it made, the last of
+/// which changed nothing.
 pub(crate) fn needs(insts: &mut [Inst]) -> (usize, usize) {
+    needs_in(insts, true)
+}
+
+fn needs_in(insts: &mut [Inst], utf8: bool) -> (usize, usize) {
     let mut need = vec![NO_MATCH as i32; insts.len()];
     let mut passes = 0;
     // The needs only fall, and nearly every way goes forward, so going through the instructions from the last to
@@ -648,7 +698,7 @@ pub(crate) fn needs(insts: &mut [Inst]) -> (usize, usize) {
                 Op::Match | Op::LookOk | Op::LookFail => n = 0,
                 Op::Fail => {}
                 Op::Char | Op::Set => next(after, 1),
-                Op::Lit => next(after, i.lit.len() as i64),
+                Op::Lit => next(after, if utf8 { i.lit.len() } else { i.lit16.len() } as i64),
                 Op::Rep | Op::RepLazy => next(after, i.min as i64),
                 Op::Jmp => {
                     // The one way that goes back is the jump at the end of the body of a loop, to the instruction
@@ -678,7 +728,8 @@ pub(crate) fn needs(insts: &mut [Inst]) -> (usize, usize) {
                 }
                 Op::LoopInit => {
                     let loop_ = &insts[pc + 1];
-                    next(after, times_need(loop_.min as i64, loop_.iter as i64));
+                    let iter = if utf8 { loop_.iter } else { loop_.iter16 };
+                    next(after, times_need(loop_.min as i64, iter as i64));
                 }
                 _ => next(after, 0),
             }
@@ -691,7 +742,11 @@ pub(crate) fn needs(insts: &mut [Inst]) -> (usize, usize) {
     }
     for (pc, i) in insts.iter_mut().enumerate() {
         if i.op == Op::Loop {
-            i.need = need[pc];
+            if utf8 {
+                i.need = need[pc];
+            } else {
+                i.need16 = need[pc];
+            }
         }
     }
     (need[0] as usize, passes)
@@ -716,14 +771,14 @@ pub(crate) struct Quick {
 impl Quick {
     /// Whether a way can go on from the position.
     #[inline(always)]
-    pub(crate) fn allows(&self, input: &[u8], pos: usize) -> bool {
+    pub(crate) fn allows<U: Copy + Into<u32>>(&self, input: &[U], pos: usize) -> bool {
         if pos >= input.len() {
             return self.end;
         }
         if self.mid {
             return true;
         }
-        let c = input[pos];
+        let c: u32 = input[pos].into();
         if c < 0x80 {
             return (self.ascii[(c >> 6) as usize] >> (c & 63)) & 1 != 0;
         }

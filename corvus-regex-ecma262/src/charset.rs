@@ -11,7 +11,7 @@ pub(crate) const MAX_RUNE: Rune = ucd::MAX_RUNE;
 
 /// An immutable set of code points. The ranges are sorted, inclusive, and neither overlap nor touch. The two words
 /// of `ascii` repeat the membership of the code points below 128 so that the common case is one bit test.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CharSet {
     pub(crate) ranges: Vec<Rune>,
     pub(crate) ascii: [u64; 2],

@@ -152,15 +152,310 @@ pub(crate) fn unit_before(input: &[u8], pos: usize) -> (Rune, usize) {
     (r, w)
 }
 
-/// The character at the position and its width in bytes: a code unit with `units` set, and a code point otherwise.
-/// It is for the places that are not hot. The matcher's own instructions make the choice themselves.
-#[inline]
-pub(crate) fn decode(input: &[u8], pos: usize, units: bool) -> (Rune, usize) {
-    if units { unit_at(input, pos) } else { decode_rune(&input[pos..]) }
+/// A text the matcher reads: UTF-8 bytes ([`Utf8`]), or UTF-16 code units ([`Utf16`]). Every method of the matcher
+/// is generic over it, so the compiler makes one matcher for each and there is no branch on the encoding in the
+/// loop. A position is an offset in the units of the text. Over UTF-8 the position between the halves of a
+/// character beyond the Basic Multilingual Plane is the offset of its third byte (see the top of this file); over
+/// UTF-16 every unit is a position, and with the u flag a position inside a surrogate pair is not one the matcher
+/// stands at.
+///
+/// It is public only so that the public `Haystack` trait can name it; the module that holds it is private.
+pub trait Text: Copy + 'static {
+    type Unit: Copy + Eq + Ord + Into<u32> + std::fmt::Debug + 'static;
+    /// Whether a unit is a byte of UTF-8.
+    const UTF8: bool;
+
+    /// The code point at the position and its width in units: with the u flag a surrogate pair is one code point
+    /// and a lone surrogate is a code point of its own.
+    fn decode(input: &[Self::Unit], pos: usize) -> (Rune, usize);
+    /// The code point that ends at the position, and its width.
+    fn decode_last(input: &[Self::Unit], pos: usize) -> (Rune, usize);
+    /// The UTF-16 code unit at the position and its width in units.
+    fn unit_at(input: &[Self::Unit], pos: usize) -> (Rune, usize);
+    /// The UTF-16 code unit that ends at the position and its width.
+    fn unit_before(input: &[Self::Unit], pos: usize) -> (Rune, usize);
+    /// The width of the last character of `input[from..pos]`, read as it was read going forward from `from`.
+    fn give_back(input: &[Self::Unit], from: usize, pos: usize, units: bool) -> usize;
+    fn line_terminator_at(input: &[Self::Unit], pos: usize) -> bool;
+    fn line_terminator_before(input: &[Self::Unit], pos: usize) -> bool;
+    /// Of a value kept in both encodings (a literal in UTF-8 and in UTF-16), the one in this encoding.
+    fn pick<'a>(utf8: &'a [u8], utf16: &'a [u16]) -> &'a [Self::Unit];
+    /// Whether the units `input[from..to]`, compared equal to a group's, are the same code points: false only when
+    /// the comparison ends inside a surrogate pair of the text, which the u flag reads as one code point.
+    fn whole(input: &[Self::Unit], from: usize, to: usize) -> bool;
+    /// The offset of the first occurrence of `needle` in `haystack`.
+    fn find(haystack: &[Self::Unit], needle: &[Self::Unit]) -> Option<usize>;
+    /// Appends `input[from..to]` to `out`. Over UTF-8 a bound between the halves of a character (which only a
+    /// pattern without the u flag can make) cannot be written as UTF-8, and the half character is written as
+    /// U+FFFD, as a lossy conversion of the UTF-16 text would write it; so the result is UTF-8 when the input is.
+    fn push_lossy(out: &mut Vec<Self::Unit>, input: &[Self::Unit], from: usize, to: usize);
+    /// The position a search from `start` begins at. With the u flag a position inside a character means the
+    /// character (RegExpBuiltinExec reads the text as code points); without it every code unit is a position,
+    /// which over UTF-8 is a character's first byte or the third byte of a character of four.
+    fn normalize(input: &[Self::Unit], start: usize, unicode: bool) -> usize;
+    /// The position after the character at `pos` (AdvanceStringIndex): a code point with the u flag and a code unit
+    /// without it.
+    fn advance(input: &[Self::Unit], pos: usize, unicode: bool) -> usize;
+    /// The units of a UTF-8 string in this encoding.
+    fn encode(s: &str) -> Vec<Self::Unit>;
+
+    /// The character at the position: a code unit with `units` set, and a code point otherwise.
+    #[inline(always)]
+    fn read(input: &[Self::Unit], pos: usize, units: bool) -> (Rune, usize) {
+        if units { Self::unit_at(input, pos) } else { Self::decode(input, pos) }
+    }
+
+    /// [`Text::read`] for the character that ends at the position.
+    #[inline(always)]
+    fn read_last(input: &[Self::Unit], pos: usize, units: bool) -> (Rune, usize) {
+        if units { Self::unit_before(input, pos) } else { Self::decode_last(input, pos) }
+    }
 }
 
-/// [`decode`] for the character that ends at the position.
+/// UTF-8 text: the bytes of a `str`, or bytes read a byte at a time as U+FFFD where they are not UTF-8.
+#[derive(Clone, Copy)]
+pub struct Utf8;
+
+/// UTF-16 text, which may hold lone surrogates.
+#[derive(Clone, Copy)]
+pub struct Utf16;
+
+impl Text for Utf8 {
+    type Unit = u8;
+    const UTF8: bool = true;
+
+    #[inline(always)]
+    fn decode(input: &[u8], pos: usize) -> (Rune, usize) {
+        decode_rune(&input[pos..])
+    }
+
+    #[inline(always)]
+    fn decode_last(input: &[u8], pos: usize) -> (Rune, usize) {
+        decode_last_rune(&input[..pos])
+    }
+
+    #[inline(always)]
+    fn unit_at(input: &[u8], pos: usize) -> (Rune, usize) {
+        unit_at(input, pos)
+    }
+
+    #[inline(always)]
+    fn unit_before(input: &[u8], pos: usize) -> (Rune, usize) {
+        unit_before(input, pos)
+    }
+
+    #[inline(always)]
+    fn give_back(input: &[u8], from: usize, pos: usize, units: bool) -> usize {
+        if input[pos - 1] < RUNE_SELF {
+            1
+        } else if units {
+            unit_before(input, pos).1
+        } else {
+            decode_last_rune(&input[from..pos]).1
+        }
+    }
+
+    #[inline]
+    fn line_terminator_at(input: &[u8], pos: usize) -> bool {
+        match input[pos] {
+            b'\n' | b'\r' => true,
+            0xE2 => {
+                pos + 2 < input.len() && input[pos + 1] == 0x80 && (input[pos + 2] == 0xA8 || input[pos + 2] == 0xA9)
+            }
+            _ => false,
+        }
+    }
+
+    /// U+2028 and U+2029 are E2 80 A8 and E2 80 A9.
+    #[inline]
+    fn line_terminator_before(input: &[u8], pos: usize) -> bool {
+        match input[pos - 1] {
+            b'\n' | b'\r' => true,
+            0xA8 | 0xA9 => pos >= 3 && input[pos - 3] == 0xE2 && input[pos - 2] == 0x80,
+            _ => false,
+        }
+    }
+
+    #[inline(always)]
+    fn pick<'a>(utf8: &'a [u8], _: &'a [u16]) -> &'a [u8] {
+        utf8
+    }
+
+    #[inline(always)]
+    fn whole(_: &[u8], _: usize, _: usize) -> bool {
+        true
+    }
+
+    #[inline]
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        memchr::memmem::find(haystack, needle)
+    }
+
+    fn push_lossy(out: &mut Vec<u8>, input: &[u8], mut from: usize, mut to: usize) {
+        if from >= to {
+            return;
+        }
+        if inside_four(input, from) {
+            out.extend_from_slice("\u{FFFD}".as_bytes());
+            from += 2;
+        }
+        let tail = to < input.len() && inside_four(input, to);
+        if tail {
+            to -= 2;
+        }
+        if from < to {
+            out.extend_from_slice(&input[from..to]);
+        }
+        if tail {
+            out.extend_from_slice("\u{FFFD}".as_bytes());
+        }
+    }
+
+    fn normalize(input: &[u8], start: usize, unicode: bool) -> usize {
+        if start == 0 || start >= input.len() || !continuation(input[start]) {
+            return start;
+        }
+        let mut lead = start;
+        while lead > 0 && continuation(input[lead]) {
+            lead -= 1;
+        }
+        if !unicode && input[lead] >= 0xF0 && start == lead + 2 {
+            return start;
+        }
+        lead
+    }
+
+    fn advance(input: &[u8], pos: usize, unicode: bool) -> usize {
+        if pos >= input.len() {
+            return pos + 1;
+        }
+        if unicode { pos + decode_rune(&input[pos..]).1 } else { pos + unit_at(input, pos).1 }
+    }
+
+    fn encode(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+}
+
+/// Whether the position is the one between the halves of a character of four bytes: its third byte.
 #[inline]
-pub(crate) fn decode_last(input: &[u8], pos: usize, units: bool) -> (Rune, usize) {
-    if units { unit_before(input, pos) } else { decode_last_rune(&input[..pos]) }
+fn inside_four(input: &[u8], pos: usize) -> bool {
+    pos >= 2
+        && pos < input.len()
+        && continuation(input[pos])
+        && input[pos - 2] >= 0xF0
+        && decode_rune(&input[pos - 2..]).1 == 4
+}
+
+#[inline(always)]
+fn high(u: u16) -> bool {
+    (0xD800..=0xDBFF).contains(&u)
+}
+
+#[inline(always)]
+fn low(u: u16) -> bool {
+    (0xDC00..=0xDFFF).contains(&u)
+}
+
+impl Text for Utf16 {
+    type Unit = u16;
+    const UTF8: bool = false;
+
+    #[inline(always)]
+    fn decode(input: &[u16], pos: usize) -> (Rune, usize) {
+        let u = input[pos];
+        if high(u) && pos + 1 < input.len() && low(input[pos + 1]) {
+            return (0x10000 + (((u as Rune) - 0xD800) << 10) + (input[pos + 1] as Rune - 0xDC00), 2);
+        }
+        (u as Rune, 1)
+    }
+
+    #[inline(always)]
+    fn decode_last(input: &[u16], pos: usize) -> (Rune, usize) {
+        let u = input[pos - 1];
+        if low(u) && pos >= 2 && high(input[pos - 2]) {
+            return (0x10000 + (((input[pos - 2] as Rune) - 0xD800) << 10) + (u as Rune - 0xDC00), 2);
+        }
+        (u as Rune, 1)
+    }
+
+    #[inline(always)]
+    fn unit_at(input: &[u16], pos: usize) -> (Rune, usize) {
+        (input[pos] as Rune, 1)
+    }
+
+    #[inline(always)]
+    fn unit_before(input: &[u16], pos: usize) -> (Rune, usize) {
+        (input[pos - 1] as Rune, 1)
+    }
+
+    #[inline(always)]
+    fn give_back(input: &[u16], from: usize, pos: usize, units: bool) -> usize {
+        if !units && low(input[pos - 1]) && pos >= from + 2 && high(input[pos - 2]) { 2 } else { 1 }
+    }
+
+    #[inline]
+    fn line_terminator_at(input: &[u16], pos: usize) -> bool {
+        matches!(input[pos], 0x0A | 0x0D | 0x2028 | 0x2029)
+    }
+
+    #[inline]
+    fn line_terminator_before(input: &[u16], pos: usize) -> bool {
+        matches!(input[pos - 1], 0x0A | 0x0D | 0x2028 | 0x2029)
+    }
+
+    #[inline(always)]
+    fn pick<'a>(_: &'a [u8], utf16: &'a [u16]) -> &'a [u16] {
+        utf16
+    }
+
+    #[inline(always)]
+    fn whole(input: &[u16], from: usize, to: usize) -> bool {
+        let starts_inside = from > 0 && from < input.len() && low(input[from]) && high(input[from - 1]);
+        let ends_inside = to > from && to < input.len() && high(input[to - 1]) && low(input[to]);
+        !(starts_inside || ends_inside)
+    }
+
+    fn find(haystack: &[u16], needle: &[u16]) -> Option<usize> {
+        let (&first, rest) = needle.split_first()?;
+        let mut at = 0;
+        while haystack.len() - at >= needle.len() {
+            at += haystack[at..=haystack.len() - needle.len()].iter().position(|&u| u == first)?;
+            if haystack[at + 1..at + needle.len()] == *rest {
+                return Some(at);
+            }
+            at += 1;
+        }
+        None
+    }
+
+    fn push_lossy(out: &mut Vec<u16>, input: &[u16], from: usize, to: usize) {
+        if from < to {
+            out.extend_from_slice(&input[from..to]);
+        }
+    }
+
+    fn normalize(input: &[u16], start: usize, unicode: bool) -> usize {
+        if unicode && start > 0 && start < input.len() && low(input[start]) && high(input[start - 1]) {
+            return start - 1;
+        }
+        start
+    }
+
+    fn advance(input: &[u16], pos: usize, unicode: bool) -> usize {
+        if pos >= input.len() {
+            return pos + 1;
+        }
+        if unicode { pos + Self::decode(input, pos).1 } else { pos + 1 }
+    }
+
+    fn encode(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+}
+
+/// Whether a code unit is one of the 63 ASCII word characters.
+#[inline(always)]
+pub(crate) fn is_word_unit(c: u32) -> bool {
+    c < 0x80 && super::charset::is_word_byte(c as u8)
 }

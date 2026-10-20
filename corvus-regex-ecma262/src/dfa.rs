@@ -140,6 +140,7 @@ impl NfaBuilder {
 
 /// The automaton. A state is a byte, a byte of the text is one of a few classes (bytes the pattern does not tell
 /// apart), and `trans[state << shift | class]` is the state after the byte.
+#[derive(Clone)]
 pub(crate) struct Dfa {
     class: [u8; 256],
     trans: Vec<u8>,
@@ -155,7 +156,7 @@ impl Dfa {
     /// Reports whether the pattern matches the text. `None` when the text is not ASCII, which this automaton does
     /// not decide.
     #[inline]
-    pub(crate) fn is_match(&self, text: &[u8]) -> Option<bool> {
+    pub(crate) fn is_match<U: Copy + Into<u32>>(&self, text: &[U]) -> Option<bool> {
         if text.is_empty() {
             return Some(self.empty);
         }
@@ -165,7 +166,9 @@ impl Dfa {
         }
         let (trans, shift) = (&self.trans[..], self.shift);
         for &c in text {
-            s = trans[(s as usize) << shift | self.class[c as usize] as usize];
+            let c: u32 = c.into();
+            // A unit beyond ASCII is in class 0, as every byte beyond ASCII is.
+            s = trans[(s as usize) << shift | self.class[c.min(0x80) as usize] as usize];
             if (s as usize) < DFA_FIRST {
                 return if s == DFA_BAIL { None } else { Some(s == DFA_ACCEPT) };
             }

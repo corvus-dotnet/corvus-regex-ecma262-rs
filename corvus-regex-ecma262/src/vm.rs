@@ -4,10 +4,9 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use super::Rune;
-use super::charset::is_word_byte;
 use super::compile::{Inst, MAX_MEMO_LOOPS, Op, Program};
 use super::fold::{canonicalize, is_fold_word_rune};
-use super::units::{RUNE_SELF, decode, decode_last, decode_last_rune, decode_rune, unit_at, unit_before};
+use super::units::{Text, is_word_unit};
 
 /// Why a match was abandoned. Neither is an answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +94,8 @@ struct State {
     tmp: Vec<usize>,
     /// For each loop, the number of iterations started and the position at which the last one started.
     counts: Vec<usize>,
+    /// Where the match that was found ends.
+    end: usize,
     /// The time the match may take, or `None` for no limit. The clock starts at the first check, so `deadline` is
     /// set when `timed` is.
     limit: Option<Duration>,
@@ -236,18 +237,35 @@ impl Program {
         idx
     }
 
-    /// Reports whether the program matches anywhere in the text. With a limit the match is abandoned when it has
+    /// Finds the first match at or after `start` (at `start` alone with `sticky`), and returns where it starts and
+    /// ends. When it finds one and `caps` is given, `caps` receives the start and end of each group the program
+    /// records, or `usize::MAX` for a group that did not take part. With a limit the match is abandoned when it has
     /// run for longer than that, or when its stack has reached `MAX_STACK`, and the error says which.
-    pub(crate) fn is_match(&self, text: &str, limit: Option<Duration>) -> Result<bool, MatchError> {
+    pub(crate) fn exec<T: Text>(
+        &self,
+        input: &[T::Unit],
+        start: usize,
+        sticky: bool,
+        limit: Option<Duration>,
+        caps: Option<&mut [usize]>,
+    ) -> Result<Option<(usize, usize)>, MatchError> {
         STATE.with(|cell| match cell.try_borrow_mut() {
-            Ok(mut st) => self.match_with(&mut st, text, limit),
+            Ok(mut st) => self.match_with::<T>(&mut st, input, start, sticky, limit, caps),
             // The thread is already inside a match, which nothing in the crate does. A match is then given a
             // memory of its own.
-            Err(_) => self.match_with(&mut State::default(), text, limit),
+            Err(_) => self.match_with::<T>(&mut State::default(), input, start, sticky, limit, caps),
         })
     }
 
-    fn match_with(&self, st: &mut State, text: &str, limit: Option<Duration>) -> Result<bool, MatchError> {
+    fn match_with<T: Text>(
+        &self,
+        st: &mut State,
+        input: &[T::Unit],
+        start: usize,
+        sticky: bool,
+        limit: Option<Duration>,
+        caps: Option<&mut [usize]>,
+    ) -> Result<Option<(usize, usize)>, MatchError> {
         st.caps.clear();
         st.caps.resize(2 * self.groups, NONE);
         st.tmp.clear();
@@ -256,12 +274,15 @@ impl Program {
         st.counts.resize(2 * self.loops, 0);
         (st.limit, st.deadline, st.steps, st.stop) = (limit.filter(|l| !l.is_zero()), None, CHECK_EVERY, STOP_NONE);
         (st.memo_on, st.memo_off, st.checks) = (false, self.points.is_empty(), 0);
-        (st.width, st.points) = (text.len() + 1, self.points.len());
+        (st.width, st.points) = (input.len() + 1, self.points.len());
         if !st.memo_off && memo_from_the_start() {
             st.remember();
         }
-        let ok = self.search(st, text);
+        let found = self.search::<T>(st, input, start, sticky);
         let stop = st.stop;
+        if let (Some(_), Some(caps)) = (found, caps) {
+            caps[..st.caps.len()].copy_from_slice(&st.caps);
+        }
         if st.stack.capacity() > MAX_RETAINED_STACK {
             st.stack = Vec::new();
         }
@@ -271,57 +292,57 @@ impl Program {
         match stop {
             STOP_TIME => Err(MatchError::Time),
             STOP_MEMORY => Err(MatchError::Memory),
-            _ => Ok(ok),
+            _ => Ok(found),
         }
     }
 
-    fn search(&self, st: &mut State, text: &str) -> bool {
-        let input = text.as_bytes();
-        if input.len() < self.need {
-            return false;
+    fn search<T: Text>(&self, st: &mut State, input: &[T::Unit], start: usize, sticky: bool) -> Option<(usize, usize)> {
+        let len = input.len();
+        let need = if T::UTF8 { self.need } else { self.need16 };
+        if start > len || len - start < need {
+            return None;
         }
-        if self.anchored {
-            return self.run(st, input, 0);
+        if sticky || self.anchored {
+            if self.anchored && start > 0 {
+                return None;
+            }
+            return self.run::<T>(st, input, start).then_some((start, st.end));
         }
-        if !self.prefix.is_empty() {
-            let mut at = 0;
+        let prefix = T::pick(self.prefix.as_bytes(), &self.prefix16);
+        if !prefix.is_empty() {
+            let mut at = start;
             loop {
-                // The search for the literal takes time proportional to the text (the standard library searches for
-                // a string in linear time). `at` is at the start of a character: a literal starts with one.
-                let Some(i) = text[at..].find(&self.prefix) else { return false };
-                at += i;
-                if input.len() - at < self.need {
-                    return false;
+                // The search for the literal takes time proportional to the text. `at` is at the start of a
+                // character: a literal starts with one.
+                at += T::find(&input[at..], prefix)?;
+                if len - at < need {
+                    return None;
                 }
-                if self.run(st, input, at) {
-                    return true;
+                if self.run::<T>(st, input, at) {
+                    return Some((at, st.end));
                 }
                 if st.stop != STOP_NONE {
-                    return false;
+                    return None;
                 }
-                at += 1;
-                while !text.is_char_boundary(at) {
-                    at += 1;
-                }
+                at += T::decode(input, at).1;
             }
         }
-        let mut at = 0;
+        let units = self.units;
+        let mut at = start;
         loop {
-            if input.len() - at < self.need {
-                return false;
+            if len - at < need {
+                return None;
             }
-            if at == input.len() {
-                return self.first.is_none() && self.run(st, input, at);
+            if at == len {
+                return (self.first.is_none() && self.run::<T>(st, input, at)).then_some((at, st.end));
             }
-            let (mut r, mut w) = (input[at] as Rune, 1);
-            if input[at] >= RUNE_SELF {
-                (r, w) = if self.units { unit_at(input, at) } else { decode_rune(&input[at..]) };
-            }
-            if self.first.as_ref().is_none_or(|first| first.contains(r)) && self.run(st, input, at) {
-                return true;
+            let c: u32 = input[at].into();
+            let (r, w) = if c < 0x80 { (c as Rune, 1) } else { T::read(input, at, units) };
+            if self.first.as_ref().is_none_or(|first| first.contains(r)) && self.run::<T>(st, input, at) {
+                return Some((at, st.end));
             }
             if st.stop != STOP_NONE {
-                return false;
+                return None;
             }
             at += w;
         }
@@ -331,15 +352,15 @@ impl Program {
     /// the depth of the search is bounded by memory and not by the stack of the thread. When it fails, every group
     /// and counter is back to the value it had on entry. It counts its steps, and when a check says the match has
     /// reached a limit it returns false with the reason in `st.stop`.
-    fn run(&self, st: &mut State, input: &[u8], start: usize) -> bool {
+    fn run<T: Text>(&self, st: &mut State, input: &[T::Unit], start: usize) -> bool {
         let mut stack = std::mem::take(&mut st.stack);
         stack.clear();
-        let matched = self.run_on(st, &mut stack, input, start);
+        let matched = self.run_on::<T>(st, &mut stack, input, start);
         st.stack = stack;
         matched
     }
 
-    fn run_on(&self, st: &mut State, stack: &mut Vec<Entry>, input: &[u8], start: usize) -> bool {
+    fn run_on<T: Text>(&self, st: &mut State, stack: &mut Vec<Entry>, input: &[T::Unit], start: usize) -> bool {
         let insts = &self.insts[..];
         let quick = &self.quick[..];
         // The text is matched by UTF-16 code unit (see `units`).
@@ -363,15 +384,15 @@ impl Program {
             match i.op {
                 Op::Char => {
                     if pos < len {
-                        let c = input[pos];
-                        if c < RUNE_SELF {
+                        let c: u32 = input[pos].into();
+                        if c < 0x80 {
                             if c as Rune == i.r {
                                 pos += 1;
                                 pc += 1;
                                 continue 'run;
                             }
                         } else {
-                            let (r, w) = if units { unit_at(input, pos) } else { decode_rune(&input[pos..]) };
+                            let (r, w) = T::read(input, pos, units);
                             if r == i.r {
                                 pos += w;
                                 pc += 1;
@@ -383,15 +404,15 @@ impl Program {
                 Op::Set => {
                     if pos < len {
                         let set = set_of(i);
-                        let c = input[pos];
-                        if c < RUNE_SELF {
-                            if set.has_ascii(c) {
+                        let c: u32 = input[pos].into();
+                        if c < 0x80 {
+                            if set.has_ascii(c as u8) {
                                 pos += 1;
                                 pc += 1;
                                 continue 'run;
                             }
                         } else {
-                            let (r, w) = if units { unit_at(input, pos) } else { decode_rune(&input[pos..]) };
+                            let (r, w) = T::read(input, pos, units);
                             if set.contains(r) {
                                 pos += w;
                                 pc += 1;
@@ -401,8 +422,9 @@ impl Program {
                     }
                 }
                 Op::Lit => {
-                    let n = i.lit.len();
-                    if len - pos >= n && input[pos..pos + n] == *i.lit {
+                    let lit = T::pick(&i.lit, &i.lit16);
+                    let n = lit.len();
+                    if len - pos >= n && input[pos..pos + n] == *lit {
                         pos += n;
                         pc += 1;
                         continue 'run;
@@ -410,10 +432,8 @@ impl Program {
                 }
                 Op::CharBack | Op::SetBack => {
                     if pos > 0 {
-                        let (mut r, mut w) = (input[pos - 1] as Rune, 1);
-                        if input[pos - 1] >= RUNE_SELF {
-                            (r, w) = if units { unit_before(input, pos) } else { decode_last_rune(&input[..pos]) };
-                        }
+                        let c: u32 = input[pos - 1].into();
+                        let (r, w) = if c < 0x80 { (c as Rune, 1) } else { T::read_last(input, pos, units) };
                         if if i.op == Op::CharBack { r == i.r } else { set_of(i).contains(r) } {
                             pos -= w;
                             pc += 1;
@@ -435,28 +455,28 @@ impl Program {
                     }
                 }
                 Op::WordBoundary | Op::NotWordBoundary => {
-                    let before = pos > 0 && is_word_byte(input[pos - 1]);
-                    let after = pos < len && is_word_byte(input[pos]);
+                    let before = pos > 0 && is_word_unit(input[pos - 1].into());
+                    let after = pos < len && is_word_unit(input[pos].into());
                     if (before != after) == (i.op == Op::WordBoundary) {
                         pc += 1;
                         continue 'run;
                     }
                 }
                 Op::LineStart => {
-                    if pos == 0 || line_terminator_before(input, pos) {
+                    if pos == 0 || T::line_terminator_before(input, pos) {
                         pc += 1;
                         continue 'run;
                     }
                 }
                 Op::LineEnd => {
-                    if pos == len || line_terminator_at(input, pos) {
+                    if pos == len || T::line_terminator_at(input, pos) {
                         pc += 1;
                         continue 'run;
                     }
                 }
                 Op::WordBoundaryFold | Op::NotWordBoundaryFold => {
-                    let before = pos > 0 && is_fold_word_rune(decode_last_rune(&input[..pos]).0);
-                    let after = pos < len && is_fold_word_rune(decode_rune(&input[pos..]).0);
+                    let before = pos > 0 && is_fold_word_rune(T::decode_last(input, pos).0);
+                    let after = pos < len && is_fold_word_rune(T::decode(input, pos).0);
                     if (before != after) == (i.op == Op::WordBoundaryFold) {
                         pc += 1;
                         continue 'run;
@@ -533,7 +553,7 @@ impl Program {
                         continue 'run;
                     }
                     let n = to - from;
-                    if len - pos >= n && input[pos..pos + n] == input[from..to] {
+                    if len - pos >= n && input[pos..pos + n] == input[from..to] && T::whole(input, pos, pos + n) {
                         steps -= (n >> 3) as i64;
                         pos += n;
                         pc += 1;
@@ -548,7 +568,7 @@ impl Program {
                         continue 'run;
                     }
                     let n = to - from;
-                    if pos >= n && input[pos - n..pos] == input[from..to] {
+                    if pos >= n && input[pos - n..pos] == input[from..to] && T::whole(input, pos - n, pos) {
                         steps -= (n >> 3) as i64;
                         pos -= n;
                         pc += 1;
@@ -567,13 +587,13 @@ impl Program {
                     steps -= ((to - from) >> 3) as i64;
                     let (mut at, mut ok) = (pos, true);
                     while from < to && ok {
-                        let (want, w) = decode(input, from, units);
+                        let (want, w) = T::read(input, from, units);
                         from += w;
                         if at >= len {
                             ok = false;
                             break;
                         }
-                        let (got, w) = decode(input, at, units);
+                        let (got, w) = T::read(input, at, units);
                         at += w;
                         ok = got == want
                             || i.op == Op::BackrefFold && canonicalize(got, i.flag) == canonicalize(want, i.flag);
@@ -594,13 +614,13 @@ impl Program {
                     steps -= ((to - from) >> 3) as i64;
                     let (mut at, mut ok) = (pos, true);
                     while from < to && ok {
-                        let (want, w) = decode_last(input, to, units);
+                        let (want, w) = T::read_last(input, to, units);
                         to -= w;
                         if at == 0 {
                             ok = false;
                             break;
                         }
-                        let (got, w) = decode_last(input, at, units);
+                        let (got, w) = T::read_last(input, at, units);
                         at -= w;
                         ok = got == want
                             || i.op == Op::BackrefFoldBack && canonicalize(got, i.flag) == canonicalize(want, i.flag);
@@ -654,14 +674,14 @@ impl Program {
                     let (mut at, mut n, mut floor) = (pos, 0i32, pos);
                     if let Some(set) = &i.set {
                         while n != i.max && at < len {
-                            let c = input[at];
-                            if c < RUNE_SELF {
-                                if !set.has_ascii(c) {
+                            let c: u32 = input[at].into();
+                            if c < 0x80 {
+                                if !set.has_ascii(c as u8) {
                                     break;
                                 }
                                 at += 1;
                             } else {
-                                let (r, w) = if units { unit_at(input, at) } else { decode_rune(&input[at..]) };
+                                let (r, w) = T::read(input, at, units);
                                 if !set.contains(r) {
                                     break;
                                 }
@@ -674,10 +694,8 @@ impl Program {
                         }
                     } else {
                         while n != i.max && at < len {
-                            let (mut r, mut w) = (input[at] as Rune, 1);
-                            if input[at] >= RUNE_SELF {
-                                (r, w) = if units { unit_at(input, at) } else { decode_rune(&input[at..]) };
-                            }
+                            let c: u32 = input[at].into();
+                            let (r, w) = if c < 0x80 { (c as Rune, 1) } else { T::read(input, at, units) };
                             if r != i.r {
                                 break;
                             }
@@ -715,7 +733,7 @@ impl Program {
                 Op::RepLazy => 'rep: {
                     let (mut at, mut n) = (pos, 0i32);
                     while n < i.min {
-                        let w = one(i, input, at, units);
+                        let w = one::<T>(i, input, at, units);
                         if w == 0 {
                             break;
                         }
@@ -756,10 +774,15 @@ impl Program {
                 Op::Loop => 'looping: {
                     let a = i.a as usize;
                     let n = st.counts[2 * a] as i64;
-                    let (min, need, left) = (i.min as i64, i.need as i64, (len - pos) as i64);
-                    // Fewer bytes are left than any way from here to a match consumes: what follows the loop, and
+                    let (min, need, left, iter) = (
+                        i.min as i64,
+                        if T::UTF8 { i.need } else { i.need16 } as i64,
+                        (len - pos) as i64,
+                        if T::UTF8 { i.iter } else { i.iter16 } as i64,
+                    );
+                    // Fewer units are left than any way from here to a match consumes: what follows the loop, and
                     // the iterations it has still to make.
-                    if left < need || n < min && i.iter != 0 && left - need < (min - n) * i.iter as i64 {
+                    if left < need || n < min && iter != 0 && left - need < (min - n) * iter {
                         break 'looping;
                     }
                     // Once the minimum is met, ECMA-262 rejects an iteration that consumed nothing. That is what
@@ -810,6 +833,7 @@ impl Program {
                 }
                 Op::Match => {
                     st.steps = steps;
+                    st.end = pos;
                     return true;
                 }
             }
@@ -836,15 +860,7 @@ impl Program {
                         }
                         // Give back the last character taken. The characters between a and pos were decoded going
                         // forward, and decoding the last of them going backward finds the same boundary.
-                        let mut w = 1;
-                        if input[e.pos - 1] >= RUNE_SELF {
-                            w = if units {
-                                unit_before(input, e.pos).1
-                            } else {
-                                decode_last_rune(&input[e.a..e.pos]).1
-                            };
-                        }
-                        let at = e.pos - w;
+                        let at = e.pos - T::give_back(input, e.a, e.pos, units);
                         stack[top].pos = at;
                         (pc, pos) = (e.pc as usize, at);
                         let last = at <= e.a;
@@ -878,7 +894,7 @@ impl Program {
                             let idx = self.memo_index(st, rep.m, e.pos);
                             st.memo[idx >> 6] |= 1 << (idx & 63);
                         }
-                        let w = one(rep, input, e.pos, units);
+                        let w = one::<T>(rep, input, e.pos, units);
                         if w == 0 {
                             stack.pop();
                             continue;
@@ -936,35 +952,15 @@ fn set_of(i: &Inst) -> &super::charset::CharSet {
     i.set.as_deref().expect("a set instruction has a class")
 }
 
-/// Whether the character before the position is an ECMA-262 line terminator, and `line_terminator_at` whether the
-/// character at the position is one. U+2028 and U+2029 are E2 80 A8 and E2 80 A9.
-fn line_terminator_before(input: &[u8], pos: usize) -> bool {
-    match input[pos - 1] {
-        b'\n' | b'\r' => true,
-        0xA8 | 0xA9 => pos >= 3 && input[pos - 3] == 0xE2 && input[pos - 2] == 0x80,
-        _ => false,
-    }
-}
-
-fn line_terminator_at(input: &[u8], pos: usize) -> bool {
-    match input[pos] {
-        b'\n' | b'\r' => true,
-        0xE2 => pos + 2 < input.len() && input[pos + 1] == 0x80 && (input[pos + 2] == 0xA8 || input[pos + 2] == 0xA9),
-        _ => false,
-    }
-}
-
 /// The width of the character at the position `at` when the instruction's character or class matches it, and 0
 /// otherwise. The character is a code unit with `units` set.
 #[inline]
-fn one(i: &Inst, input: &[u8], at: usize, units: bool) -> usize {
+fn one<T: Text>(i: &Inst, input: &[T::Unit], at: usize, units: bool) -> usize {
     if at >= input.len() {
         return 0;
     }
-    let (mut r, mut w) = (input[at] as Rune, 1);
-    if input[at] >= RUNE_SELF {
-        (r, w) = if units { unit_at(input, at) } else { decode_rune(&input[at..]) };
-    }
+    let c: u32 = input[at].into();
+    let (r, w) = if c < 0x80 { (c as Rune, 1) } else { T::read(input, at, units) };
     match &i.set {
         Some(set) => {
             if !set.contains(r) {

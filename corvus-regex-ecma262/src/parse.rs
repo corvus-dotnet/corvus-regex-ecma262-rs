@@ -374,6 +374,22 @@ fn append_class_atom(pairs: &mut Vec<Rune>, c: Rune, set: Option<&Arc<CharSet>>)
 
 impl Parser {
     /// Adds to the size of the pattern, and stops the parser when the size is over its limit.
+    /// The number of capturing groups of the pattern.
+    pub(crate) fn group_count(&self) -> usize {
+        self.groups as usize
+    }
+
+    /// The names of the groups, each with the groups that have it, in the order of their first group.
+    pub(crate) fn group_names(&self) -> Vec<(Vec<Rune>, Vec<usize>)> {
+        let mut names: Vec<(Vec<Rune>, Vec<usize>)> = self
+            .names
+            .iter()
+            .map(|(name, groups)| (name.clone(), groups.iter().map(|g| g.group as usize).collect()))
+            .collect();
+        names.sort_by_key(|(_, groups)| groups[0]);
+        names
+    }
+
     fn charge(&mut self, bytes: usize) -> Parse<()> {
         self.size += bytes;
         if self.size > MAX_SIZE {

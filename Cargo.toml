@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["corvus-regex-ecma262"]
+members = ["corvus-regex-ecma262", "tools"]
 
 [workspace.package]
 edition = "2024"

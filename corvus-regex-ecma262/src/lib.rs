@@ -60,6 +60,8 @@ mod dfa;
 mod fold;
 mod parse;
 mod re2;
+mod regex;
+mod replace;
 // Generated: it has names of scripts and properties that only the tests read.
 #[allow(dead_code)]
 #[rustfmt::skip]
@@ -71,11 +73,10 @@ mod units;
 mod vm;
 
 use std::fmt::{self, Write as _};
-use std::sync::OnceLock;
-use std::time::Duration;
 
 pub use parse::{Limit, MAX_NESTING, MAX_PATTERN_LENGTH, MAX_SIZE, TooLargeError};
 pub(crate) use re2::MAX_RE2_COST;
+pub use regex::{CaptureLocations, CaptureMatches, Captures, Haystack, Match, Matches, Regex};
 pub use vm::{MAX_STACK, MatchError};
 
 /// A code point, or a UTF-16 code unit of a pattern read without the u flag. It is signed, as the `rune` of the Go
@@ -109,6 +110,7 @@ impl std::error::Error for Error {}
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Facts {
     /// The pattern is valid with the u flag. When it is not, it was read with the Annex B grammar.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) unicode: bool,
     /// The pattern has a construct only the backtracking matcher can run.
     pub(crate) needs_backtracking: bool,
@@ -126,7 +128,7 @@ fn invalid(pattern: &str, msg: &str, pos: usize) -> Error {
 
 /// Reads a pattern with the u flag grammar and, when that refuses it, with the Annex B grammar.
 #[cfg(test)]
-fn read(pattern: &str) -> Result<(parse::Node, Facts), Error> {
+fn read(pattern: &str) -> Result<(parse::Node, Facts, parse::Parser), Error> {
     let (root, ps, unicode) = match parse::parse(pattern, true) {
         Ok((root, ps)) => (root, ps, true),
         Err(parse::ParseError::TooLarge(large)) => return Err(Error::TooLarge(large)),
@@ -138,7 +140,7 @@ fn read(pattern: &str) -> Result<(parse::Node, Facts), Error> {
     };
     let facts =
         Facts { unicode, needs_backtracking: ps.needs_backtracking, size: ps.size, re2_cost: re2::re2_cost(&root) };
-    Ok((root, facts))
+    Ok((root, facts, ps))
 }
 
 /// The number of groups a pattern may open and still be read on the stack of the thread that asks.
@@ -154,7 +156,7 @@ const DEEP_STACK: usize = 64 << 20;
 /// overflow the stack. A pattern that opens few groups is shallow, and is read where it is. Any other is read on a
 /// thread of its own with a stack for the deepest nesting the limits allow. (Go grows the stack of a goroutine as
 /// it is needed, so the Go engine has no such step.) `None` when that thread could not be started.
-fn on_a_deep_stack<T: Send>(pattern: &str, work: impl FnOnce() -> T + Send) -> Option<T> {
+pub(crate) fn on_a_deep_stack<T: Send>(pattern: &str, work: impl FnOnce() -> T + Send) -> Option<T> {
     if shallow(pattern) {
         return Some(work());
     }
@@ -180,7 +182,7 @@ pub(crate) fn shallow(pattern: &str) -> bool {
 
 /// The error of a pattern that nests deeply when no thread could be started to read it: the pattern is refused as
 /// one over the limit of nesting, which is the limit the thread is there to serve.
-const NO_DEEP_STACK: Error = Error::TooLarge(TooLargeError { limit: Limit::Nesting, value: MAX_NESTING });
+pub(crate) const NO_DEEP_STACK: Error = Error::TooLarge(TooLargeError { limit: Limit::Nesting, value: MAX_NESTING });
 
 /// The flags of a pattern, as `new RegExp(pattern, flags)` takes them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -230,7 +232,7 @@ impl Flags {
         Ok(f)
     }
 
-    fn syntax(&self) -> parse::Syntax {
+    pub(crate) fn syntax(&self) -> parse::Syntax {
         parse::Syntax {
             unicode: self.unicode || self.unicode_sets,
             icase: self.ignore_case,
@@ -261,30 +263,8 @@ impl fmt::Display for Flags {
     }
 }
 
-/// A compiled ECMA-262 pattern. It is immutable once compiled, and safe to share between threads.
-pub struct Regex {
-    pattern: String,
-    flags: Flags,
-    prog: compile::Program,
-    /// The pattern needs no backtracking and is small enough to be tried for an automaton.
-    regular: bool,
-    /// The automaton of the pattern over ASCII text (see `dfa.rs`), built on the first match. `None` inside when
-    /// the pattern has none. The syntax tree is let go of when the pattern is compiled, so the pattern is read
-    /// again to build it, which cannot fail.
-    dfa: OnceLock<Option<dfa::Dfa>>,
-    /// The size the parser counted for the pattern.
-    #[cfg(test)]
-    size: usize,
-}
-
-impl fmt::Debug for Regex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Regex(/{}/{})", self.pattern, self.flags)
-    }
-}
-
 /// Reads a pattern with one grammar.
-fn read_with(pattern: &str, syntax: parse::Syntax) -> Result<(parse::Node, Facts), Error> {
+pub(crate) fn read_with(pattern: &str, syntax: parse::Syntax) -> Result<(parse::Node, Facts, parse::Parser), Error> {
     let (root, ps) = match parse::parse_with(pattern, syntax) {
         Ok(read) => read,
         Err(parse::ParseError::TooLarge(large)) => return Err(Error::TooLarge(large)),
@@ -296,112 +276,7 @@ fn read_with(pattern: &str, syntax: parse::Syntax) -> Result<(parse::Node, Facts
         size: ps.size,
         re2_cost: re2::re2_cost(&root),
     };
-    Ok((root, facts))
-}
-
-impl Regex {
-    /// Compiles a pattern with the flags `new RegExp(pattern, flags)` takes, such as `""`, `"u"` or `"gimsuy"`. It
-    /// returns [`Error::Invalid`] for a pattern that is not valid in the grammar of its flags, [`Error::Flags`] for
-    /// flags that are not valid, and [`Error::TooLarge`] for a pattern over a limit of size (see [`MAX_SIZE`]),
-    /// whether or not it is valid.
-    pub fn new(pattern: &str, flags: &str) -> Result<Regex, Error> {
-        Regex::with_flags(pattern, Flags::parse(flags)?)
-    }
-
-    /// [`Regex::new`] with the flags already read.
-    pub fn with_flags(pattern: &str, flags: Flags) -> Result<Regex, Error> {
-        if flags.unicode_sets {
-            return Err(Error::Flags("the flag v is not supported yet".to_string()));
-        }
-        let syntax = flags.syntax();
-        on_a_deep_stack(pattern, || {
-            let (root, facts) = read_with(pattern, syntax)?;
-            Ok(Regex::from_tree(pattern, flags, root, facts))
-        })
-        .unwrap_or(Err(NO_DEEP_STACK))
-    }
-
-    fn from_tree(pattern: &str, flags: Flags, root: parse::Node, facts: Facts) -> Regex {
-        let regular = !facts.needs_backtracking && facts.re2_cost <= MAX_RE2_COST;
-        let dfa = OnceLock::new();
-        if regular && !shallow(pattern) {
-            // The automaton is built from the syntax tree, so that of a pattern that nests deeply is built here
-            // and not on the stack of the thread that first matches.
-            let _ = dfa.set(dfa::build_dfa(&root));
-        }
-        Regex {
-            pattern: pattern.to_string(),
-            flags,
-            prog: compile::compile_program(root, facts.unicode),
-            regular,
-            dfa,
-            #[cfg(test)]
-            size: facts.size,
-        }
-    }
-
-    /// Whether the pattern matches anywhere in the text, with no limit on the time or the memory the match takes.
-    /// It allocates nothing once the thread's working memory has grown to what the pattern and the text need.
-    pub fn is_match(&self, text: &str) -> bool {
-        self.match_limit(text, None).unwrap_or(false)
-    }
-
-    /// [`Regex::is_match`] with a limit on the time the match may take (none when it is zero). A match that reaches
-    /// the limit is abandoned and the error is [`MatchError::Time`]. So is a match whose backtracking stack reaches
-    /// [`MAX_STACK`] entries, and the error is [`MatchError::Memory`]. The result is then not an answer. The clock
-    /// is read every 4,096 steps of the backtracking matcher, so a match can go past the limit by the time those
-    /// take, which is some tens of microseconds. The automaton takes time proportional to the text and is not
-    /// stopped.
-    pub fn try_is_match(&self, text: &str, limit: Duration) -> Result<bool, MatchError> {
-        self.match_limit(text, Some(limit))
-    }
-
-    #[inline]
-    pub(crate) fn match_limit(&self, text: &str, limit: Option<Duration>) -> Result<bool, MatchError> {
-        if self.regular
-            && let Some(dfa) = self.dfa.get_or_init(|| self.build_dfa())
-            && let Some(matched) = dfa.is_match(text.as_bytes())
-        {
-            return Ok(matched);
-        }
-        self.prog.is_match(text, limit)
-    }
-
-    /// The source of the pattern.
-    pub fn as_str(&self) -> &str {
-        &self.pattern
-    }
-
-    /// The flags of the pattern.
-    pub fn flags(&self) -> Flags {
-        self.flags
-    }
-
-    /// The backtracking matcher alone, which the tests use to compare it with the automaton.
-    #[cfg(test)]
-    pub(crate) fn match_backtrack(&self, text: &str, limit: Option<Duration>) -> Result<bool, MatchError> {
-        self.prog.is_match(text, limit)
-    }
-
-    /// Builds the automaton of the pattern, which opens few groups (see `with_flags`).
-    #[cold]
-    fn build_dfa(&self) -> Option<dfa::Dfa> {
-        let (root, _) = parse::parse_with(&self.pattern, self.flags.syntax()).ok()?;
-        dfa::build_dfa(&root)
-    }
-
-    /// Whether the pattern was read with the ECMA-262 u flag grammar.
-    #[cfg(test)]
-    pub(crate) fn unicode(&self) -> bool {
-        self.flags.unicode
-    }
-
-    /// The size the parser counted for the pattern, which the tree, the program and the time to make both are
-    /// proportional to (see [`MAX_SIZE`]).
-    #[cfg(test)]
-    pub(crate) fn size(&self) -> usize {
-        self.size
-    }
+    Ok((root, facts, ps))
 }
 
 /// Compiles a pattern as JSON Schema reads one, which is what the tests of the engine's first home ask of it: with
@@ -409,9 +284,9 @@ impl Regex {
 #[cfg(test)]
 pub(crate) fn compile(pattern: &str) -> Result<Regex, Error> {
     on_a_deep_stack(pattern, || {
-        let (root, facts) = read(pattern)?;
+        let (root, facts, ps) = read(pattern)?;
         let flags = Flags { unicode: facts.unicode, ..Flags::default() };
-        Ok(Regex::from_tree(pattern, flags, root, facts))
+        Ok(Regex::from_tree(pattern, flags, root, facts, &ps))
     })
     .unwrap_or(Err(NO_DEEP_STACK))
 }
@@ -426,5 +301,5 @@ pub(crate) fn valid(pattern: &str) -> bool {
 /// Reads the pattern without compiling it, as [`compile`] reads it.
 #[cfg(test)]
 pub(crate) fn check(pattern: &str) -> Result<Facts, Error> {
-    on_a_deep_stack(pattern, || read(pattern).map(|(_, facts)| facts)).unwrap_or(Err(NO_DEEP_STACK))
+    on_a_deep_stack(pattern, || read(pattern).map(|(_, facts, _)| facts)).unwrap_or(Err(NO_DEEP_STACK))
 }

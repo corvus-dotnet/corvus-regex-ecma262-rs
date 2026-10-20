@@ -72,7 +72,7 @@ fn check_verdict(p: &str, valid_unicode: bool, valid_legacy: bool) -> Option<Reg
     assert_eq!(re.is_ok(), valid_unicode || valid_legacy, "compile({p:?}): {:?}", re.as_ref().err());
     let re = re.ok()?;
     assert_eq!(re.unicode(), valid_unicode, "compile({p:?}).unicode()");
-    assert_eq!(check(p).map(|facts| (facts.unicode, facts.size)), Ok((valid_unicode, re.size())), "check({p:?})");
+    assert_eq!(check(p).map(|facts| (facts.unicode, facts.size)), Ok((valid_unicode, re.size)), "check({p:?})");
     assert_eq!(re.as_str(), p);
     Some(re)
 }
@@ -135,7 +135,7 @@ fn parse_u(pattern: &str) -> parse::Node {
 }
 
 fn program(pattern: &str) -> Program {
-    compile_program(parse_u(pattern), true)
+    compile_program(parse_u(pattern), true, None)
 }
 
 /// Matching by UTF-16 code unit, against V8. A pattern that is valid only with no flag is matched a code unit at a
@@ -862,7 +862,7 @@ fn the_automaton_and_the_matcher_agree() {
     let (mut regular, mut automata, mut decided) = (0, 0, 0);
     for p in &patterns {
         let Ok(re) = compile(p) else { continue };
-        if !re.regular {
+        if !re.is_regular() {
             continue;
         }
         regular += 1;
@@ -920,7 +920,7 @@ fn backtracking_semantics() {
         (r"^(?!.*(.).*\1)[a-c]+$", "abca", false),
     ] {
         let re = compile(pattern).unwrap();
-        assert!(!re.regular, "{pattern:?} needs no backtracking");
+        assert!(!re.is_regular(), "{pattern:?} needs no backtracking");
         assert_eq!(re.is_match(text), want, "{pattern:?} on {text:?}");
     }
 }
@@ -942,7 +942,7 @@ fn long_input() {
         (r"^(?:[ab]c?){2097152}(?<=b)$", long.clone(), true),
     ] {
         let re = compile(pattern).unwrap();
-        assert!(!re.regular, "{pattern:?} needs no backtracking");
+        assert!(!re.is_regular(), "{pattern:?} needs no backtracking");
         assert_eq!(re.is_match(&text), want, "{pattern:?} on {} bytes", text.len());
     }
 }
@@ -1351,7 +1351,11 @@ fn a_repetition_in_a_repetition_is_answered() {
         (r"(?=.)(?:a|\u00e9)*c", "a\u{e9}".repeat(30000), false),
     ] {
         let re = compile(pattern).unwrap();
-        assert!(!re.regular && !re.prog.points.is_empty(), "{pattern:?} has {} memo points", re.prog.points.len());
+        assert!(
+            !re.is_regular() && !re.program().points.is_empty(),
+            "{pattern:?} has {} memo points",
+            re.program().points.len()
+        );
         for limit in [Some(GENEROUS), None] {
             assert_eq!(re.match_limit(&text, limit), Ok(want), "{pattern:?} on {} characters, {limit:?}", text.len());
         }
