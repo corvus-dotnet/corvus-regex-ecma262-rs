@@ -31,6 +31,7 @@
 //! loops can end at.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use aho_corasick::{AhoCorasick, MatchKind, packed};
 use memchr::memmem;
@@ -53,6 +54,8 @@ enum Finder {
     One(memmem::Finder<'static>),
     Packed(packed::Searcher),
     Automaton(AhoCorasick),
+    /// A few literals that all start with one rare byte: `memchr` for the byte, then each literal compared in order.
+    Shared(u8, Vec<Vec<u8>>),
 }
 
 /// Whether a byte is rare enough in text for a search for it alone to pay: not a lower case letter (but the rarest
@@ -73,14 +76,17 @@ impl Finder {
             }
             return Finder::One(memmem::Finder::new(&literals[0]).into_owned());
         }
-        // Two literals that start with the same rare byte are found by the automaton's search for that byte (memchr,
-        // Sherlock|Street); any others by the fingerprint search, which looks at three bytes (Huck|Saw, whose two
+        // Up to four literals that start with the same rare byte are found by `memchr` for that byte and a compare of
+        // each (Sherlock|Street, as the regex crate finds them); any others by the fingerprint search, which looks at three bytes (Huck|Saw, whose two
         // first bytes are both capitals, measured 1.6 times regex's time with the search for two bytes).
         // Over UTF-16 every other byte of an ASCII literal is zero, which no search for rare bytes can use, so the
         // fingerprint search always takes several literals there.
         let first = literals[0].first().copied();
         let one_rare_first = first.is_some_and(rare) && literals.iter().all(|l| l.first().copied() == first);
         let fingerprint = fingerprint || utf16 || !one_rare_first;
+        if !fingerprint && literals.len() <= 4 {
+            return Finder::Shared(first.expect("a literal"), literals.to_vec());
+        }
         if fingerprint
             && literals.len() <= MAX_FORMS
             && let Some(searcher) =
@@ -108,6 +114,16 @@ impl Finder {
             }
             Finder::Automaton(a) => {
                 a.find(aho_corasick::Input::new(haystack).span(from..haystack.len())).map(|m| (m.start(), m.end()))
+            }
+            Finder::Shared(first, literals) => {
+                let mut at = from;
+                loop {
+                    let p = at + memchr::memchr(*first, &haystack[at..])?;
+                    if let Some(l) = literals.iter().find(|l| haystack[p..].starts_with(l)) {
+                        return Some((p, p + l.len()));
+                    }
+                    at = p + 1;
+                }
             }
         }
     }
@@ -149,17 +165,34 @@ pub(crate) struct Literals {
     packed: Option<(Finder, Vec<(u16, u8)>)>,
     /// The most code units of a literal.
     longest: usize,
+    /// The bytes the UTF-8 literals start with.
+    firsts: Box<[bool; 256]>,
 }
 
 /// The units packed into bytes at a time for the UTF-16 search of ASCII literals.
 const PACK: usize = 4096;
 
 impl Literals {
-    /// The search for the literals, each a sequence of code points.
-    fn new(literals: &[Vec<Rune>], fingerprint: bool) -> Literals {
+    /// The search for the literals, each a sequence of code points, with the most bytes of each written out over
+    /// UTF-8 (see [`utf8_cuts`]).
+    fn new(literals: &[Vec<Rune>], cuts: &[usize], fingerprint: bool) -> Literals {
         let as_string =
             |l: &Vec<Rune>| -> String { l.iter().map(|&r| char::from_u32(r as u32).expect("a literal")).collect() };
-        let utf8: Vec<Vec<u8>> = literals.iter().map(|l| as_string(l).into_bytes()).collect();
+        // A literal cut to fewer bytes finds the same starts, and one that an earlier literal begins with finds no
+        // start the earlier one does not.
+        let mut utf8: Vec<Vec<u8>> = Vec::with_capacity(literals.len());
+        for (l, &cut) in literals.iter().zip(cuts) {
+            let string = as_string(l);
+            let mut b = string.as_bytes().to_vec();
+            // A cut inside a character is not made: measured, the Cyrillic letters with a three-byte form (в and
+            // ᲁ) cut so made the search 1.2 times slower.
+            if string.is_char_boundary(cut.min(string.len())) {
+                b.truncate(cut);
+            }
+            if !utf8.iter().any(|k| b.starts_with(k)) {
+                utf8.push(b);
+            }
+        }
         let utf16: Vec<Vec<u8>> =
             literals.iter().map(|l| as_string(l).encode_utf16().flat_map(u16::to_ne_bytes).collect()).collect();
         let longest = literals.iter().map(|l| as_string(l).encode_utf16().count()).max().unwrap_or(0);
@@ -192,7 +225,12 @@ impl Literals {
         // even two units (the long s and the Kelvin sign of a case-insensitive literal) made the search slower than the
         // fingerprint search over the units' bytes, and a Cyrillic literal's map made it twenty times slower.
         let packed = (packable && map.is_empty()).then(|| (Finder::new(&packed_literals, fingerprint, false), map));
+        let mut firsts = Box::new([false; 256]);
+        for l in &utf8 {
+            firsts[l[0] as usize] = true;
+        }
         Literals {
+            firsts,
             utf8: Finder::new(&utf8, fingerprint, false),
             utf16: Finder::new(&utf16, fingerprint, true),
             packed,
@@ -200,16 +238,36 @@ impl Literals {
         }
     }
 
-    /// The most UTF-16 code units of a literal (so also the most characters).
-    pub(crate) fn longest_units(&self) -> usize {
-        self.longest
-    }
-
     /// The position (in units of the text) of the leftmost occurrence at or after `from`. `bytes` is the text's
     /// bytes and `utf8` says whether a unit is one of them.
     #[inline]
     pub(crate) fn find(&self, bytes: &[u8], from: usize, utf8: bool) -> Option<usize> {
         self.find_match(bytes, from, utf8).map(|(start, _)| start)
+    }
+
+    /// The leftmost occurrence that starts at or after `from` and at or before `last`. Over UTF-8 the few bytes
+    /// between are looked at one at a time for a literal's first byte before a search is called, since a call on so
+    /// short a text costs more than reading it.
+    #[inline]
+    pub(crate) fn find_within(&self, bytes: &[u8], from: usize, last: usize, utf8: bool) -> Option<usize> {
+        if !utf8 {
+            let reach = (last + self.longest).min(bytes.len() / 2);
+            if from >= reach {
+                return None;
+            }
+            return self.find(&bytes[..reach * 2], from, false).filter(|&q| q <= last);
+        }
+        let last = last.min(bytes.len().checked_sub(1)?);
+        if from > last {
+            return None;
+        }
+        if let Finder::One(f) = &self.utf8 {
+            let needle = f.needle();
+            return (from..=last).find(|&p| bytes[p] == needle[0] && bytes[p..].starts_with(needle));
+        }
+        let p = (from..=last).find(|&p| self.firsts[bytes[p] as usize])?;
+        let reach = (last + 3 * self.longest).min(bytes.len());
+        self.utf8.find(&bytes[..reach], p).map(|(q, _)| q).filter(|&q| q <= last)
     }
 
     /// [`Literals::find`], with where the occurrence ends.
@@ -276,6 +334,54 @@ impl Literals {
     }
 }
 
+/// The anchored automaton of what follows an occurrence (an anchor and the terms after it), run at the occurrence
+/// before any start is walked back to. A check that seldom rules an occurrence out costs more than it saves (an
+/// e-mail address's `@` is nearly always followed by a domain), so the check keeps count over its first trials and is
+/// dropped for good when fewer than one in eight of them ruled the occurrence out. The counts change only how fast a
+/// search is, never what it finds.
+#[derive(Debug)]
+pub(crate) struct RestCheck {
+    dfa: super::adfa::Anchored,
+    checks: AtomicU32,
+    rejects: AtomicU32,
+}
+
+/// The checks a [`RestCheck`] makes before it decides whether it pays.
+const REST_TRIALS: u32 = 64;
+
+impl Clone for RestCheck {
+    fn clone(&self) -> RestCheck {
+        RestCheck {
+            dfa: self.dfa.clone(),
+            checks: AtomicU32::new(self.checks.load(Ordering::Relaxed)),
+            rejects: AtomicU32::new(self.rejects.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl RestCheck {
+    fn new(dfa: super::adfa::Anchored) -> Box<RestCheck> {
+        Box::new(RestCheck { dfa, checks: AtomicU32::new(0), rejects: AtomicU32::new(0) })
+    }
+
+    /// Whether nothing from the occurrence at `q` on can match.
+    #[inline]
+    pub(crate) fn rules_out<U: Copy + Into<u32>>(&self, input: &[U], q: usize) -> bool {
+        let checks = self.checks.load(Ordering::Relaxed);
+        if checks >= REST_TRIALS && self.rejects.load(Ordering::Relaxed) * 8 < REST_TRIALS {
+            return false;
+        }
+        let out = self.dfa.matches_at(input, q) == Some(false);
+        if checks < REST_TRIALS {
+            self.checks.store(checks + 1, Ordering::Relaxed);
+            if out {
+                self.rejects.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        out
+    }
+}
+
 /// How the search finds where a match can start, beyond the first set.
 #[derive(Clone, Debug, Default)]
 pub(crate) enum Plan {
@@ -283,9 +389,19 @@ pub(crate) enum Plan {
     #[default]
     Scan,
     /// Every match holds one of the literals so many to so many characters (`lo` to `hi`) after its start.
-    Windows { literals: Literals, lo: usize, hi: usize, reverse: Option<super::adfa::Reverse> },
+    /// `rest` is the anchored automaton of the anchors and the terms after each, run at an occurrence first where a
+    /// window has more than one start: where nothing from the occurrence on can match, its window is not tried.
+    Windows {
+        literals: Literals,
+        lo: usize,
+        hi: usize,
+        reverse: Option<super::adfa::Reverse>,
+        rest: Option<Box<RestCheck>>,
+    },
     /// Every match is runs of the loops' sets, then the literal.
-    AfterLoops { literals: Literals, sets: Vec<Arc<CharSet>>, mins: Vec<usize> },
+    /// `rest` is the anchored automaton of the literal and the terms after it, run at each occurrence first: where
+    /// nothing from the occurrence on can match, no start before it is walked back to or tried.
+    AfterLoops { literals: Literals, sets: Vec<Arc<CharSet>>, mins: Vec<usize>, rest: Option<Box<RestCheck>> },
 }
 
 /// The shape of a pattern whose matches the search finds without running the matcher (the .NET reference engine's
@@ -294,8 +410,9 @@ pub(crate) enum Plan {
 pub(crate) enum Shape {
     #[default]
     None,
-    /// Literals and nothing else, an alternation of them or one: the search's own match (`Plan::Windows`), which is
-    /// the first literal in the pattern's order of those that start leftmost, as ECMA-262 finds it.
+    /// Literals and nothing else, an alternation of them or one, with every form of each written out (`the` under the
+    /// i flag is eight literals): the search's own match (`Plan::Windows`), which is the first literal in the
+    /// pattern's order of those that start leftmost, as ECMA-262 finds it.
     Literals,
     /// An alternation of literals each of whose characters has several forms (a letter under the i flag): at each
     /// occurrence the search finds, the alternatives are compared in order.
@@ -532,6 +649,8 @@ struct Anchor {
     hi: usize,
     /// The terms a match goes through before the anchor.
     prefix: Vec<Node>,
+    /// The terms from the anchor on, to the end of the pattern.
+    rest: Vec<Node>,
 }
 
 /// The forms of a character the search can look for: a literal code point, or the members of a small class.
@@ -613,16 +732,18 @@ fn width(n: &Node) -> Option<(usize, Option<usize>)> {
 /// run of literal characters of each of its alternatives, or `None` when some alternative has none at a bounded
 /// distance.
 fn anchors(n: &Node, lo: usize, hi: usize) -> Option<Vec<Anchor>> {
-    anchors_after(n, lo, hi, &[])
+    anchors_after(n, lo, hi, &[], &[])
 }
 
-fn anchors_after(n: &Node, mut lo: usize, mut hi: usize, before: &[Node]) -> Option<Vec<Anchor>> {
+/// The anchors of `n`, which the terms `before` precede and the terms `after` follow.
+fn anchors_after(n: &Node, mut lo: usize, mut hi: usize, before: &[Node], after: &[Node]) -> Option<Vec<Anchor>> {
     let ts = terms(n);
     let mut prefix: Vec<Node> = before.to_vec();
     let mut k = 0;
     while k < ts.len() {
         let t = ts[k];
         if forms(t).is_some() {
+            let rest: Vec<Node> = ts[k..].iter().map(|&t| t.clone()).chain(after.iter().cloned()).collect();
             let mut chars = Vec::new();
             while k < ts.len()
                 && let Some(f) = forms(ts[k])
@@ -630,7 +751,7 @@ fn anchors_after(n: &Node, mut lo: usize, mut hi: usize, before: &[Node]) -> Opt
                 chars.push(f);
                 k += 1;
             }
-            return Some(vec![Anchor { chars, lo, hi, prefix }]);
+            return Some(vec![Anchor { chars, lo, hi, prefix, rest }]);
         }
         let alternation = match t.kind {
             NodeKind::Alt => Some(t),
@@ -638,9 +759,10 @@ fn anchors_after(n: &Node, mut lo: usize, mut hi: usize, before: &[Node]) -> Opt
             _ => None,
         };
         if let Some(alt) = alternation {
+            let following: Vec<Node> = ts[k + 1..].iter().map(|&t| t.clone()).chain(after.iter().cloned()).collect();
             let mut all = Vec::new();
             for sub in &alt.subs {
-                all.extend(anchors_after(sub, lo, hi, &prefix)?);
+                all.extend(anchors_after(sub, lo, hi, &prefix, &following)?);
             }
             return Some(all);
         }
@@ -665,15 +787,27 @@ fn expand(a: &Anchor, count: usize) -> Vec<Vec<Rune>> {
     out
 }
 
+/// The most bytes of each of an anchor's literals written out over UTF-8: where the anchor was cut short, every
+/// literal is cut to the bytes of its shortest, so that the forms of a character longer than the others (the long s,
+/// two bytes beside the one of s) make no more literals than the others. This is the `regex` crate's rule, which cuts
+/// literals by bytes; a script whose forms are all of one length keeps its characters, and a literal the cut would end
+/// inside a character keeps its own.
+fn utf8_cuts(cut_short: bool, literals: &[Vec<Rune>]) -> Vec<usize> {
+    let bytes = |l: &Vec<Rune>| l.iter().map(|&r| char::from_u32(r as u32).map_or(0, char::len_utf8)).sum::<usize>();
+    let cut = if cut_short { literals.iter().map(bytes).min().unwrap_or(usize::MAX) } else { usize::MAX };
+    vec![cut; literals.len()]
+}
+
 /// How many of each anchor's characters to write out. Exact anchors are written out in full. Where a character has
 /// several forms (a letter under the i flag), every anchor is cut to one length by the rule of the `regex` crate's
 /// literal optimisation (`Seq::optimize_by_preference`), taken here because it measured best with the fingerprint
 /// search the two share: the full literals if they are ten or fewer, else five characters if that makes ten or fewer,
 /// else four if that makes sixty-four or fewer, else three if sixty-four or fewer, else two if ten or fewer, else one.
-fn counts(anchors: &[Anchor]) -> Vec<usize> {
+/// With the counts, whether the anchors were cut short (so that [`utf8_cuts`] cuts their literals' bytes too).
+fn counts(anchors: &[Anchor]) -> (Vec<usize>, bool) {
     let full: Vec<usize> = anchors.iter().map(|a| a.chars.len()).collect();
     if anchors.iter().all(|a| a.chars.iter().all(|f| f.len() == 1)) {
-        return full;
+        return (full, false);
     }
     let total = |k: usize| -> usize {
         anchors
@@ -694,7 +828,7 @@ fn counts(anchors: &[Anchor]) -> Vec<usize> {
     } else {
         1
     };
-    full.iter().map(|&n| n.min(k)).collect()
+    (full.iter().map(|&n| n.min(k)).collect(), k != usize::MAX)
 }
 
 /// Whether a node can only begin with an ASCII word character, or is not known to.
@@ -715,7 +849,7 @@ fn alternatives(root: &Node) -> Vec<&Node> {
 }
 
 /// The literal shapes of a tree whose anchors are `found`: literals and nothing else, exact or with forms.
-fn shape_of_literals(root: &Node, found: &[Anchor], counts: &[usize]) -> Shape {
+fn shape_of_literals(root: &Node, found: &[Anchor], counts: &[usize], cut_short: bool) -> Shape {
     if holds_group(root) {
         return Shape::None;
     }
@@ -729,9 +863,9 @@ fn shape_of_literals(root: &Node, found: &[Anchor], counts: &[usize]) -> Shape {
             _ => return Shape::None,
         }
     }
-    let exact = all.iter().all(|alt| alt.iter().all(|f| f.len() == 1));
-    // Exact literals written out in full are the search's own literals, in the pattern's order.
-    if exact
+    // Literals written out in full, every form of each, are the search's own literals, in the pattern's order (an
+    // alternative's forms together), so the search's leftmost-first match is the pattern's.
+    if !cut_short
         && found.len() == all.len()
         && found.iter().zip(&all).zip(counts).all(|((a, alt), &n)| a.lo == 0 && a.hi == 0 && n == alt.len())
     {
@@ -802,27 +936,45 @@ pub(crate) fn plan(root: &Node, backrefs: bool, first: Option<&CharSet>, units: 
     }
     if let Some(found) = anchors(root, 0, 0) {
         let mut literals: Vec<Vec<Rune>> = Vec::new();
+        let mut cuts: Vec<usize> = Vec::new();
         let (mut lo, mut hi) = (usize::MAX, 0);
         let mut forms = false;
-        let counts = counts(&found);
+        let (counts, cut_short) = counts(&found);
         for (a, &count) in found.iter().zip(&counts) {
             lo = lo.min(a.lo);
             hi = hi.max(a.hi);
             forms |= a.chars.iter().any(|f| f.len() > 1);
-            for l in expand(a, count) {
-                if !literals.contains(&l) {
-                    literals.push(l);
+            let expanded = expand(a, count);
+            for (l, cut) in expanded.iter().zip(utf8_cuts(cut_short, &expanded)) {
+                if !literals.contains(l) {
+                    literals.push(l.clone());
+                    cuts.push(cut);
                 }
             }
         }
         if !literals.is_empty() && literals.len() <= MAX_LITERALS && literals.iter().all(|l| !l.is_empty()) {
             let fingerprint = literals.len() >= 3 || forms;
-            search.shape = shape_of_literals(root, &found, &counts);
-            let finder = Literals::new(&literals, fingerprint);
+            search.shape = shape_of_literals(root, &found, &counts, cut_short);
+            let finder = Literals::new(&literals, &cuts, fingerprint);
             // Where a window has more than one start, the terms before the anchors are matched backwards from each
             // occurrence, so that only the starts they allow are tried (the reverse search of the `regex` crate).
             let reverse = if hi > 0 { super::adfa::reverse(found.iter().map(|a| &a.prefix[..])) } else { None };
-            search.plan = Plan::Windows { literals: finder, lo, hi, reverse };
+            // Where every anchor is the end of its alternative, the occurrence is all the rest there is to check.
+            let rest = if hi > 0 && found.iter().any(|a| a.rest.len() > a.chars.len()) {
+                let mut alt = Node::new(NodeKind::Alt);
+                alt.subs = found
+                    .iter()
+                    .map(|a| {
+                        let mut cat = Node::new(NodeKind::Cat);
+                        cat.subs = a.rest.clone();
+                        cat
+                    })
+                    .collect();
+                super::adfa::build(&alt).map(RestCheck::new)
+            } else {
+                None
+            };
+            search.plan = Plan::Windows { literals: finder, lo, hi, reverse, rest };
             return search;
         }
     }
@@ -844,16 +996,26 @@ pub(crate) fn plan(root: &Node, backrefs: bool, first: Option<&CharSet>, units: 
             && (0..0x80u8).all(|c| !sets[0].has_ascii(c) || is_word_byte(c));
         let disjoint = sets.windows(2).all(|w| w[0].intersect(&w[1]).is_empty());
         let mut chars = Vec::new();
+        let literal_at = k;
         while let Some(f) = ts.get(k).and_then(|t| forms(t)) {
             chars.push(f);
             k += 1;
         }
         if (!boundary || word_set) && disjoint && mins.iter().all(|&m| m <= 1) && !chars.is_empty() {
-            let anchor = Anchor { chars, lo: 0, hi: 0, prefix: Vec::new() };
-            let literals = expand(&anchor, counts(std::slice::from_ref(&anchor))[0]);
+            let anchor = Anchor { chars, lo: 0, hi: 0, prefix: Vec::new(), rest: Vec::new() };
+            let (count, cut_short) = counts(std::slice::from_ref(&anchor));
+            let literals = expand(&anchor, count[0]);
+            let cuts = utf8_cuts(cut_short, &literals);
             let fingerprint = literals.len() >= 2;
-            search.plan =
-                Plan::AfterLoops { literals: Literals::new(&literals, fingerprint), sets: sets.clone(), mins };
+            let mut rest = Node::new(NodeKind::Cat);
+            rest.subs = ts[literal_at..].iter().map(|&t| t.clone()).collect();
+            let more = rest.subs.len() > anchor.chars.len();
+            search.plan = Plan::AfterLoops {
+                literals: Literals::new(&literals, &cuts, fingerprint),
+                sets: sets.clone(),
+                mins,
+                rest: if more { super::adfa::build(&rest).map(RestCheck::new) } else { None },
+            };
         }
         // A failed start may skip the rest of its leading loop's run (the loop is the first term).
         if !boundary {

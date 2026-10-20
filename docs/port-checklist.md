@@ -8,9 +8,11 @@ here, and the plan leaves it out. Where this port does a thing another way, the 
 
 | Count | |
 |---|---|
-| Done | 29 |
+| Done | 44 |
 | Not applicable | 5 |
-| To do | 4 |
+| To do | 0 |
+
+Items 1 to 38 are the reference's; items 39 to 49 are what bringing the engine level with the `regex` crate added.
 
 ## Section 4.2: the program and the working memory
 
@@ -45,15 +47,15 @@ here, and the plan leaves it out. Where this port does a thing another way, the 
 | 22 | The long s and the Kelvin sign, whose UTF-8 is longer than s and k, looked for apart | done | Another way: they are forms like any other in the literals of the one search, which takes literals of different lengths, so nothing is looked for apart and no window is needed for them. |
 | 23 | The fingerprint search's positions chosen by rarity, beyond ASCII the bytes that tell the literals apart | not applicable | `aho-corasick` chooses the bytes Teddy looks at (the first bytes of each literal); this port uses the crate as it is. |
 | 24 | The first set found by a vectorised search for its units | done | Over UTF-8: `memchr` for up to three bytes, Teddy over one-byte literals for up to sixty-four (the first set's ASCII members and the lead bytes of its other members), after a probe of sixteen bytes one at a time where they are common. |
-| 25 | The same over UTF-16 | to do | Over UTF-16 every unit is tested against the first set (`\\p{Sm}` over the Leipzig text is 26 times slower over UTF-16 than over UTF-8). The fingerprint search over UTF-16 also looks at the zero high bytes of ASCII units, which tell nothing apart. |
+| 25 | The same over UTF-16 | done | `FirstUnits`: sixteen units at a time against up to four ASCII ranges and, where the first set has members beyond ASCII, every unit beyond it, in a loop the compiler makes into vector instructions, after a probe of eight units one at a time; a candidate is then tested against the first set. Several ASCII literals are searched for in the low bytes of the units packed into bytes, in chunks that grow from 64 to 4,096 units (`Literals::find_packed`), so the zero high bytes are not looked at; one literal stays with `memmem` over the units' bytes, ranked for UTF-16. |
 | 26 | A failed start skips the rest of its leading loop's run | done | `Search::skip_run`. |
 | 27 | A start inside a word skipped where the pattern starts with `\b` and every first character is a word character | done | `Search::leading_word_boundary`. |
 | 28 | A minimum length rules out short rests | done | From the engine this crate came from (`need`). |
 | 29 | Simple shapes answered without the matcher: a literal alone | done | `Search::literal`. |
-| 30 | Simple shapes: one class alone, a sequence of classes, one unbounded loop, an alternation of literals, a case-insensitive ASCII literal | to do | Each runs the matcher at its start; the literal shape was the one the rows showed paid. |
-| 31 | What an enumeration carries: the range known to hold no rare line terminator, so a run of `.` is one search for LF and CR | to do | A run of `.` reads its characters one by one; `.*` over the Sherlock text is at about the speed of regex's count of fewer matches. |
+| 30 | Simple shapes: one class alone, a sequence of classes, one unbounded loop, an alternation of literals, a case-insensitive ASCII literal | done | `Shape`: one class (`Set`), one greedy unbounded loop of a class (`Loop`, its run's end found by `memchr` where the class leaves out up to three ASCII characters or is the dot), an alternation of literals (`Literals`, the search's own leftmost-first match) and of literals with forms (`Forms`, the alternatives compared in order at each occurrence). A sequence of classes is left to the anchored automaton (item 40), which answers it as fast. |
+| 31 | What an enumeration carries: the range known to hold no rare line terminator, so a run of `.` is one search for LF and CR | done | Another way: a run of `.` is one `memchr3` for LF, CR and the lead byte of U+2028 and U+2029, looked at further where it is found (`RunEnd::Line`); nothing is carried from one match to the next. `.*` over the Sherlock text is a fifth of regex's time. |
 | 32 | What an enumeration carries: the range known to hold no form the search leaves out | not applicable | No form is left out of the search (item 22). |
-| 33 | The give-back of a single-character loop by a vectorised scan for the units what follows can start with | to do | A loop gives back a character at a time, each passed over at once when the quick check rules it out. |
+| 33 | The give-back of a single-character loop by a vectorised scan for the units what follows can start with | done | `set_back`: where what follows a greedy loop can start with one to three ASCII bytes and nothing else, the give-back is a `memrchr` for them. |
 | 34 | The search's kernels as static methods with constants as arguments, no call inside | not applicable | A .NET JIT concern; the searches here are the crates', and the matcher is monomorphised for each encoding. |
 
 ## Section 4.4: the automaton
@@ -65,6 +67,31 @@ here, and the plan leaves it out. Where this port does a thing another way, the 
 | 37 | One table read per unit for both encodings | done | The automaton reads UTF-8 bytes and UTF-16 units alike. |
 | 38 | An automaton over full Unicode | not applicable | The reference has none either; the benchmarks have not asked for one. |
 
+## Beyond the reference: level with the `regex` crate
+
+The work that brought this engine over UTF-8 level with `regex` on the Industry workloads, each change measured A/B
+against the build before it with `regex` beside them (cores 0 to 11, nothing else running), the data set at 0 wrong
+after each.
+
+| # | Optimisation | State | In this port |
+|---|---|---|---|
+| 39 | Simple shapes and the dot's run by `memchr` | done | Items 30 and 31. |
+| 40 | An anchored, leftmost-first automaton over ASCII for where a match from a start ends | done | `adfa.rs`: threads in priority order, a match ending the lower ones, the word and start bits of item 36, the states premultiplied by the stride so a step is one load and an add; it gives up at the first byte beyond ASCII and the matcher runs instead. Used for a pattern with no group and no backreference, at every start the search tries. |
+| 41 | The terms before a window's anchors read backwards from each occurrence, so that only the starts they allow are tried | done | The reverse search of the `regex` crate: `adfa::reverse`, run by `search_reverse` with the starts it allows held as a bit mask and tried in order, an occurrence within reach of the earliest taken in first so leftmost order holds. |
+| 42 | Case-insensitive anchors cut to one length by `regex`'s literal rule | done | `counts` (`Seq::optimize_by_preference`): full if ten literals or fewer, else five characters if that makes ten or fewer, else four if sixty-four or fewer, else three, two, one. Where an anchor is cut, its UTF-8 literals are cut to the bytes of the shortest (`utf8_cuts`), as `regex` cuts by bytes, so the long s and the Kelvin sign make no extra literals. |
+| 43 | Two literals by the automaton only when they start with the same rare byte | done | `Finder::new`; any other pair goes to Teddy, which looks at three bytes. |
+| 44 | A failed start of a leading loop's run passes over the occurrences in the rest of the run | done | `search_after_loops` with one loop: every occurrence in the run walks back to the start just tried. |
+| 45 | Over UTF-16, ASCII literals searched for in the packed low bytes of the units | done | Item 25. |
+| 46 | The anchor and what follows it checked at each occurrence before any start is walked back to | done | The anchored automaton of the anchors' rests (an alternation of each anchor and the terms after it, to the end of the pattern), run at each occurrence of a window or of a literal after loops, stopping at the first place a match could end (`Anchored::matches_at`). Left out where the anchor ends its alternative. `\b\w+n\b` is the row: an `n` inside a word is passed over without walking back to the word's start. |
+| 47 | The reverse automaton's table premultiplied, and the look for a nearer occurrence made without a search call on a few bytes | done | `Reverse::starts`, `Literals::find_within`. |
+| 48 | Up to four literals with one rare first byte found by `memchr` for it and a compare of each | done | `Finder::Shared`, as `regex` finds `Sherlock\|Street` (its prefilter is a `memchr` of `S`). |
+| 49 | Literals with forms written out in full answered by the search alone | done | `Shape::Literals` takes them too (`the` under the i flag is eight literals, and the search's leftmost-first match is the pattern's); an alternation of literals with forms cut short is compared at each occurrence by the anchored automaton where the text is ASCII. |
+
+Tried and taken out, each slower on the rows it was for: a search that folds case in place of the written-out forms;
+the long s and the Kelvin sign looked for apart (item 22's reference way); an unanchored forward automaton with a
+backward one to find the start (no row gained); budgets of 64 literals shared round the anchors, and anchors of four
+characters.
+
 ## The search layer, step by step
 
 Each step measured over the Industry workloads over UTF-8 (the harness at 0.3 seconds and three passes, an
@@ -74,7 +101,7 @@ evaluator, trying every position its first set allows. Each column adds one sear
 start (memmem), then two literals anywhere (the automaton), then three or more (Teddy), then the windows at distances,
 then the case-insensitive forms, then the walk back over leading loops with the skip over a failed loop's run and the
 leading `\b`. The steps after these (the first set's bytes, the writing out of small repetitions, the anchors of three
-characters, the literal alone) were measured in the full runs reported with the work, whose data the nightly workflow now publishes. regex is the same
+characters, the literal alone) were measured in the full runs reported with the work. regex is the same
 look at the `regex` crate.
 
 | Workload | scan | + needle | + 2 literals | + fingerprint | + windows | + forms | + loops | regex |

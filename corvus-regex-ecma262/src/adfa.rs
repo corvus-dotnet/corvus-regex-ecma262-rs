@@ -159,6 +159,8 @@ pub(crate) struct Anchored {
     at_end: Vec<bool>,
     /// The start state for each of: the unit before is a word character (bit 1), the start of the text (bit 0).
     starts: [u16; 4],
+    /// Whether the start states differ (the pattern looks back at the unit before or at the start of the text).
+    context: bool,
 }
 
 /// What the automaton found from a start.
@@ -172,14 +174,24 @@ pub(crate) enum Found {
 }
 
 impl Anchored {
+    /// The start state at `start`: where the pattern has no boundary or anchor that looks back, the one start state.
+    #[inline]
+    fn start<U: Copy + Into<u32>>(&self, input: &[U], start: usize) -> u16 {
+        if self.context {
+            let word = start > 0 && {
+                let c: u32 = input[start - 1].into();
+                c < 0x80 && is_word_byte(c as u8)
+            };
+            self.starts[usize::from(word) << 1 | usize::from(start == 0)]
+        } else {
+            self.starts[0]
+        }
+    }
+
     /// Where the match that starts at `start` ends, over units that are ASCII bytes or UTF-16 code units.
     #[inline]
     pub(crate) fn find<U: Copy + Into<u32>>(&self, input: &[U], start: usize) -> Found {
-        let word = start > 0 && {
-            let c: u32 = input[start - 1].into();
-            c < 0x80 && is_word_byte(c as u8)
-        };
-        let s = self.starts[usize::from(word) << 1 | usize::from(start == 0)];
+        let s = self.start(input, start);
         if s == DEAD {
             return Found::None;
         }
@@ -209,6 +221,36 @@ impl Anchored {
             return Found::End(p);
         }
         last.map_or(Found::None, Found::End)
+    }
+}
+
+impl Anchored {
+    /// Whether any match starts at `start`, found at the first place one ends; `None` when a unit beyond ASCII is
+    /// reached first.
+    #[inline]
+    pub(crate) fn matches_at<U: Copy + Into<u32>>(&self, input: &[U], start: usize) -> Option<bool> {
+        let s = self.start(input, start);
+        if s == DEAD {
+            return Some(false);
+        }
+        let (trans, class) = (&self.fast[..], &self.class);
+        let mut at = (s as usize) << self.shift;
+        for &u in &input[start..] {
+            let c: u32 = u.into();
+            if c >= 0x80 {
+                return None;
+            }
+            // SAFETY: as in `find`.
+            let t = unsafe { *trans.get_unchecked(at + class[c as usize] as usize) };
+            if t & FAST_MATCHED != 0 {
+                return Some(true);
+            }
+            at = t as usize;
+            if at == 0 {
+                return Some(false);
+            }
+        }
+        Some(self.at_end[at >> self.shift])
     }
 }
 
@@ -392,7 +434,8 @@ pub(crate) fn build(root: &Node) -> Option<Anchored> {
         .iter()
         .map(|&t| (u32::from(t & !MATCHED) << shift) | if t & MATCHED != 0 { FAST_MATCHED } else { 0 })
         .collect();
-    Some(Anchored { class, shift: shift as u32, fast, at_end, starts })
+    let context = starts.iter().any(|&s| s != starts[0]);
+    Some(Anchored { class, shift: shift as u32, fast, at_end, starts, context })
 }
 
 /// An automaton of the terms before the anchors of a search, read backwards (accepting where any of them can start):
@@ -402,8 +445,11 @@ pub(crate) fn build(root: &Node) -> Option<Anchored> {
 pub(crate) struct Reverse {
     class: [u8; 128],
     shift: u32,
-    trans: Vec<u16>,
-    accept: Vec<bool>,
+    /// The transitions, each the next state's row (premultiplied by the stride, so 0 is the dead state) with
+    /// [`FAST_MATCHED`] where that state accepts.
+    fast: Vec<u32>,
+    /// Whether the first state accepts (an empty run of terms).
+    accept_first: bool,
 }
 
 impl Reverse {
@@ -411,22 +457,24 @@ impl Reverse {
     /// looking no further back than `most` units nor before `floor`; `None` when a unit beyond ASCII is reached.
     #[inline]
     pub(crate) fn starts<U: Copy + Into<u32>>(&self, input: &[U], q: usize, most: usize, floor: usize) -> Option<u128> {
-        let mut s = 1u16;
-        let mut mask = u128::from(self.accept[1]);
-        let mut d = 0;
-        while d < most && q - d > floor {
-            let c: u32 = input[q - d - 1].into();
+        let mut mask = u128::from(self.accept_first);
+        let mut at = 1usize << self.shift;
+        let (fast, class) = (&self.fast[..], &self.class);
+        for d in 1..=most.min(q.saturating_sub(floor)) {
+            let c: u32 = input[q - d].into();
             if c >= 0x80 {
                 return None;
             }
-            s = self.trans[(s as usize) << self.shift | self.class[c as usize] as usize];
-            if s == DEAD {
+            // SAFETY: `at` is a state's row (a multiple of the stride below the table's length, as every entry of the
+            // table is) and a class is below the stride.
+            let t = unsafe { *fast.get_unchecked(at + class[c as usize] as usize) };
+            if t == 0 {
                 break;
             }
-            d += 1;
-            if self.accept[s as usize] {
+            if t & FAST_MATCHED != 0 {
                 mask |= 1u128 << d;
             }
+            at = (t & !FAST_MATCHED) as usize;
         }
         Some(mask)
     }
@@ -595,5 +643,9 @@ pub(crate) fn reverse<'a>(prefixes: impl Iterator<Item = &'a [Node]>) -> Option<
         }
         id += 1;
     }
-    Some(Reverse { class, shift: shift as u32, trans, accept })
+    let fast = trans
+        .iter()
+        .map(|&t| (u32::from(t) << shift) | if t != DEAD && accept[t as usize] { FAST_MATCHED } else { 0 })
+        .collect();
+    Some(Reverse { class, shift: shift as u32, fast, accept_first: accept[1] })
 }

@@ -48,8 +48,10 @@ has these searches in crates every Rust program already depends on, so this port
 - three literals or more, and the forms of a case-insensitive literal: `aho-corasick`'s packed searcher, Teddy;
 - the first set over UTF-8: `memchr` for up to three bytes, Teddy over one-byte literals for up to sixty-four.
 
-Over UTF-16 the same searchers look at the bytes of the code units, and an occurrence at an odd byte offset is passed
-over, where the reference has searches over `ushort` lanes.
+Over UTF-16 one literal is found by `memmem` over the bytes of the code units, ranked for UTF-16, and an occurrence at
+an odd byte offset is passed over. Several ASCII literals are found in the low bytes of the units packed into bytes,
+in chunks that grow from 64 to 4,096 units, so the zero high bytes are never looked at. The first set is tested
+sixteen units at a time against up to four ASCII ranges.
 
 What is searched for is worked out from the syntax tree once (`search.rs`): an anchor is a literal, each character of
 which may have several forms, that every alternative holds at a known or bounded number of characters from its start.
@@ -58,13 +60,28 @@ offset or a bounded range, the literal after a bounded loop, the alternation of 
 alternative holds), and one loop (`search_windows`) tries the windows of starts each occurrence opens, in order and
 never twice.
 
-Case-insensitive search writes the forms of each character out into literals (three characters of each anchor,
-more where a character has one form) rather than masking the forms that differ in a bit. Teddy's nibble tables take
-the forms as they come, and since its literals may differ in length, the long s and the Kelvin sign (longer in UTF-8
-than s and k) are literals like the others and are not looked for apart.
+Case-insensitive search writes the forms of each character out into literals rather than masking the forms that
+differ in a bit, and cuts them to one length by the `regex` crate's rule (`Seq::optimize_by_preference`), by bytes
+over UTF-8, so the long s and the Kelvin sign (longer in UTF-8 than s and k) are literals like the others, cut to the
+same bytes, and are not looked for apart.
+
+## The automata
+
+Two small automata over ASCII decide most starts without the backtracking matcher, each giving up to it at the first
+unit beyond ASCII:
+
+- an anchored, leftmost-first automaton (`adfa.rs`) says where the match from a start ends, for a pattern with no
+  group and no backreference; its threads are kept in priority order and a match ends the lower ones, as the
+  backtracking order would;
+- the terms before a window's anchors are read backwards from each occurrence (the `regex` crate's reverse search),
+  so only the starts they allow are tried, and the anchored automaton of the anchor and what follows it is run at the
+  occurrence first, so an occurrence nothing can follow is passed over before any start is walked back to.
+
+The simple shapes (a literal, an alternation of literals with or without forms, one class, one unbounded loop of a
+class) are answered by the search alone, and a run of `.` is one `memchr3` for the line terminators.
 
 ## What is not here
 
-The source generator (the reference's section 5): Rust has no build-time step here. The simple shapes other than a
-lone literal, the enumeration's cursor for runs of `.`, the vectorised give-back of a loop and the vectorised first
-set over UTF-16 are listed as to do in `port-checklist.md`, with the rows that would ask for them.
+The source generator (the reference's section 5): Rust has no build-time step here. An automaton over full Unicode:
+the reference has none either. `port-checklist.md` marks every item of the reference's search layer, and what the
+work to bring this engine level with `regex` added.

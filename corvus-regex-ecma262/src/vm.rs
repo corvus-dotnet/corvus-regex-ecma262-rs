@@ -322,11 +322,18 @@ impl Program {
             return self.run::<T>(st, input, start).then_some((start, st.end));
         }
         match &self.search.plan {
-            Plan::Windows { literals, lo, hi, reverse } => {
-                self.search_windows::<T>(st, input, start, literals, *lo, *hi, reverse.as_ref(), need)
-            }
-            Plan::AfterLoops { literals, sets, mins } => {
-                self.search_after_loops::<T>(st, input, start, literals, sets, mins, need)
+            Plan::Windows { literals, lo, hi, reverse, rest } => self.search_windows::<T>(
+                st,
+                input,
+                start,
+                literals,
+                (*lo, *hi),
+                reverse.as_ref(),
+                rest.as_deref(),
+                need,
+            ),
+            Plan::AfterLoops { literals, sets, mins, rest } => {
+                self.search_after_loops::<T>(st, input, start, literals, sets, mins, rest.as_deref(), need)
             }
             Plan::Scan => self.scan::<T>(st, input, start, need),
         }
@@ -356,6 +363,17 @@ impl Program {
                 let mut next = start;
                 loop {
                     let Some(q) = literals.find(bytes, next, T::UTF8) else { break None };
+                    // The automaton compares several alternatives at once where the text is ASCII; one is compared
+                    // faster as it is.
+                    let dfa = if alternatives.len() > 1 { self.anchored_dfa.as_ref() } else { None };
+                    match dfa.map(|d| d.find(input, q)) {
+                        Some(Found::End(end)) => break Some((q, end)),
+                        Some(Found::None) => {
+                            next = q + T::read(input, q, units).1;
+                            continue;
+                        }
+                        _ => {}
+                    }
                     let mut found = None;
                     'alternatives: for alt in alternatives {
                         let mut p = q;
@@ -460,14 +478,14 @@ impl Program {
         input: &[T::Unit],
         start: usize,
         literals: &Literals,
-        lo: usize,
-        hi: usize,
+        (lo, hi): (usize, usize),
         reverse: Option<&super::adfa::Reverse>,
+        rest: Option<&super::search::RestCheck>,
         need: usize,
     ) -> Option<(usize, usize)> {
         if let Some(rev) = reverse
             && hi < 127
-            && let Ok(found) = self.search_reverse::<T>(st, input, start, literals, lo, hi, rev, need)
+            && let Ok(found) = self.search_reverse::<T>(st, input, start, literals, lo, hi, rev, rest, need)
         {
             return found;
         }
@@ -493,7 +511,7 @@ impl Program {
                 continue;
             }
             let (last, back) = self.walk_back::<T>(input, q, lo, start);
-            if back < lo || last < untried {
+            if back < lo || last < untried || rest.is_some_and(|r| r.rules_out(input, q)) {
                 continue;
             }
             let (mut s, _) = self.walk_back::<T>(input, q, hi, start);
@@ -533,11 +551,11 @@ impl Program {
         lo: usize,
         hi: usize,
         rev: &super::adfa::Reverse,
+        rest: Option<&super::search::RestCheck>,
         need: usize,
     ) -> Result<Option<(usize, usize)>, ()> {
         let len = input.len();
         let bytes = T::bytes(input);
-        let unit = if T::UTF8 { 1 } else { 2 };
         // The starts waiting to be tried: bit k is the position base + k.
         let (mut pending, mut base) = (0u128, start);
         // Every start at or before this has been tried, or can no longer be allowed.
@@ -551,7 +569,12 @@ impl Program {
                 pending = if shift >= 128 { 0 } else { pending >> shift };
                 base = new_base;
             }
-            let mut mask = rev.starts(input, q, hi, start).ok_or(())?;
+            // An occurrence from which nothing can match allows no start.
+            let mut mask = if rest.is_some_and(|r| r.rules_out(input, q)) {
+                0
+            } else {
+                rev.starts(input, q, hi, start).ok_or(())?
+            };
             mask &= !((1u128 << lo) - 1);
             while mask != 0 {
                 let d = 127 - mask.leading_zeros() as usize;
@@ -568,11 +591,8 @@ impl Program {
             while pending != 0 {
                 let k = pending.trailing_zeros() as usize;
                 let s = base + k;
-                // A literal of n code units is at most 3n bytes of UTF-8.
-                let reach = (s + hi + literals.longest_units() * if T::UTF8 { 3 } else { 1 }).min(len);
-                if after < reach
-                    && let Some(q2) = literals.find(&bytes[..reach * unit], after, T::UTF8)
-                    && q2 <= s + hi
+                if after <= s + hi
+                    && let Some(q2) = literals.find_within(bytes, after, s + hi, T::UTF8)
                 {
                     q = q2;
                     taken = true;
@@ -608,6 +628,7 @@ impl Program {
         literals: &Literals,
         sets: &[Arc<CharSet>],
         mins: &[usize],
+        rest: Option<&super::search::RestCheck>,
         need: usize,
     ) -> Option<(usize, usize)> {
         let len = input.len();
@@ -618,6 +639,21 @@ impl Program {
         'occurrences: loop {
             let q = literals.find(bytes, next, T::UTF8)?;
             next = q + T::read(input, q, units).1;
+            // A loop that needs a member must have one just before the occurrence: a test of one character, made
+            // before the rest is checked.
+            let last = sets.len() - 1;
+            if mins[last] == 1
+                && (q <= start || {
+                    let c: u32 = input[q - 1].into();
+                    let r = if c < 0x80 { c as Rune } else { T::read_last(input, q, units).0 };
+                    !sets[last].contains(r)
+                })
+            {
+                continue;
+            }
+            if rest.is_some_and(|r| r.rules_out(input, q)) {
+                continue;
+            }
             let mut s = q;
             for k in (0..sets.len()).rev() {
                 let run_end = s;
