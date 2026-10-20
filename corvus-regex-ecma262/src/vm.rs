@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use super::Rune;
 use std::sync::Arc;
 
+use super::adfa::Found;
 use super::charset::CharSet;
 use super::compile::{Inst, MAX_MEMO_LOOPS, Op, Program};
 use super::fold::{canonicalize, is_fold_word_rune};
@@ -321,7 +322,9 @@ impl Program {
             return self.run::<T>(st, input, start).then_some((start, st.end));
         }
         match &self.search.plan {
-            Plan::Windows { literals, lo, hi } => self.search_windows::<T>(st, input, start, literals, *lo, *hi, need),
+            Plan::Windows { literals, lo, hi, reverse } => {
+                self.search_windows::<T>(st, input, start, literals, *lo, *hi, reverse.as_ref(), need)
+            }
             Plan::AfterLoops { literals, sets, mins } => {
                 self.search_after_loops::<T>(st, input, start, literals, sets, mins, need)
             }
@@ -459,8 +462,15 @@ impl Program {
         literals: &Literals,
         lo: usize,
         hi: usize,
+        reverse: Option<&super::adfa::Reverse>,
         need: usize,
     ) -> Option<(usize, usize)> {
+        if let Some(rev) = reverse
+            && hi < 127
+            && let Ok(found) = self.search_reverse::<T>(st, input, start, literals, lo, hi, rev, need)
+        {
+            return found;
+        }
         let len = input.len();
         let bytes = T::bytes(input);
         let mut next = start;
@@ -505,6 +515,85 @@ impl Program {
                 s += T::read(input, s, self.units).1;
             }
             untried = untried.max(s);
+        }
+    }
+
+    /// [`Program::search_windows`] with the terms before the anchors read backwards from each occurrence, so that only
+    /// the starts they allow are tried. A start is tried only once no later occurrence could allow an earlier one (it
+    /// is before the next occurrence's window), so the starts are tried in order across occurrences and the first
+    /// match is the leftmost. Over ASCII a character is a unit; `Err` when a unit beyond ASCII is reached, and the
+    /// search is then made again the plain way.
+    #[allow(clippy::too_many_arguments)]
+    fn search_reverse<T: Text>(
+        &self,
+        st: &mut State,
+        input: &[T::Unit],
+        start: usize,
+        literals: &Literals,
+        lo: usize,
+        hi: usize,
+        rev: &super::adfa::Reverse,
+        need: usize,
+    ) -> Result<Option<(usize, usize)>, ()> {
+        let len = input.len();
+        let bytes = T::bytes(input);
+        let unit = if T::UTF8 { 1 } else { 2 };
+        // The starts waiting to be tried: bit k is the position base + k.
+        let (mut pending, mut base) = (0u128, start);
+        // Every start at or before this has been tried, or can no longer be allowed.
+        let mut tried: Option<usize> = None;
+        let Some(mut q) = literals.find(bytes, start, T::UTF8) else { return Ok(None) };
+        loop {
+            // The starts this occurrence's terms allow join those waiting.
+            let new_base = q.saturating_sub(hi).max(start);
+            if new_base > base {
+                let shift = new_base - base;
+                pending = if shift >= 128 { 0 } else { pending >> shift };
+                base = new_base;
+            }
+            let mut mask = rev.starts(input, q, hi, start).ok_or(())?;
+            mask &= !((1u128 << lo) - 1);
+            while mask != 0 {
+                let d = 127 - mask.leading_zeros() as usize;
+                mask &= !(1u128 << d);
+                let s = q - d;
+                if s >= base && tried.is_none_or(|t| s > t) {
+                    pending |= 1u128 << (s - base);
+                }
+            }
+            let after = q + T::read(input, q, self.units).1;
+            // The earliest waiting start is tried once no occurrence before it plus the window could allow an
+            // earlier one: an occurrence within that reach is taken in first, which looks no further than the reach.
+            let mut taken = false;
+            while pending != 0 {
+                let k = pending.trailing_zeros() as usize;
+                let s = base + k;
+                // A literal of n code units is at most 3n bytes of UTF-8.
+                let reach = (s + hi + literals.longest_units() * if T::UTF8 { 3 } else { 1 }).min(len);
+                if after < reach
+                    && let Some(q2) = literals.find(&bytes[..reach * unit], after, T::UTF8)
+                    && q2 <= s + hi
+                {
+                    q = q2;
+                    taken = true;
+                    break;
+                }
+                pending &= !(1u128 << k);
+                tried = Some(s);
+                if len - s < need {
+                    return Ok(None);
+                }
+                if self.try_at::<T>(st, input, s) {
+                    return Ok(Some((s, st.end)));
+                }
+                if st.stop != STOP_NONE {
+                    return Ok(None);
+                }
+            }
+            if !taken {
+                let Some(q2) = literals.find(bytes, after, T::UTF8) else { return Ok(None) };
+                q = q2;
+            }
         }
     }
 
@@ -628,6 +717,16 @@ impl Program {
     /// and counter is back to the value it had on entry. It counts its steps, and when a check says the match has
     /// reached a limit it returns false with the reason in `st.stop`.
     fn run<T: Text>(&self, st: &mut State, input: &[T::Unit], start: usize) -> bool {
+        if let Some(dfa) = &self.anchored_dfa {
+            match dfa.find(input, start) {
+                Found::End(end) => {
+                    st.end = end;
+                    return true;
+                }
+                Found::None => return false,
+                Found::Bail => {}
+            }
+        }
         let mut stack = std::mem::take(&mut st.stack);
         stack.clear();
         let matched = self.run_on::<T>(st, &mut stack, input, start);

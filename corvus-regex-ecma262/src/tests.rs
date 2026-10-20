@@ -1670,6 +1670,10 @@ fn the_searches_find_what_every_position_finds() {
         (r"ab|a", ""),
         (r"sherlock|holmes|k", "i"),
         (r"\u{1F600}|Ш", ""),
+        // A start that one occurrence's terms do not allow, and a later occurrence's do, is tried first.
+        (r"(|([^a]|[^a][^a]){2,4}){2}(\3){3,5}?x", ""),
+        (r"[^a]{0,3}(?:xx|x)", ""),
+        (r"\s[a-zA-Z]{0,12}ing\s", ""),
     ];
     let alphabet = [
         "a",

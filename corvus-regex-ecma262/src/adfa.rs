@@ -1,0 +1,588 @@
+//! An anchored, leftmost-first automaton over ASCII text, which finds where the match that starts at a position ends
+//! for a pattern that needs no backtracking: what the `regex` crate's DFAs do for the match, taken into this engine
+//! where ECMA-262's semantics allow it.
+//!
+//! A state is an ordered list of the pattern's states (its threads, the most preferred first, as the backtracking
+//! matcher would try them), with whether the unit before it was a word character and whether it is at the start of
+//! the text. When the match state is among the threads, a match ends here, and the threads after it, which the
+//! backtracking matcher would only try had this way failed, are dropped; the threads before it may still find a
+//! longer match, which it would prefer. So the last match found before the threads run out is the backtracking
+//! matcher's match, for a pattern with no lookaround, no backreference and no repetition whose body can match the
+//! empty string (where ECMA-262's rule for an empty iteration would differ from a thread's). A unit beyond ASCII hands
+//! the start back to the backtracking matcher.
+//!
+//! Every state is worked out when the pattern is compiled, within bounds of states and steps, so that a pattern too
+//! large for an automaton costs little before that is known.
+
+use std::collections::HashMap;
+
+use super::charset::is_word_byte;
+use super::parse::{Node, NodeKind, UNBOUNDED};
+
+const MAX_STATES: usize = 2048;
+const MAX_NFA: usize = 1024;
+const MAX_STEPS: i64 = 2_000_000;
+/// No thread is left: no match can end further on.
+const DEAD: u16 = 0;
+/// The flag of a transition across which a match ends before the unit.
+const MATCHED: u16 = 0x8000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Set,
+    Split,
+    Bol,
+    Eol,
+    Word,
+    NotWord,
+    Match,
+}
+
+#[derive(Clone, Copy)]
+struct State {
+    kind: Kind,
+    set: [u64; 2],
+    out: usize,
+    alt: usize,
+}
+
+impl State {
+    fn new(kind: Kind, out: usize) -> State {
+        State { kind, set: [0; 2], out, alt: 0 }
+    }
+}
+
+struct Builder {
+    states: Vec<State>,
+    failed: bool,
+}
+
+impl Builder {
+    fn add(&mut self, s: State) -> usize {
+        if self.states.len() >= MAX_NFA {
+            self.failed = true;
+            return 0;
+        }
+        self.states.push(s);
+        self.states.len() - 1
+    }
+
+    /// A split whose preferred way is `first`.
+    fn split(&mut self, first: usize, second: usize) -> usize {
+        self.add(State { alt: second, ..State::new(Kind::Split, first) })
+    }
+
+    /// The states of a node that go on to `next`; the state they start at.
+    fn compile(&mut self, n: &Node, mut next: usize) -> usize {
+        if self.failed {
+            return 0;
+        }
+        match n.kind {
+            NodeKind::Empty => next,
+            NodeKind::Char => {
+                let mut set = [0u64; 2];
+                if (0..128).contains(&n.r) {
+                    set[(n.r >> 6) as usize] = 1 << (n.r & 63);
+                }
+                self.add(State { set, ..State::new(Kind::Set, next) })
+            }
+            NodeKind::Set => self.add(State { set: n.class().ascii, ..State::new(Kind::Set, next) }),
+            NodeKind::Cat => {
+                for sub in n.subs.iter().rev() {
+                    next = self.compile(sub, next);
+                }
+                next
+            }
+            NodeKind::Alt => {
+                let mut start = self.compile(&n.subs[n.subs.len() - 1], next);
+                for sub in n.subs[..n.subs.len() - 1].iter().rev() {
+                    let out = self.compile(sub, next);
+                    start = self.split(out, start);
+                }
+                start
+            }
+            NodeKind::Group => self.compile(&n.subs[0], next),
+            NodeKind::Repeat => {
+                let sub = &n.subs[0];
+                if n.max != 0 && n.max != 1 && super::compile::nullable_node(sub) {
+                    // ECMA-262 refuses an empty iteration after the least count, which a thread does not know.
+                    self.failed = true;
+                    return 0;
+                }
+                if n.max == UNBOUNDED {
+                    let loop_ = self.split(0, 0);
+                    if self.failed {
+                        return 0;
+                    }
+                    let body = self.compile(sub, loop_);
+                    let s = &mut self.states[loop_];
+                    (s.out, s.alt) = if n.lazy { (next, body) } else { (body, next) };
+                    next = loop_;
+                } else {
+                    let mut i = n.min;
+                    while i < n.max && !self.failed {
+                        let body = self.compile(sub, next);
+                        next = if n.lazy { self.split(next, body) } else { self.split(body, next) };
+                        i += 1;
+                    }
+                }
+                let mut i = 0;
+                while i < n.min && !self.failed {
+                    next = self.compile(sub, next);
+                    i += 1;
+                }
+                next
+            }
+            NodeKind::Bol => self.add(State::new(Kind::Bol, next)),
+            NodeKind::Eol => self.add(State::new(Kind::Eol, next)),
+            NodeKind::WordBoundary if !n.fold => self.add(State::new(Kind::Word, next)),
+            NodeKind::NotWordBoundary if !n.fold => self.add(State::new(Kind::NotWord, next)),
+            _ => {
+                self.failed = true;
+                0
+            }
+        }
+    }
+}
+
+/// The anchored automaton of a pattern.
+#[derive(Clone, Debug)]
+pub(crate) struct Anchored {
+    class: [u8; 128],
+    shift: u32,
+    /// `trans[state << shift | class]`: the next state, with `MATCHED` when a match ends before the unit.
+    trans: Vec<u16>,
+    /// For each state: a match ends at the end of the text.
+    at_end: Vec<bool>,
+    /// The start state for each of: the unit before is a word character (bit 1), the start of the text (bit 0).
+    starts: [u16; 4],
+}
+
+/// What the automaton found from a start.
+pub(crate) enum Found {
+    /// The match ends here.
+    End(usize),
+    /// No match starts here.
+    None,
+    /// A unit beyond ASCII was reached: the backtracking matcher decides.
+    Bail,
+}
+
+impl Anchored {
+    /// Where the match that starts at `start` ends, over units that are ASCII bytes or UTF-16 code units.
+    #[inline]
+    pub(crate) fn find<U: Copy + Into<u32>>(&self, input: &[U], start: usize) -> Found {
+        let word = start > 0 && {
+            let c: u32 = input[start - 1].into();
+            c < 0x80 && is_word_byte(c as u8)
+        };
+        let mut s = self.starts[usize::from(word) << 1 | usize::from(start == 0)];
+        if s == DEAD {
+            return Found::None;
+        }
+        let mut last = None;
+        let mut p = start;
+        let (trans, shift, class) = (&self.trans[..], self.shift, &self.class);
+        while p < input.len() {
+            let c: u32 = input[p].into();
+            if c >= 0x80 {
+                return Found::Bail;
+            }
+            let t = trans[(s as usize) << shift | class[c as usize] as usize];
+            if t & MATCHED != 0 {
+                last = Some(p);
+            }
+            s = t & !MATCHED;
+            if s == DEAD {
+                return last.map_or(Found::None, Found::End);
+            }
+            p += 1;
+        }
+        if self.at_end[s as usize] {
+            return Found::End(p);
+        }
+        last.map_or(Found::None, Found::End)
+    }
+}
+
+struct Det<'a> {
+    nfa: &'a [State],
+    mark: Vec<u32>,
+    generation: u32,
+    steps: i64,
+}
+
+impl Det<'_> {
+    /// Appends to `out`, in order of preference, the threads that reading nothing reaches from `from`, keeping the
+    /// states that read a unit, the anchors and boundaries still to pass, and the match, after which nothing more is
+    /// kept. Boundaries are passed or dropped with `words`, and kept to pass later without it.
+    fn closure(
+        &mut self,
+        out: &mut Vec<usize>,
+        from: &[usize],
+        at_start: bool,
+        at_end: bool,
+        words: Option<(bool, bool)>,
+    ) {
+        self.generation += 1;
+        let mut stack: Vec<usize> = from.iter().rev().copied().collect();
+        while let Some(i) = stack.pop() {
+            self.steps -= 1;
+            if self.mark[i] == self.generation {
+                continue;
+            }
+            self.mark[i] = self.generation;
+            let s = &self.nfa[i];
+            match s.kind {
+                Kind::Split => {
+                    stack.push(s.alt);
+                    stack.push(s.out);
+                }
+                Kind::Bol => {
+                    if at_start {
+                        stack.push(s.out);
+                    }
+                }
+                Kind::Eol => {
+                    if at_end {
+                        stack.push(s.out);
+                    } else {
+                        out.push(i);
+                    }
+                }
+                Kind::Word | Kind::NotWord => match words {
+                    None => out.push(i),
+                    Some((before, after)) => {
+                        if (before != after) == (s.kind == Kind::Word) {
+                            stack.push(s.out);
+                        }
+                    }
+                },
+                Kind::Match => {
+                    out.push(i);
+                    return;
+                }
+                Kind::Set => out.push(i),
+            }
+        }
+    }
+}
+
+fn is_word(c: usize) -> bool {
+    is_word_byte(c as u8)
+}
+
+/// Builds the anchored automaton of a tree (after `simplify`), or `None` when the pattern has none.
+pub(crate) fn build(root: &Node) -> Option<Anchored> {
+    let mut b = Builder { states: Vec::new(), failed: false };
+    let match_ = b.add(State::new(Kind::Match, 0));
+    let start = b.compile(root, match_);
+    if b.failed {
+        return None;
+    }
+    let nfa = &b.states[..];
+    let mut d = Det { nfa, mark: vec![0; nfa.len()], generation: 0, steps: MAX_STEPS };
+
+    // The classes of units: those every set has both or neither of, and that are both word characters or neither.
+    let mut class = [0u8; 128];
+    let mut signatures: HashMap<Vec<u64>, u8> = HashMap::new();
+    for (c, slot) in class.iter_mut().enumerate() {
+        let mut sig: Vec<u64> = vec![u64::from(is_word(c))];
+        for s in nfa.iter().filter(|s| s.kind == Kind::Set) {
+            sig.push((s.set[c >> 6] >> (c & 63)) & 1);
+        }
+        let n = signatures.len();
+        *slot = *signatures.entry(sig).or_insert(n as u8);
+    }
+    let classes = signatures.len();
+    let mut shift = 0;
+    while 1usize << shift < classes {
+        shift += 1;
+    }
+    let stride = 1usize << shift;
+    let mut sample = vec![0usize; classes];
+    for c in (0..128usize).rev() {
+        sample[class[c] as usize] = c;
+    }
+
+    let has = |set: &[usize], k: Kind| set.iter().any(|&i| nfa[i].kind == k);
+    // The word bit matters only to a pattern with a boundary and the start bit only to one with a start anchor (each
+    // may be reached later, behind an end anchor or a boundary still to pass, so the whole pattern is asked).
+    let boundaries = nfa.iter().any(|s| matches!(s.kind, Kind::Word | Kind::NotWord));
+    let anchors = nfa.iter().any(|s| s.kind == Kind::Bol);
+    let mut ids: HashMap<(Vec<usize>, bool, bool), u16> = HashMap::new();
+    let mut sets: Vec<(Vec<usize>, bool, bool)> = vec![(Vec::new(), false, false)];
+    let mut trans: Vec<u16> = vec![DEAD; stride];
+    let mut at_end: Vec<bool> = vec![false];
+    let intern = |d: &mut Det<'_>,
+                  ids: &mut HashMap<(Vec<usize>, bool, bool), u16>,
+                  sets: &mut Vec<(Vec<usize>, bool, bool)>,
+                  trans: &mut Vec<u16>,
+                  at_end: &mut Vec<bool>,
+                  set: Vec<usize>,
+                  word: bool,
+                  at_start: bool|
+     -> Option<u16> {
+        if set.is_empty() {
+            return Some(DEAD);
+        }
+        let word = word && boundaries;
+        let at_start = at_start && anchors;
+        let key = (set, word, at_start);
+        if let Some(&id) = ids.get(&key) {
+            return Some(id);
+        }
+        if sets.len() >= MAX_STATES {
+            return None;
+        }
+        let id = sets.len() as u16;
+        let mut closed = Vec::new();
+        d.closure(&mut closed, &key.0, at_start, true, Some((word, false)));
+        at_end.push(has(&closed, Kind::Match));
+        trans.extend(std::iter::repeat_n(DEAD, stride));
+        ids.insert(key.clone(), id);
+        sets.push(key);
+        Some(id)
+    };
+    let mut starts = [DEAD; 4];
+    for (k, slot) in starts.iter_mut().enumerate() {
+        let (word, at_start) = (k & 2 != 0, k & 1 != 0);
+        let mut first = Vec::new();
+        d.closure(&mut first, &[start], at_start, false, None);
+        *slot = intern(&mut d, &mut ids, &mut sets, &mut trans, &mut at_end, first, word, at_start)?;
+    }
+    let mut id = 1;
+    let (mut resolved, mut moved) = (Vec::new(), Vec::new());
+    while id < sets.len() {
+        let (set, word, at_start) = sets[id].clone();
+        for (cl, &c) in sample.iter().enumerate() {
+            resolved.clear();
+            d.closure(&mut resolved, &set, at_start, false, Some((word, is_word(c))));
+            let mut flag = 0;
+            if let Some(m) = resolved.iter().position(|&i| nfa[i].kind == Kind::Match) {
+                // A match ends before this unit; only the threads it would have been tried after go on.
+                flag = MATCHED;
+                resolved.truncate(m);
+            }
+            moved.clear();
+            for &i in &resolved {
+                let s = &nfa[i];
+                if s.kind == Kind::Set && (s.set[c >> 6] >> (c & 63)) & 1 != 0 {
+                    moved.push(s.out);
+                }
+            }
+            let mut next = Vec::new();
+            d.closure(&mut next, &moved, false, false, None);
+            let to = intern(&mut d, &mut ids, &mut sets, &mut trans, &mut at_end, next, is_word(c), false)?;
+            if d.steps < 0 {
+                return None;
+            }
+            trans[id * stride + cl] = to | flag;
+        }
+        id += 1;
+    }
+    Some(Anchored { class, shift: shift as u32, trans, at_end, starts })
+}
+
+/// An automaton of the terms before the anchors of a search, read backwards (accepting where any of them can start):
+/// from an occurrence of an anchor it finds, over ASCII text, every start from which some alternative's terms reach
+/// it. Only terms with no assertion are taken.
+#[derive(Clone, Debug)]
+pub(crate) struct Reverse {
+    class: [u8; 128],
+    shift: u32,
+    trans: Vec<u16>,
+    accept: Vec<bool>,
+}
+
+impl Reverse {
+    /// The starts before `q`, as a mask of their distances (bit `d` is the start `q - d`), that the terms allow,
+    /// looking no further back than `most` units nor before `floor`; `None` when a unit beyond ASCII is reached.
+    #[inline]
+    pub(crate) fn starts<U: Copy + Into<u32>>(&self, input: &[U], q: usize, most: usize, floor: usize) -> Option<u128> {
+        let mut s = 1u16;
+        let mut mask = u128::from(self.accept[1]);
+        let mut d = 0;
+        while d < most && q - d > floor {
+            let c: u32 = input[q - d - 1].into();
+            if c >= 0x80 {
+                return None;
+            }
+            s = self.trans[(s as usize) << self.shift | self.class[c as usize] as usize];
+            if s == DEAD {
+                break;
+            }
+            d += 1;
+            if self.accept[s as usize] {
+                mask |= 1u128 << d;
+            }
+        }
+        Some(mask)
+    }
+}
+
+impl Builder {
+    /// The states of a node read backwards that go on to `next`.
+    fn compile_back(&mut self, n: &Node, mut next: usize) -> usize {
+        if self.failed {
+            return 0;
+        }
+        match n.kind {
+            NodeKind::Cat => {
+                for sub in &n.subs {
+                    next = self.compile_back(sub, next);
+                }
+                next
+            }
+            NodeKind::Alt => {
+                let mut start = self.compile_back(&n.subs[n.subs.len() - 1], next);
+                for sub in n.subs[..n.subs.len() - 1].iter().rev() {
+                    let out = self.compile_back(sub, next);
+                    start = self.split(out, start);
+                }
+                start
+            }
+            NodeKind::Group => self.compile_back(&n.subs[0], next),
+            NodeKind::Repeat => {
+                let sub = &n.subs[0];
+                if n.max == UNBOUNDED {
+                    let loop_ = self.split(0, 0);
+                    if self.failed {
+                        return 0;
+                    }
+                    let body = self.compile_back(sub, loop_);
+                    let s = &mut self.states[loop_];
+                    (s.out, s.alt) = (body, next);
+                    next = loop_;
+                } else {
+                    let mut i = n.min;
+                    while i < n.max && !self.failed {
+                        let body = self.compile_back(sub, next);
+                        next = self.split(body, next);
+                        i += 1;
+                    }
+                }
+                let mut i = 0;
+                while i < n.min && !self.failed {
+                    next = self.compile_back(sub, next);
+                    i += 1;
+                }
+                next
+            }
+            NodeKind::Empty | NodeKind::Char | NodeKind::Set => self.compile(n, next),
+            _ => {
+                self.failed = true;
+                0
+            }
+        }
+    }
+}
+
+/// The reverse automaton of the prefixes of a search's anchors, or `None` when one holds an assertion or the automaton
+/// is too large.
+pub(crate) fn reverse<'a>(prefixes: impl Iterator<Item = &'a [Node]>) -> Option<Reverse> {
+    let mut b = Builder { states: Vec::new(), failed: false };
+    let match_ = b.add(State::new(Kind::Match, 0));
+    let mut starts = Vec::new();
+    for prefix in prefixes {
+        let mut next = match_;
+        for t in prefix {
+            next = b.compile_back(t, next);
+        }
+        starts.push(next);
+    }
+    if b.failed || starts.is_empty() {
+        return None;
+    }
+    let mut start = starts[starts.len() - 1];
+    for &s in starts[..starts.len() - 1].iter().rev() {
+        start = b.split(s, start);
+    }
+    if b.failed {
+        return None;
+    }
+    let nfa = &b.states[..];
+    let mut d = Det { nfa, mark: vec![0; nfa.len()], generation: 0, steps: MAX_STEPS };
+    let mut class = [0u8; 128];
+    let mut signatures: HashMap<Vec<u64>, u8> = HashMap::new();
+    for (c, slot) in class.iter_mut().enumerate() {
+        let sig: Vec<u64> =
+            nfa.iter().filter(|s| s.kind == Kind::Set).map(|s| (s.set[c >> 6] >> (c & 63)) & 1).collect();
+        let n = signatures.len();
+        *slot = *signatures.entry(sig).or_insert(n as u8);
+    }
+    let classes = signatures.len();
+    let mut shift = 0;
+    while 1usize << shift < classes {
+        shift += 1;
+    }
+    let stride = 1usize << shift;
+    let mut sample = vec![0usize; classes];
+    for c in (0..128usize).rev() {
+        sample[class[c] as usize] = c;
+    }
+    // A set of states, sorted, is its key; every thread is kept (any of them reaching the match is a start).
+    let closure = |d: &mut Det<'_>, from: &[usize]| -> Vec<usize> {
+        let mut out = Vec::new();
+        d.generation += 1;
+        let mut stack: Vec<usize> = from.to_vec();
+        while let Some(i) = stack.pop() {
+            d.steps -= 1;
+            if d.mark[i] == d.generation {
+                continue;
+            }
+            d.mark[i] = d.generation;
+            let s = &d.nfa[i];
+            match s.kind {
+                Kind::Split => {
+                    stack.push(s.alt);
+                    stack.push(s.out);
+                }
+                _ => out.push(i),
+            }
+        }
+        out.sort_unstable();
+        out
+    };
+    let mut ids: HashMap<Vec<usize>, u16> = HashMap::new();
+    let mut sets: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut trans = vec![DEAD; stride];
+    let mut accept = vec![false];
+    let first = closure(&mut d, &[start]);
+    ids.insert(first.clone(), 1);
+    accept.push(first.iter().any(|&i| nfa[i].kind == Kind::Match));
+    sets.push(first);
+    trans.extend(std::iter::repeat_n(DEAD, stride));
+    let mut id = 1;
+    while id < sets.len() {
+        for (cl, &c) in sample.iter().enumerate() {
+            let moved: Vec<usize> = sets[id]
+                .iter()
+                .filter(|&&i| nfa[i].kind == Kind::Set && (nfa[i].set[c >> 6] >> (c & 63)) & 1 != 0)
+                .map(|&i| nfa[i].out)
+                .collect();
+            let next = closure(&mut d, &moved);
+            let to = if next.is_empty() {
+                DEAD
+            } else if let Some(&t) = ids.get(&next) {
+                t
+            } else {
+                if sets.len() >= MAX_STATES {
+                    return None;
+                }
+                let t = sets.len() as u16;
+                accept.push(next.iter().any(|&i| nfa[i].kind == Kind::Match));
+                ids.insert(next.clone(), t);
+                sets.push(next);
+                trans.extend(std::iter::repeat_n(DEAD, stride));
+                t
+            };
+            if d.steps < 0 {
+                return None;
+            }
+            trans[id * stride + cl] = to;
+        }
+        id += 1;
+    }
+    Some(Reverse { class, shift: shift as u32, trans, accept })
+}

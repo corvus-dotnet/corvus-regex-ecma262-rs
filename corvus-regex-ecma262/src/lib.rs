@@ -71,6 +71,7 @@
 //! the case folding come from the tables of `ucd.rs` and `strings_gen.rs` and never from the standard library or
 //! from a dependency, so a pattern matches the same texts whatever built the program.
 
+mod adfa;
 mod charset;
 mod compile;
 mod dfa;

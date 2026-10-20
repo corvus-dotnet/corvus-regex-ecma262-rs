@@ -174,6 +174,9 @@ pub(crate) struct Program {
     pub first: Option<CharSet>,
     /// How the search finds where a match can start (see `search.rs`).
     pub search: super::search::Search,
+    /// The anchored automaton that finds where a match from a start ends, for a program that records no group and
+    /// needs no backtracking (see `adfa.rs`).
+    pub anchored_dfa: Option<super::adfa::Anchored>,
 }
 
 struct Compiler {
@@ -246,7 +249,11 @@ pub(crate) fn compile_program(root: Node, unicode: bool, groups: Option<usize>) 
         quick,
         first: None,
         search: super::search::Search::default(),
+        anchored_dfa: None,
     };
+    if p.groups == 0 && !backrefs {
+        p.anchored_dfa = super::adfa::build(&root);
+    }
     if !p.anchored {
         {
             let mut pairs = Vec::new();
@@ -1023,6 +1030,11 @@ fn set_back(insts: &mut [Inst], quick: &[Quick]) {
 /// also what a malformed byte of the text decodes to.
 pub(crate) fn literal_rune(r: Rune) -> bool {
     (0..=0x10FFFF).contains(&r) && !(0xD800..=0xDFFF).contains(&r) && r != RUNE_ERROR
+}
+
+/// [`nullable`], for the anchored automaton.
+pub(crate) fn nullable_node(n: &Node) -> bool {
+    nullable(n)
 }
 
 /// Whether `n` can match without consuming anything. It errs towards true.
