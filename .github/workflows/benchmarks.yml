@@ -45,7 +45,8 @@ jobs:
     - name: Run the harness image
       run: |
         mkdir -p out
-        docker run --rm -e SECONDS_EACH='${{ github.event.inputs.seconds || '2' }}' -e RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+        # The runner's own description of itself passes in, for the run's record.
+        docker run --rm -e RUNNER_NAME -e RUNNER_OS -e ImageOS -e ImageVersion -e SECONDS_EACH='${{ github.event.inputs.seconds || '2' }}' -e RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
           -v "$PWD/tools/benchmarks/workloads.json:/workloads.json:ro" -v "$PWD/texts:/texts:ro" \
           -v "$PWD/ecma262-regex-test-data/data:/data:ro" -v "$PWD/out:/out" harness
     - name: Keep the run
