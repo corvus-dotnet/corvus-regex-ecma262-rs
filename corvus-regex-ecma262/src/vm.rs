@@ -379,6 +379,10 @@ impl Program {
                 if len - q < need {
                     return None;
                 }
+                if let Some((bytes8, units16)) = self.search.literal {
+                    // The pattern is the literal: the occurrence is the match.
+                    return Some((q, q + if T::UTF8 { bytes8 } else { units16 }));
+                }
                 if self.try_at::<T>(st, input, q) {
                     return Some((q, st.end));
                 }

@@ -163,6 +163,9 @@ pub(crate) struct Search {
     /// The bytes a match can start with over UTF-8, searched for together when they are few: the first set's ASCII
     /// members and the lead bytes of its other members.
     pub(crate) first_bytes: Option<FirstBytes>,
+    /// The pattern is one literal and nothing else, of this many bytes of UTF-8 and UTF-16 code units: every
+    /// occurrence the search finds is a match, and the matcher does not run.
+    pub(crate) literal: Option<(usize, usize)>,
 }
 
 /// A search for any of a few bytes: `memchr` for up to three, and the fingerprint search of one-byte literals for
@@ -358,17 +361,47 @@ fn anchors(n: &Node, mut lo: usize, mut hi: usize) -> Option<Vec<Anchor>> {
     None
 }
 
-/// The literals of an anchor: its characters' forms written out, for as many of its first characters as keep them
-/// to `budget` literals (and always the first character's).
-fn expand(a: &Anchor, budget: usize) -> Vec<Vec<Rune>> {
+/// The literals of an anchor: the forms of its first `count` characters written out.
+fn expand(a: &Anchor, count: usize) -> Vec<Vec<Rune>> {
     let mut out: Vec<Vec<Rune>> = vec![Vec::new()];
-    for f in &a.chars {
-        if out.len() > 1 && out.len() * f.len() > budget || out.len() == 1 && f.len() > budget.max(4) {
-            break;
-        }
+    for f in &a.chars[..count] {
         out = out.iter().flat_map(|prefix| f.iter().map(move |&r| [&prefix[..], &[r]].concat())).collect();
     }
     out
+}
+
+/// How many of each anchor's characters to write out: three where it has them (a literal of three is what the
+/// fingerprint search tells apart well), more while a character has one form and so adds no literal, and fewer for
+/// the anchors with the most literals while all of them together are more than the fingerprint search takes.
+fn counts(anchors: &[Anchor]) -> Vec<usize> {
+    let product = |a: &Anchor, n: usize| -> usize { a.chars[..n].iter().map(Vec::len).product() };
+    let mut counts: Vec<usize> = anchors
+        .iter()
+        .map(|a| {
+            let mut n = a.chars.len().min(3);
+            while n < a.chars.len() && a.chars[n].len() == 1 {
+                n += 1;
+            }
+            n
+        })
+        .collect();
+    loop {
+        let total: usize = anchors.iter().zip(&counts).map(|(a, &n)| product(a, n)).sum();
+        if total <= MAX_FORMS {
+            break;
+        }
+        let Some((k, _)) = anchors
+            .iter()
+            .zip(&counts)
+            .enumerate()
+            .filter(|(_, (_, n))| **n > 1)
+            .max_by_key(|(_, (a, n))| product(a, **n))
+        else {
+            break;
+        };
+        counts[k] -= 1;
+    }
+    counts
 }
 
 /// Whether a node can only begin with an ASCII word character, or is not known to.
@@ -377,6 +410,11 @@ fn starts_with_word(n: &Node, first: Option<&CharSet>) -> bool {
     first.is_some_and(|f| {
         f.ranges.last().is_some_and(|&last| last < 0x80) && (0..0x80u8).all(|c| !f.has_ascii(c) || is_word_byte(c))
     })
+}
+
+/// Whether a node holds a capturing group.
+fn holds_group(n: &Node) -> bool {
+    n.kind == NodeKind::Group && n.group > 0 || n.subs.iter().any(holds_group)
 }
 
 /// A loop of one character or class with no upper bound.
@@ -411,14 +449,11 @@ pub(crate) fn plan(root: &Node, backrefs: bool, first: Option<&CharSet>, units: 
         let mut literals: Vec<Vec<Rune>> = Vec::new();
         let (mut lo, mut hi) = (usize::MAX, 0);
         let mut forms = false;
-        // The forms of the anchors share what the fingerprint search takes, so that each is written out for as many
-        // characters as its share allows.
-        let budget = (MAX_FORMS / found.len()).max(1);
-        for a in &found {
+        for (a, count) in found.iter().zip(counts(&found)) {
             lo = lo.min(a.lo);
             hi = hi.max(a.hi);
             forms |= a.chars.iter().any(|f| f.len() > 1);
-            for l in expand(a, budget) {
+            for l in expand(a, count) {
                 if !literals.contains(&l) {
                     literals.push(l);
                 }
@@ -426,6 +461,16 @@ pub(crate) fn plan(root: &Node, backrefs: bool, first: Option<&CharSet>, units: 
         }
         if !literals.is_empty() && literals.len() <= MAX_LITERALS && literals.iter().all(|l| !l.is_empty()) {
             let fingerprint = literals.len() >= 3 || forms;
+            if literals.len() == 1
+                && found.len() == 1
+                && found[0].chars.len() == ts.len()
+                && literals[0].len() == ts.len()
+                && ts.iter().all(|t| t.kind == NodeKind::Char)
+                && !holds_group(root)
+            {
+                let s: String = literals[0].iter().map(|&r| char::from_u32(r as u32).expect("a literal")).collect();
+                search.literal = Some((s.len(), s.encode_utf16().count()));
+            }
             search.plan = Plan::Windows { literals: Literals::new(&literals, fingerprint), lo, hi };
             return search;
         }
@@ -452,7 +497,8 @@ pub(crate) fn plan(root: &Node, backrefs: bool, first: Option<&CharSet>, units: 
             k += 1;
         }
         if (!boundary || word_set) && disjoint && mins.iter().all(|&m| m <= 1) && !chars.is_empty() {
-            let literals = expand(&Anchor { chars, lo: 0, hi: 0 }, MAX_FORMS);
+            let anchor = Anchor { chars, lo: 0, hi: 0 };
+            let literals = expand(&anchor, counts(std::slice::from_ref(&anchor))[0]);
             let fingerprint = literals.len() >= 2;
             search.plan =
                 Plan::AfterLoops { literals: Literals::new(&literals, fingerprint), sets: sets.clone(), mins };
