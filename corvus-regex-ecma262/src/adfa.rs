@@ -161,6 +161,21 @@ pub(crate) struct Anchored {
     starts: [u16; 4],
     /// Whether the start states differ (the pattern looks back at the unit before or at the start of the text).
     context: bool,
+    /// For the forward automaton (see [`build_forward`]), whether each state is a start state: no thread of an
+    /// earlier start is alive in it.
+    start_like: Vec<bool>,
+}
+
+/// What the forward automaton found (see [`Anchored::scan`]).
+pub(crate) enum Scan {
+    /// A match ends here.
+    Match(usize),
+    /// A start state is reached here: no match starts before it.
+    Idle(usize),
+    /// A unit beyond ASCII is here.
+    Bail(usize),
+    /// No match ends before the end of the text.
+    None,
 }
 
 /// What the automaton found from a start.
@@ -174,6 +189,34 @@ pub(crate) enum Found {
 }
 
 impl Anchored {
+    /// For the forward automaton (see [`build_forward`]): the first place at or after `from` where a match ends, read
+    /// from a start state at `from`, with the last start state's position before it (the leftmost match starts in
+    /// between). `Scan::Idle(p)` when a start state is reached again at `p` first, `Scan::Bail(p)` at a unit beyond
+    /// ASCII at `p`, `Scan::None` at the end of the text with no match.
+    #[inline]
+    pub(crate) fn scan<U: Copy + Into<u32>>(&self, input: &[U], from: usize) -> Scan {
+        let mut row = (self.start(input, from) as usize) << self.shift;
+        let (trans, class) = (&self.fast[..], &self.class);
+        let mut p = from;
+        while p < input.len() {
+            let c: u32 = input[p].into();
+            if c >= 0x80 {
+                return Scan::Bail(p);
+            }
+            // SAFETY: as in `find`.
+            let t = unsafe { *trans.get_unchecked(row + class[c as usize] as usize) };
+            if t & FAST_MATCHED != 0 {
+                return Scan::Match(p);
+            }
+            row = t as usize;
+            p += 1;
+            if self.start_like[row >> self.shift] {
+                return Scan::Idle(p);
+            }
+        }
+        if self.at_end[row >> self.shift] { Scan::Match(p) } else { Scan::None }
+    }
+
     /// The start state at `start`: where the pattern has no boundary or anchor that looks back, the one start state.
     #[inline]
     fn start<U: Copy + Into<u32>>(&self, input: &[U], start: usize) -> u16 {
@@ -191,9 +234,15 @@ impl Anchored {
     /// Where the match that starts at `start` ends, over units that are ASCII bytes or UTF-16 code units.
     #[inline]
     pub(crate) fn find<U: Copy + Into<u32>>(&self, input: &[U], start: usize) -> Found {
+        self.find_reach(input, start).0
+    }
+
+    /// [`Anchored::find`], with how far it read: the unit at which every thread had died, or the end of the text.
+    #[inline]
+    pub(crate) fn find_reach<U: Copy + Into<u32>>(&self, input: &[U], start: usize) -> (Found, usize) {
         let s = self.start(input, start);
         if s == DEAD {
-            return Found::None;
+            return (Found::None, start);
         }
         let mut last = None;
         let mut p = start;
@@ -203,7 +252,7 @@ impl Anchored {
         while p < input.len() {
             let c: u32 = input[p].into();
             if c >= 0x80 {
-                return Found::Bail;
+                return (Found::Bail, p);
             }
             // SAFETY: `at` is a state's row (a multiple of the stride below the table's length, as every entry of
             // the table is) and a class is below the stride.
@@ -213,14 +262,14 @@ impl Anchored {
             }
             at = (t & !FAST_MATCHED) as usize;
             if at == 0 {
-                return last.map_or(Found::None, Found::End);
+                return (last.map_or(Found::None, Found::End), p);
             }
             p += 1;
         }
         if self.at_end[at >> self.shift] {
-            return Found::End(p);
+            return (Found::End(p), p);
         }
-        last.map_or(Found::None, Found::End)
+        (last.map_or(Found::None, Found::End), p)
     }
 }
 
@@ -274,6 +323,18 @@ impl Det<'_> {
         words: Option<(bool, bool)>,
     ) {
         self.generation += 1;
+        self.closure_on(out, from, at_start, at_end, words);
+    }
+
+    /// [`Det::closure`] after the closure just made, leaving out the states it reached.
+    fn closure_on(
+        &mut self,
+        out: &mut Vec<usize>,
+        from: &[usize],
+        at_start: bool,
+        at_end: bool,
+        words: Option<(bool, bool)>,
+    ) {
         let mut stack: Vec<usize> = from.iter().rev().copied().collect();
         while let Some(i) = stack.pop() {
             self.steps -= 1;
@@ -323,6 +384,18 @@ fn is_word(c: usize) -> bool {
 
 /// Builds the anchored automaton of a tree (after `simplify`), or `None` when the pattern has none.
 pub(crate) fn build(root: &Node) -> Option<Anchored> {
+    build_with(root, false)
+}
+
+/// Builds the forward automaton of a tree: the anchored automaton with a new start joined at every unit, behind every
+/// thread already alive (so last in preference, as the search tries later starts after earlier ones). Read over the
+/// text from a start, it says where the first match ends, and its start states say where no thread of an earlier
+/// start is alive: the leftmost match starts at or after the last of them, the forward search of the `regex` crate.
+pub(crate) fn build_forward(root: &Node) -> Option<Anchored> {
+    build_with(root, true)
+}
+
+fn build_with(root: &Node, forward: bool) -> Option<Anchored> {
     let mut b = Builder { states: Vec::new(), failed: false };
     let match_ = b.add(State::new(Kind::Match, 0));
     let start = b.compile(root, match_);
@@ -331,6 +404,11 @@ pub(crate) fn build(root: &Node) -> Option<Anchored> {
     }
     let nfa = &b.states[..];
     let mut d = Det { nfa, mark: vec![0; nfa.len()], generation: 0, steps: MAX_STEPS };
+    // In the forward automaton a thread of the start joined at the current unit is kept apart from the threads of
+    // earlier starts, as its state's number plus the number of states, so that a state whose threads are all of the
+    // current start (a start state) is known: no earlier start can still match.
+    let n = nfa.len();
+    let decode = move |set: &[usize]| -> Vec<usize> { set.iter().map(|&i| if i >= n { i - n } else { i }).collect() };
 
     // The classes of units: those every set has both or neither of, and that are both word characters or neither.
     let mut class = [0u8; 128];
@@ -386,7 +464,7 @@ pub(crate) fn build(root: &Node) -> Option<Anchored> {
         }
         let id = sets.len() as u16;
         let mut closed = Vec::new();
-        d.closure(&mut closed, &key.0, at_start, true, Some((word, false)));
+        d.closure(&mut closed, &decode(&key.0), at_start, true, Some((word, false)));
         at_end.push(has(&closed, Kind::Match));
         trans.extend(std::iter::repeat_n(DEAD, stride));
         ids.insert(key.clone(), id);
@@ -398,12 +476,16 @@ pub(crate) fn build(root: &Node) -> Option<Anchored> {
         let (word, at_start) = (k & 2 != 0, k & 1 != 0);
         let mut first = Vec::new();
         d.closure(&mut first, &[start], at_start, false, None);
+        if forward {
+            first.iter_mut().for_each(|i| *i += n);
+        }
         *slot = intern(&mut d, &mut ids, &mut sets, &mut trans, &mut at_end, first, word, at_start)?;
     }
     let mut id = 1;
     let (mut resolved, mut moved) = (Vec::new(), Vec::new());
     while id < sets.len() {
         let (set, word, at_start) = sets[id].clone();
+        let set = decode(&set);
         for (cl, &c) in sample.iter().enumerate() {
             resolved.clear();
             d.closure(&mut resolved, &set, at_start, false, Some((word, is_word(c))));
@@ -422,6 +504,11 @@ pub(crate) fn build(root: &Node) -> Option<Anchored> {
             }
             let mut next = Vec::new();
             d.closure(&mut next, &moved, false, false, None);
+            if forward && flag == 0 {
+                let mut fresh = Vec::new();
+                d.closure_on(&mut fresh, &[start], false, false, None);
+                next.extend(fresh.iter().map(|&i| i + n));
+            }
             let to = intern(&mut d, &mut ids, &mut sets, &mut trans, &mut at_end, next, is_word(c), false)?;
             if d.steps < 0 {
                 return None;
@@ -435,7 +522,12 @@ pub(crate) fn build(root: &Node) -> Option<Anchored> {
         .map(|&t| (u32::from(t & !MATCHED) << shift) | if t & MATCHED != 0 { FAST_MATCHED } else { 0 })
         .collect();
     let context = starts.iter().any(|&s| s != starts[0]);
-    Some(Anchored { class, shift: shift as u32, fast, at_end, starts, context })
+    let start_like = if forward {
+        sets.iter().map(|(set, _, _)| !set.is_empty() && set.iter().all(|&i| i >= n)).collect()
+    } else {
+        Vec::new()
+    };
+    Some(Anchored { class, shift: shift as u32, fast, at_end, starts, context, start_like })
 }
 
 /// An automaton of the terms before the anchors of a search, read backwards (accepting where any of them can start):

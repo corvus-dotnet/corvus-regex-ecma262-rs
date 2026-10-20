@@ -177,6 +177,10 @@ pub(crate) struct Program {
     /// The anchored automaton that finds where a match from a start ends, for a program that records no group and
     /// needs no backtracking (see `adfa.rs`).
     pub anchored_dfa: Option<super::adfa::Anchored>,
+    /// The tree of a pattern whose search tries every start its first set allows, from which the forward automaton
+    /// (see `adfa::build_forward`) is built on the first search that wants it.
+    pub forward_root: Option<Box<Node>>,
+    pub forward: std::sync::OnceLock<Option<Box<super::adfa::Anchored>>>,
 }
 
 struct Compiler {
@@ -250,6 +254,8 @@ pub(crate) fn compile_program(root: Node, unicode: bool, groups: Option<usize>) 
         first: None,
         search: super::search::Search::default(),
         anchored_dfa: None,
+        forward_root: None,
+        forward: std::sync::OnceLock::new(),
     };
     if p.groups == 0 && !backrefs {
         p.anchored_dfa = super::adfa::build(&root);
@@ -264,6 +270,20 @@ pub(crate) fn compile_program(root: Node, unicode: bool, groups: Option<usize>) 
             }
         }
         p.search = super::search::plan(&root, backrefs, p.first.as_ref(), !unicode);
+        // The tree is kept, and later built from and dropped, on the thread that searches, whose stack may be small:
+        // only a shallow one is kept.
+        #[cfg(test)]
+        let searching = !super::search::NO_SEARCH.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let searching = true;
+        if searching
+            && !backrefs
+            && shallower_than(&root, 64)
+            && matches!(p.search.plan, super::search::Plan::Scan)
+            && matches!(p.search.shape, super::search::Shape::None)
+        {
+            p.forward_root = Some(Box::new(root.clone()));
+        }
     }
     p
 }
@@ -1101,4 +1121,9 @@ fn first_chars(n: &Node, pairs: &mut Vec<Rune>) -> Option<bool> {
         NodeKind::Backref => None,
         _ => Some(true),
     }
+}
+
+/// Whether a tree nests fewer than `limit` levels.
+fn shallower_than(n: &Node, limit: usize) -> bool {
+    limit > 0 && n.subs.iter().all(|s| shallower_than(s, limit - 1))
 }

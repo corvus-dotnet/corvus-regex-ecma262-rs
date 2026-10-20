@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use super::Rune;
 use std::sync::Arc;
 
-use super::adfa::Found;
+use super::adfa::{Found, Scan};
 use super::charset::CharSet;
 use super::compile::{Inst, MAX_MEMO_LOOPS, Op, Program};
 use super::fold::{canonicalize, is_fold_word_rune};
@@ -226,6 +226,12 @@ impl State {
     }
 }
 
+/// Whether a position of UTF-16 text is between the halves of a pair.
+#[inline]
+fn mid_pair(units: &[u16], at: usize) -> bool {
+    at > 0 && at < units.len() && (0xDC00..=0xDFFF).contains(&units[at]) && (0xD800..=0xDBFF).contains(&units[at - 1])
+}
+
 impl Program {
     /// The bit of the memory for the memo point `m` at a position, with the state of the loops around the point:
     /// for each, whether it would refuse an iteration that ended here as empty.
@@ -406,7 +412,7 @@ impl Program {
                     let _ = w;
                     at
                 };
-                let to = if T::UTF8 { end.end8(bytes, from) } else { None };
+                let to = if T::UTF8 { end.end8(bytes, from) } else { end.end16(T::units16(input), from) };
                 Some((from, to.unwrap_or_else(|| self.end_of_run::<T>(set, input, from))))
             }
         })
@@ -424,6 +430,11 @@ impl Program {
                 at = fb.find(bytes, at)?;
             } else if let Some(fu) = first_units {
                 at = fu.find(units16, at)?;
+                // With the u or v flag the trail half of a pair is not a character a match can start at.
+                if !self.units && mid_pair(units16, at) {
+                    at += 1;
+                    continue;
+                }
             }
             if at >= input.len() {
                 return None;
@@ -704,8 +715,48 @@ impl Program {
     }
 
     /// The search that tries every position the first set allows.
+    /// The forward automaton, built on the first search that wants it.
+    #[inline]
+    fn forward(&self) -> Option<&super::adfa::Anchored> {
+        let root = self.forward_root.as_ref()?;
+        self.forward.get_or_init(|| super::adfa::build_forward(root).map(Box::new)).as_deref()
+    }
+
+    /// Tries the starts from `at` to `last` in order, as the plain search would: the first match, or `Err` with
+    /// where the starts ran out.
+    fn try_starts<T: Text>(
+        &self,
+        st: &mut State,
+        input: &[T::Unit],
+        mut at: usize,
+        last: usize,
+    ) -> Result<Option<(usize, usize)>, usize> {
+        let units16 = T::units16(input);
+        while at <= last && at <= input.len() {
+            if !T::UTF8 && !self.units && mid_pair(units16, at) {
+                at += 1;
+                continue;
+            }
+            if at == input.len() {
+                let found = self.first.is_none() && self.run::<T>(st, input, at);
+                return Ok(found.then_some((at, st.end)));
+            }
+            let c: u32 = input[at].into();
+            let (r, w) = if c < 0x80 { (c as Rune, 1) } else { T::read(input, at, self.units) };
+            if self.first.as_ref().is_none_or(|first| first.contains(r)) && self.run::<T>(st, input, at) {
+                return Ok(Some((at, st.end)));
+            }
+            if st.stop != STOP_NONE {
+                return Ok(None);
+            }
+            at += w;
+        }
+        Err(at)
+    }
+
     fn scan<T: Text>(&self, st: &mut State, input: &[T::Unit], start: usize, need: usize) -> Option<(usize, usize)> {
         let len = input.len();
+        let forward = self.forward();
         let units = self.units;
         let search = &self.search;
         let mut at = start;
@@ -719,6 +770,11 @@ impl Program {
                 at = fb.find(bytes, at)?;
             } else if let Some(fu) = first_units {
                 at = fu.find(units16, at)?;
+                // With the u or v flag the trail half of a pair is not a character a match can start at.
+                if !self.units && mid_pair(units16, at) {
+                    at += 1;
+                    continue;
+                }
             }
             if len - at < need {
                 return None;
@@ -732,6 +788,23 @@ impl Program {
                 // Inside a word, where \b cannot hold: the rest of the word is passed over.
                 let first = self.first.as_ref().expect("a leading word boundary has a first set");
                 at = self.end_of_run::<T>(first, input, at).max(at + w);
+                continue;
+            }
+            if let Some(fw) = forward {
+                // One pass of the forward automaton from here says where a match first ends, or that none starts
+                // before a place where no thread is alive; only then are starts tried, from here to there.
+                let last = match fw.scan(input, at) {
+                    Scan::None => return None,
+                    Scan::Idle(p) => {
+                        at = p;
+                        continue;
+                    }
+                    Scan::Match(p) | Scan::Bail(p) => p,
+                };
+                match self.try_starts::<T>(st, input, at, last) {
+                    Ok(found) => return found,
+                    Err(next) => at = next,
+                }
                 continue;
             }
             if self.first.as_ref().is_none_or(|first| first.contains(r)) && self.run::<T>(st, input, at) {

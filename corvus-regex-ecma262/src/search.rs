@@ -40,6 +40,7 @@ use super::Rune;
 use super::charset::{CharSet, is_word_byte};
 use super::compile::literal_rune;
 use super::parse::{Node, NodeKind, UNBOUNDED};
+use super::simd16::{self, Needle16, UnitSet};
 
 /// The most literals the forms of one anchor are expanded to: the most the fingerprint search takes.
 const MAX_FORMS: usize = 64;
@@ -152,6 +153,17 @@ impl memchr::arch::all::packedpair::HeuristicFrequencyRank for Utf16Rank {
     }
 }
 
+/// How common a UTF-16 code unit is in text, for the choice of a needle's rarest units (higher is commoner): ASCII as
+/// English ranks it, Cyrillic as common as lower case letters, anything else rare.
+fn unit_rank(u: u16) -> u8 {
+    use memchr::arch::all::packedpair::HeuristicFrequencyRank;
+    match u {
+        0..=0x7F => Utf16Rank.rank(u as u8),
+        0x0400..=0x04FF => 200,
+        _ => 60,
+    }
+}
+
 /// The literals of a search, over UTF-8 and over the bytes of UTF-16 code units.
 #[derive(Clone, Debug)]
 pub(crate) struct Literals {
@@ -161,12 +173,29 @@ pub(crate) struct Literals {
     /// units of a chunk of text are packed into bytes (an ASCII unit as itself, one of the few others as a byte of its
     /// own from 0x81 on, any other as 0x80, which no literal holds) and the packed literals searched for, as the .NET
     /// reference engine's packed fingerprint search does, so that the zero high bytes of ASCII units are not looked at.
-    /// (One literal is found by `memmem` over the units' bytes, ranked for UTF-16.)
-    packed: Option<(Finder, Vec<(u16, u8)>)>,
+    packed: Option<Packed16>,
+    /// One literal over UTF-16: the vectorised search for two of its units, the rarest.
+    needle16: Option<Needle16>,
+    /// Up to four literals over UTF-16 that start with one rare unit: the vectorised search for it, then a compare of
+    /// each.
+    shared16: Option<(UnitSet, Vec<Vec<u16>>)>,
     /// The most code units of a literal.
     longest: usize,
     /// The bytes the UTF-8 literals start with.
     firsts: Box<[bool; 256]>,
+}
+
+/// The packed search over UTF-16 (see [`Literals::find_packed`]).
+#[derive(Clone, Debug)]
+struct Packed16 {
+    /// The search for the ASCII literals in the packed units (folded to lower case with `fold`).
+    finder: Finder,
+    fold: bool,
+    /// The literals with units beyond ASCII, and those units.
+    apart: Vec<Vec<u16>>,
+    apart_set: Option<UnitSet>,
+    /// Every literal in the pattern's order, for the rare start where literals of both kinds occur.
+    all: Vec<Vec<u16>>,
 }
 
 /// The units packed into bytes at a time for the UTF-16 search of ASCII literals.
@@ -196,35 +225,50 @@ impl Literals {
         let utf16: Vec<Vec<u8>> =
             literals.iter().map(|l| as_string(l).encode_utf16().flat_map(u16::to_ne_bytes).collect()).collect();
         let longest = literals.iter().map(|l| as_string(l).encode_utf16().count()).max().unwrap_or(0);
-        let mut map: Vec<(u16, u8)> = Vec::new();
-        let mut packable = literals.len() > 1 && longest < 64;
-        let packed_literals: Vec<Vec<u8>> = literals
-            .iter()
-            .map(|l| {
-                as_string(l)
-                    .encode_utf16()
-                    .map(|u| {
-                        if u < 0x80 {
-                            return u as u8;
-                        }
-                        if let Some(&(_, b)) = map.iter().find(|(m, _)| *m == u) {
-                            return b;
-                        }
-                        if map.len() >= 64 {
-                            packable = false;
-                            return 0x80;
-                        }
-                        let b = 0x81 + map.len() as u8;
-                        map.push((u, b));
-                        b
-                    })
-                    .collect()
-            })
-            .collect();
-        // Packing pays for ASCII literals: a unit beyond them is then one compare away from its byte. Measured, a map of
-        // even two units (the long s and the Kelvin sign of a case-insensitive literal) made the search slower than the
-        // fingerprint search over the units' bytes, and a Cyrillic literal's map made it twenty times slower.
-        let packed = (packable && map.is_empty()).then(|| (Finder::new(&packed_literals, fingerprint, false), map));
+        let units16: Vec<Vec<u16>> = literals.iter().map(|l| as_string(l).encode_utf16().collect()).collect();
+        // Packing pays for ASCII literals: a chunk of text is packed by a vector loop, ASCII units as themselves and
+        // any other as 0x80, and the ASCII literals searched for in it. The literals with a few units beyond ASCII
+        // (the long s and the Kelvin sign of a case-insensitive literal) are left out of that search and looked for
+        // apart, at those units, in a chunk that holds a unit beyond ASCII, which English text seldom has. A Cyrillic
+        // literal set is not packed: the search over the units' bytes is faster for it.
+        let (ascii, apart): (Vec<&Vec<u16>>, Vec<&Vec<u16>>) =
+            units16.iter().partition(|l| l.iter().all(|&u| u < 0x80));
+        let mut apart_units: Vec<u16> = apart.iter().flat_map(|l| l.iter().copied().filter(|&u| u >= 0x80)).collect();
+        apart_units.sort_unstable();
+        apart_units.dedup();
+        let packed = (literals.len() > 1 && longest < 64 && !ascii.is_empty() && apart_units.len() <= 4).then(|| {
+            let bytes: Vec<Vec<u8>> = ascii.iter().map(|l| l.iter().map(|&u| u as u8).collect()).collect();
+            // Where the literals are mostly a letter's cases written out, the packed text is folded to lower case
+            // and the folded literals searched for, a few where there were many, each candidate then compared with
+            // the literals themselves: the .NET reference engine's case-insensitive packed search.
+            let mut folded: Vec<Vec<u8>> = Vec::new();
+            for l in &bytes {
+                let f: Vec<u8> = l.iter().map(u8::to_ascii_lowercase).collect();
+                if !folded.contains(&f) {
+                    folded.push(f);
+                }
+            }
+            let fold = folded.len() * 2 <= bytes.len();
+            Packed16 {
+                finder: Finder::new(if fold { &folded } else { &bytes }, fingerprint || fold, false),
+                fold,
+                apart: apart.iter().map(|l| (*l).clone()).collect(),
+                apart_set: (!apart_units.is_empty())
+                    .then(|| UnitSet::new(&apart_units.iter().map(|&u| (u, u)).collect::<Vec<_>>()))
+                    .flatten(),
+                all: units16.clone(),
+            }
+        });
+        let needle16 = (units16.len() == 1).then(|| Needle16::new(units16[0].clone(), unit_rank));
+        let first16 = units16.first().and_then(|l| l.first()).copied();
+        let shared16 = (units16.len() > 1
+            && units16.len() <= 4
+            && first16.is_some_and(|u| u < 0x80 && rare(u as u8))
+            && units16.iter().all(|l| l.first().copied() == first16))
+        .then(|| {
+            let u = first16.expect("a first unit");
+            (UnitSet::new(&[(u, u)]).expect("one range"), units16.clone())
+        });
         let mut firsts = Box::new([false; 256]);
         for l in &utf8 {
             firsts[l[0] as usize] = true;
@@ -234,6 +278,8 @@ impl Literals {
             utf8: Finder::new(&utf8, fingerprint, false),
             utf16: Finder::new(&utf16, fingerprint, true),
             packed,
+            needle16,
+            shared16,
             longest,
         }
     }
@@ -276,8 +322,26 @@ impl Literals {
         if utf8 {
             return self.utf8.find(bytes, from);
         }
-        if let Some((finder, map)) = &self.packed {
-            return self.find_packed(finder, map, bytes, from);
+        if self.needle16.is_some() || self.shared16.is_some() {
+            // SAFETY: the bytes are those of a slice of u16 (`Text::bytes` of UTF-16 text), so they are aligned for
+            // u16 and their length is even.
+            let text: &[u16] = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u16>(), bytes.len() / 2) };
+            if let Some(n) = &self.needle16 {
+                return n.find(text, from).map(|i| (i, i + n.len()));
+            }
+            if let Some((first, literals)) = &self.shared16 {
+                let mut at = from;
+                loop {
+                    let p = first.find(text, at)?;
+                    if let Some(l) = literals.iter().find(|l| text[p..].starts_with(l)) {
+                        return Some((p, p + l.len()));
+                    }
+                    at = p + 1;
+                }
+            }
+        }
+        if let Some(p) = &self.packed {
+            return self.find_packed(p, bytes, from);
         }
         let mut at = 2 * from;
         loop {
@@ -292,13 +356,44 @@ impl Literals {
     /// The search over UTF-16 for ASCII literals: the low bytes of a chunk of units packed into bytes, searched by the
     /// UTF-8 search. An occurrence that starts so near the end of a chunk that a longer one could start before it and
     /// end beyond the chunk is looked for again in the next chunk, which starts that far back.
-    fn find_packed(&self, finder: &Finder, map: &[(u16, u8)], bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    fn find_packed(&self, p: &Packed16, bytes: &[u8], from: usize) -> Option<(usize, usize)> {
         // SAFETY: the bytes are those of a slice of u16 (`Text::bytes` of UTF-16 text), so they are aligned for u16
         // and their length is even.
         let text: &[u16] = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u16>(), bytes.len() / 2) };
         let units = text.len();
         let overlap = self.longest.saturating_sub(1);
-        let mut buf = [0u8; PACK];
+        if from > units {
+            return None;
+        }
+        let session = SESSION.get();
+        if session != 0 {
+            // Within a global search the chunk packed last is kept, and the next search from inside it starts there.
+            let key = (session, text.as_ptr() as usize, units, std::ptr::from_ref(self) as usize);
+            return PACK_CACHE.with_borrow_mut(|c| {
+                let (mut at, mut end) =
+                    if c.key == key && from >= c.start && from < c.end { (c.start, c.end) } else { (from, from) };
+                loop {
+                    if end == at {
+                        end = (at + PACK).min(units);
+                        let (_, wide) = simd16::pack(&mut c.buf[..end - at], &text[at..end], p.fold);
+                        (c.key, c.start, c.end, c.wide) = (key, at, end, wide);
+                    }
+                    // SAFETY: the cache's first end - start bytes were packed when they were kept.
+                    let packed = unsafe { std::slice::from_raw_parts(c.buf.as_ptr().cast::<u8>(), end - at) };
+                    let last = end == units;
+                    if let Some(found) = p.search_chunk(text, packed, at, from, c.wide, last, overlap) {
+                        return Some(found);
+                    }
+                    if last {
+                        return None;
+                    }
+                    at = end - overlap;
+                    end = at;
+                }
+            });
+        }
+        // Only the packed part of the buffer is read, so it is never cleared.
+        let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); PACK];
         let mut at = from;
         // The first chunk is small, and each is four times the one before, so a search whose occurrence is near
         // packs little more than it reads.
@@ -306,24 +401,10 @@ impl Literals {
         while at <= units {
             let end = (at + size).min(units);
             size = (size * 4).min(PACK);
-            // A unit beyond ASCII packs to 0x80; the loop is one the compiler makes into vector instructions.
-            for (slot, &u) in buf[..end - at].iter_mut().zip(&text[at..end]) {
-                *slot = u.min(0x80) as u8;
-            }
-            if !map.is_empty() {
-                for (slot, &u) in buf[..end - at].iter_mut().zip(&text[at..end]) {
-                    if u >= 0x80
-                        && let Some(&(_, b)) = map.iter().find(|(m, _)| *m == u)
-                    {
-                        *slot = b;
-                    }
-                }
-            }
+            let (packed, wide) = simd16::pack(&mut buf[..end - at], &text[at..end], p.fold);
             let last = end == units;
-            if let Some((s, e)) = finder.find(&buf[..end - at], 0)
-                && (last || s < end - at - overlap)
-            {
-                return Some((at + s, at + e));
+            if let Some(found) = p.search_chunk(text, packed, at, from, wide, last, overlap) {
+                return Some(found);
             }
             if last {
                 return None;
@@ -332,6 +413,109 @@ impl Literals {
         }
         None
     }
+}
+
+impl Packed16 {
+    /// The leftmost occurrence at or after `from` in the chunk of `text` from `at` that `packed` holds packed, of
+    /// those that end within it unless it is the `last`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn search_chunk(
+        &self,
+        text: &[u16],
+        packed: &[u8],
+        at: usize,
+        from: usize,
+        wide: bool,
+        last: bool,
+        overlap: usize,
+    ) -> Option<(usize, usize)> {
+        let end = at + packed.len();
+        let limit = if last { packed.len() } else { packed.len().saturating_sub(overlap) };
+        let mut found = None;
+        let mut from_k = from.saturating_sub(at);
+        while let Some((s, e)) = self.finder.find(packed, from_k).filter(|&(s, _)| s < limit) {
+            if !self.fold {
+                found = Some((at + s, at + e));
+                break;
+            }
+            // A folded candidate is a match where one of the literals, in the pattern's order, is there.
+            if let Some(l) = self.all.iter().find(|l| text[at + s..].starts_with(l)) {
+                found = Some((at + s, at + s + l.len()));
+                break;
+            }
+            from_k = s + 1;
+        }
+        if wide && let Some(units) = &self.apart_set {
+            // The literals with units beyond ASCII, at each of those units in the chunk from `from` on, found by the
+            // vectorised search for them, up to an occurrence already found.
+            let stop = found.map_or(end, |(s, _)| (s + overlap + 1).min(end));
+            let mut k = from.max(at);
+            while let Some(p) = units.find(&text[..stop], k) {
+                k = p + 1;
+                let u = text[p];
+                for l in &self.apart {
+                    for (j, _) in l.iter().enumerate().filter(|&(_, &x)| x == u) {
+                        if p >= from + j && text[p - j..].starts_with(l) {
+                            let s = p - j;
+                            if found.is_none_or(|(f, _)| s < f) {
+                                found = Some((s, s + l.len()));
+                            } else if found.is_some_and(|(f, _)| s == f) {
+                                // Literals of both kinds start here: the first in the pattern's order is the match.
+                                let first = self.all.iter().find(|l| text[s..].starts_with(l)).expect("a literal");
+                                found = Some((s, s + first.len()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        found
+    }
+}
+
+/// The global search a call belongs to, for the packed chunk kept between its searches (0: none). The text cannot
+/// change during a global search, which borrows it, so a chunk kept for it stays true.
+static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+thread_local! {
+    static SESSION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PACK_CACHE: std::cell::RefCell<PackCache> = const { std::cell::RefCell::new(PackCache {
+        key: (0, 0, 0, 0),
+        start: 0,
+        end: 0,
+        wide: false,
+        buf: [std::mem::MaybeUninit::uninit(); PACK],
+    }) };
+}
+
+/// The chunk of packed units kept for a global search: its key (the search, the text and its length, the literals)
+/// and the units it holds.
+struct PackCache {
+    key: (u64, usize, usize, usize),
+    start: usize,
+    end: usize,
+    wide: bool,
+    buf: [std::mem::MaybeUninit<u8>; PACK],
+}
+
+/// A new global search's number.
+pub(crate) fn new_session() -> u64 {
+    NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Runs `f` as part of the global search `session`.
+#[inline]
+pub(crate) fn in_session<R>(session: u64, f: impl FnOnce() -> R) -> R {
+    /// Puts the session before back, even when `f` panics.
+    struct Restore(u64);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SESSION.set(self.0);
+        }
+    }
+    let _restore = Restore(SESSION.replace(session));
+    f()
 }
 
 /// The anchored automaton of what follows an occurrence (an anchor and the terms after it), run at the occurrence
@@ -457,6 +641,25 @@ impl RunEnd {
         RunEnd::Stops(stops)
     }
 
+    /// The end of the run that starts at `at` in UTF-16 text, or `None` when it is to be found a member at a time:
+    /// the stops found by the vectorised search for their units.
+    #[inline]
+    pub(crate) fn end16(&self, units: &[u16], at: usize) -> Option<usize> {
+        let stops = match self {
+            RunEnd::Each => return None,
+            RunEnd::All => return Some(units.len()),
+            RunEnd::Stops(b) => {
+                let mut r = [(0u16, 0u16); 3];
+                for (slot, &c) in r.iter_mut().zip(b) {
+                    *slot = (u16::from(c), u16::from(c));
+                }
+                UnitSet::new(&r[..b.len()])
+            }
+            RunEnd::Line => UnitSet::new(&[(0x0A, 0x0A), (0x0D, 0x0D), (0x2028, 0x2029)]),
+        };
+        Some(stops.and_then(|s| s.find(units, at)).unwrap_or(units.len()))
+    }
+
     /// The end of the run that starts at `at` in UTF-8 text, or `None` when it is to be found a member at a time.
     #[inline]
     pub(crate) fn end8(&self, input: &[u8], at: usize) -> Option<usize> {
@@ -525,62 +728,54 @@ pub(crate) enum FirstBytes {
     Packed(packed::Searcher, Box<[bool; 256]>),
 }
 
-/// A test for the code units a match can start with over UTF-16: up to four ranges of ASCII units, and with `wide` every
-/// unit beyond ASCII (which the first set then has a member among). Sixteen units are tested at once, in a loop the
-/// compiler makes into vector instructions, and a candidate is then tested against the first set itself.
+/// A test for the code units a match can start with over UTF-16: the first set's units as up to eight ranges (a
+/// member beyond the BMP as its lead surrogate), where more are merged across the narrowest gaps, the ASCII and Latin
+/// ones last since those units are common in text. The ranges are tested sixteen units at a time by a vector loop
+/// (`simd16`), and a candidate is then tested against the first set itself.
 #[derive(Clone, Debug)]
 pub(crate) struct FirstUnits {
-    ranges: [(u16, u16); 4],
-    wide: bool,
+    set: UnitSet,
 }
 
 impl FirstUnits {
     fn new(set: &CharSet) -> Option<FirstUnits> {
-        let mut ranges = [(u16::MAX, 0u16); 4];
-        let mut n = 0;
-        let mut wide = false;
+        let lead = |cp: u32| 0xD800 + ((cp - 0x10000) >> 10);
+        let mut units: Vec<(u32, u32)> = Vec::new();
         for &[lo, hi] in set.ranges.as_chunks::<2>().0 {
-            if hi >= 0x80 {
-                wide = true;
+            let (lo, hi) = (lo as u32, hi as u32);
+            if lo <= 0xFFFF {
+                units.push((lo, hi.min(0xFFFF)));
             }
-            if lo < 0x80 {
-                if n == 4 {
-                    return None;
-                }
-                ranges[n] = (lo as u16, (hi.min(0x7F) - lo) as u16);
-                n += 1;
+            if hi > 0xFFFF {
+                units.push((lead(lo.max(0x10000)), lead(hi)));
             }
         }
-        Some(FirstUnits { ranges, wide })
-    }
-
-    #[inline(always)]
-    fn hit(&self, u: u16) -> bool {
-        let r = &self.ranges;
-        (self.wide & (u >= 0x80))
-            | (u.wrapping_sub(r[0].0) <= r[0].1)
-            | (u.wrapping_sub(r[1].0) <= r[1].1)
-            | (u.wrapping_sub(r[2].0) <= r[2].1)
-            | (u.wrapping_sub(r[3].0) <= r[3].1)
+        units.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::new();
+        for (lo, hi) in units {
+            match merged.last_mut() {
+                Some(last) if lo <= last.1 + 1 => last.1 = last.1.max(hi),
+                _ => merged.push((lo, hi)),
+            }
+        }
+        while merged.len() > 8 {
+            // The gap whose units are least likely in text: its width, a thousand times over below U+0300.
+            let cost = |k: usize| {
+                let (a, b) = (merged[k].1 + 1, merged[k + 1].0);
+                u64::from(b - a) * if a < 0x300 { 1000 } else { 1 }
+            };
+            let k = (0..merged.len() - 1).min_by_key(|&k| cost(k)).expect("two ranges");
+            merged[k].1 = merged[k + 1].1;
+            merged.remove(k + 1);
+        }
+        let ranges: Vec<(u16, u16)> = merged.iter().map(|&(lo, hi)| (lo as u16, hi as u16)).collect();
+        UnitSet::new(&ranges).map(|set| FirstUnits { set })
     }
 
     /// The first unit at or after `from` that can begin a match.
     #[inline]
     pub(crate) fn find(&self, units: &[u16], from: usize) -> Option<usize> {
-        // Where the units are common a few are looked at one by one first.
-        let probe = units.get(from..)?.iter().take(8).position(|&u| self.hit(u));
-        if let Some(i) = probe {
-            return Some(from + i);
-        }
-        let mut at = from + 8;
-        while at + 16 <= units.len() {
-            let chunk: &[u16; 16] = units[at..at + 16].try_into().expect("sixteen units");
-            if chunk.iter().fold(false, |any, &u| any | self.hit(u)) {
-                break;
-            }
-            at += 16;
-        }
-        units.get(at..)?.iter().position(|&u| self.hit(u)).map(|i| at + i)
+        self.set.find(units, from)
     }
 }
 

@@ -374,7 +374,7 @@ impl Regex {
     /// assert_eq!(words, ["a", "bc", "def"]);
     /// ```
     pub fn find_iter<'r, 't>(&'r self, text: &'t str) -> Matches<'r, 't> {
-        Matches { re: self, text, at: 0, done: false }
+        Matches { re: self, text, at: 0, done: false, session: super::search::new_session() }
     }
 
     /// The first match and what each group captured (`exec`).
@@ -399,7 +399,7 @@ impl Regex {
 
     /// The captures of every match, as [`Regex::find_iter`] finds them.
     pub fn captures_iter<'r, 't>(&'r self, text: &'t str) -> CaptureMatches<'r, 't> {
-        CaptureMatches { re: self, text, at: 0, done: false }
+        CaptureMatches { re: self, text, at: 0, done: false, session: super::search::new_session() }
     }
 
     /// A place to read the groups of a match into, for [`Regex::captures_read_at`], so that a loop over many
@@ -501,7 +501,7 @@ impl Regex {
 
     /// [`Regex::find_iter`] over UTF-16 text.
     pub fn find_iter_utf16<'r, 't>(&'r self, text: &'t [u16]) -> Matches<'r, 't, [u16]> {
-        Matches { re: self, text, at: 0, done: false }
+        Matches { re: self, text, at: 0, done: false, session: super::search::new_session() }
     }
 
     /// [`Regex::captures`] over UTF-16 text.
@@ -526,7 +526,7 @@ impl Regex {
 
     /// [`Regex::captures_iter`] over UTF-16 text.
     pub fn captures_iter_utf16<'r, 't>(&'r self, text: &'t [u16]) -> CaptureMatches<'r, 't, [u16]> {
-        CaptureMatches { re: self, text, at: 0, done: false }
+        CaptureMatches { re: self, text, at: 0, done: false, session: super::search::new_session() }
     }
 
     /// [`Regex::captures_read_at`] over UTF-16 text.
@@ -752,6 +752,8 @@ pub struct Matches<'r, 't, H: ?Sized = str> {
     text: &'t H,
     at: usize,
     done: bool,
+    /// The global search this is, for what its searches keep between them (see `search::in_session`).
+    session: u64,
 }
 
 impl<'t, H: Haystack + ?Sized> Iterator for Matches<'_, 't, H> {
@@ -762,7 +764,10 @@ impl<'t, H: Haystack + ?Sized> Iterator for Matches<'_, 't, H> {
             return None;
         }
         let input = self.text.units();
-        match self.re.exec::<H::Text>(input, self.at, self.re.flags.sticky, None, None) {
+        let exec = || self.re.exec::<H::Text>(input, self.at, self.re.flags.sticky, None, None);
+        // Only the UTF-16 searches keep anything between the searches of a global search.
+        let found = if <H::Text as Text>::UTF8 { exec() } else { super::search::in_session(self.session, exec) };
+        match found {
             Ok(Some((from, to))) => {
                 self.at = self.re.next_start::<H::Text>(input, from, to);
                 Some(Match { text: self.text, start: from, end: to })
@@ -783,6 +788,7 @@ pub struct CaptureMatches<'r, 't, H: ?Sized = str> {
     text: &'t H,
     at: usize,
     done: bool,
+    session: u64,
 }
 
 impl<'t, H: Haystack + ?Sized> Iterator for CaptureMatches<'_, 't, H> {
@@ -792,7 +798,10 @@ impl<'t, H: Haystack + ?Sized> Iterator for CaptureMatches<'_, 't, H> {
         if self.done {
             return None;
         }
-        match self.re.captures_generic(self.text, self.at, self.re.flags.sticky, None) {
+        let captures = || self.re.captures_generic(self.text, self.at, self.re.flags.sticky, None);
+        let found =
+            if <H::Text as Text>::UTF8 { captures() } else { super::search::in_session(self.session, captures) };
+        match found {
             Ok(Some(caps)) => {
                 let m = caps.get_match();
                 self.at = self.re.next_start::<H::Text>(self.text.units(), m.start, m.end);
