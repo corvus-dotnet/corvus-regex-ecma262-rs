@@ -98,7 +98,7 @@ the dot-all row left out), and above on one:
 
 | Row | This engine | `regex` | Ratio | Why |
 |---|--:|--:|--:|---|
-| `Holmes.{0,25}Watson\|Watson.{0,25}Holmes` | 66.6 us | 59.5 us | 1.12 | Both find the 542 occurrences with the same Teddy searcher and check each with an automaton; Teddy takes 37.8 us here against 34.4 us in `regex`, the check 19.9 against 18.1 us. Reading on through the window after a failed occurrence, as `regex`'s lazy automaton does, was tried two ways and both were slower: looking at the window's units for a literal's first byte before calling the search (62.9 to 68.9 us over UTF-8, 88 to 138 us over UTF-16) and running the forward automaton (item 50) from each occurrence (1.12 times the time). Not an ECMA-262 rule. |
+| `Holmes.{0,25}Watson\|Watson.{0,25}Holmes` | 66.6 us | 59.3 us | 1.12 | Both find the 542 occurrences with the same Teddy searcher and check each with an automaton; Teddy takes 37.8 us here against 34.4 us in `regex`, the check 19.9 against 18.1 us. Reading on through the window after a failed occurrence, as `regex`'s lazy automaton does, was tried two ways and both were slower: looking at the window's units for a literal's first byte before calling the search (62.9 to 68.9 us over UTF-8, 88 to 138 us over UTF-16) and running the forward automaton (item 50) from each occurrence (1.12 times the time). Not an ECMA-262 rule. |
 
 IPv4, above `regex` before the forward automaton, is level with it.
 
