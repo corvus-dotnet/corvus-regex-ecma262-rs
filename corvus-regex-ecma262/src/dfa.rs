@@ -3,11 +3,14 @@
 //! The strings a schema tests are short and nearly always ASCII, and most patterns in schemas are small. For such a
 //! pattern every state set the text can lead to is worked out once, and a match is then one table read per byte.
 //!
-//! The automaton reads bytes below 0x80 only. A text with any other byte is handed back to the backtracking matcher
-//! from the start, so nothing here needs to know UTF-8 or the Unicode classes: a class is its ASCII members. A
-//! pattern with a word boundary, or whose automaton has more states than a byte can number, has no automaton. The
-//! automaton is built on the first match, not when the pattern is compiled, so a schema pays nothing for the
-//! patterns its instances never reach.
+//! The automaton reads units below 0x80 only. A text with any other unit is handed back to the backtracking matcher
+//! from the start, so nothing here needs to know UTF-8 or the Unicode classes: a class is its ASCII members. It
+//! takes `\b` and `\B` (not those of a case-insensitive pattern with the u flag, which fold): a state carries
+//! whether the unit before it was a word character and whether it is at the start of the text, and a boundary
+//! still to pass is passed, or not, when the next unit is known (section 4.4 of the design of the .NET reference
+//! engine). A pattern whose automaton has more states than a byte can number has no automaton. The automaton is
+//! built on the first match, not when the pattern is compiled, so a program pays nothing for the patterns it never
+//! matches.
 
 use std::collections::HashMap;
 
@@ -36,6 +39,9 @@ enum NfaKind {
     /// `Bol` and `Eol` go to `out` at the start and at the end of the text.
     Bol,
     Eol,
+    /// `Word` and `NotWord` go to `out` where a word boundary holds and where it does not.
+    Word,
+    NotWord,
     Match,
 }
 
@@ -129,6 +135,8 @@ impl NfaBuilder {
             }
             NodeKind::Bol => self.add(NfaState::new(NfaKind::Bol, next)),
             NodeKind::Eol => self.add(NfaState::new(NfaKind::Eol, next)),
+            NodeKind::WordBoundary if !n.fold => self.add(NfaState::new(NfaKind::Word, next)),
+            NodeKind::NotWordBoundary if !n.fold => self.add(NfaState::new(NfaKind::NotWord, next)),
             // A word boundary, or anything that needs the backtracking matcher.
             _ => {
                 self.failed = true;
@@ -190,9 +198,17 @@ struct DfaBuilder<'a> {
 
 impl DfaBuilder<'_> {
     /// Adds to `set` every state that reading nothing reaches from the states in `from`, keeping the states that
-    /// read a byte, the end anchors still to pass, and the match. A start anchor is passed only `at_start`, and an
-    /// end anchor only `at_end`.
-    fn closure(&mut self, set: &mut Vec<usize>, from: &[usize], at_start: bool, at_end: bool) {
+    /// read a byte, the anchors and boundaries still to pass, and the match. A start anchor is passed only
+    /// `at_start`, and an end anchor only `at_end`. A word boundary is kept to pass later without `words`, and with
+    /// it (whether the units before and after the position are word characters) is passed or dropped.
+    fn closure(
+        &mut self,
+        set: &mut Vec<usize>,
+        from: &[usize],
+        at_start: bool,
+        at_end: bool,
+        words: Option<(bool, bool)>,
+    ) {
         self.generation += 1;
         self.stack.clear();
         self.stack.extend_from_slice(from);
@@ -220,6 +236,14 @@ impl DfaBuilder<'_> {
                         set.push(i);
                     }
                 }
+                NfaKind::Word | NfaKind::NotWord => match words {
+                    None => set.push(i),
+                    Some((before, after)) => {
+                        if (before != after) == (s.kind == NfaKind::Word) {
+                            self.stack.push(s.out);
+                        }
+                    }
+                },
                 _ => set.push(i),
             }
         }
@@ -230,10 +254,17 @@ impl DfaBuilder<'_> {
     }
 }
 
-/// A set as a map key: its states in increasing order.
-fn set_key(set: &mut [usize]) -> Vec<u16> {
+/// A state of the automaton as a map key: its states in increasing order, then whether the unit before it was a
+/// word character and whether it is at the start of the text.
+fn set_key(set: &mut [usize], word: bool, at_start: bool) -> Vec<u16> {
     set.sort_unstable();
-    set.iter().map(|&s| s as u16).collect()
+    let mut key: Vec<u16> = set.iter().map(|&s| s as u16).collect();
+    key.push(u16::MAX - u16::from(word) * 2 - u16::from(at_start));
+    key
+}
+
+fn is_word(c: usize) -> bool {
+    super::charset::is_word_byte(c as u8)
 }
 
 /// Builds the automaton of a pattern for an unanchored search, or `None` when it has none.
@@ -247,13 +278,14 @@ pub(crate) fn build_dfa(root: &Node) -> Option<Dfa> {
     let nfa = &nb.states[..];
     let mut b = DfaBuilder { nfa, mark: vec![0; nfa.len()], generation: 0, stack: Vec::new(), steps: MAX_DFA_STEPS };
 
-    // The classes of bytes: two bytes are in one class when every set of the pattern has both or neither. Class 0
-    // is the bytes that are not ASCII.
+    // The classes of bytes: two bytes are in one class when every set of the pattern has both or neither, and both
+    // or neither is a word character. Class 0 is the bytes that are not ASCII.
     let mut d = Dfa { class: [0; 256], trans: Vec::new(), shift: 0, start: 0, at_end: Vec::new(), empty: false };
     let mut classes = 1usize;
     let mut signatures: HashMap<Vec<u8>, u8> = HashMap::new();
     for c in 0..128usize {
-        let mut signature = Vec::with_capacity(nfa.len() / 8 + 1);
+        let mut signature = Vec::with_capacity(nfa.len() / 8 + 2);
+        signature.push(u8::from(is_word(c)));
         let (mut acc, mut n) = (0u8, 0u8);
         for s in nfa {
             if s.kind != NfaKind::Set {
@@ -285,13 +317,15 @@ pub(crate) fn build_dfa(root: &Node) -> Option<Dfa> {
     // The search is unanchored: a match may start at any position, so after every byte the states the pattern
     // starts in (not at the start of the text) join the set.
     let mut restart = Vec::new();
-    b.closure(&mut restart, &[start], false, false);
-    let mut at_both = Vec::new();
-    b.closure(&mut at_both, &[start], true, true);
-    d.empty = b.has_match(&at_both);
+    b.closure(&mut restart, &[start], false, false, None);
 
-    let mut ids: HashMap<Vec<u16>, u8> = HashMap::new();
-    let mut sets: Vec<Vec<usize>> = vec![Vec::new(); DFA_FIRST];
+    /// The states of the automaton: the pattern's states, whether the unit before was a word character, and
+    /// whether it is at the start of the text.
+    struct States {
+        ids: HashMap<Vec<u16>, u8>,
+        sets: Vec<(Vec<usize>, bool, bool)>,
+    }
+    let mut states = States { ids: HashMap::new(), sets: vec![(Vec::new(), false, false); DFA_FIRST] };
     let stride = 1usize << d.shift;
     d.trans = vec![0; DFA_FIRST * stride];
     d.at_end = vec![false; DFA_FIRST];
@@ -303,10 +337,11 @@ pub(crate) fn build_dfa(root: &Node) -> Option<Dfa> {
     fn intern(
         b: &mut DfaBuilder<'_>,
         d: &mut Dfa,
-        ids: &mut HashMap<Vec<u16>, u8>,
-        sets: &mut Vec<Vec<usize>>,
+        states: &mut States,
         stride: usize,
         set: &mut [usize],
+        word: bool,
+        at_start: bool,
     ) -> Option<u8> {
         if b.has_match(set) {
             return Some(DFA_ACCEPT);
@@ -314,32 +349,31 @@ pub(crate) fn build_dfa(root: &Node) -> Option<Dfa> {
         if set.is_empty() {
             return Some(DFA_DEAD);
         }
-        let key = set_key(set);
-        if let Some(&id) = ids.get(&key) {
+        let key = set_key(set, word, at_start);
+        if let Some(&id) = states.ids.get(&key) {
             return Some(id);
         }
-        if sets.len() >= MAX_DFA_STATES {
+        if states.sets.len() >= MAX_DFA_STATES {
             return None;
         }
-        let id = sets.len() as u8;
-        ids.insert(key, id);
-        sets.push(set.to_vec());
+        let id = states.sets.len() as u8;
+        states.ids.insert(key, id);
+        states.sets.push((set.to_vec(), word, at_start));
         d.trans.resize(d.trans.len() + stride, 0);
-        // At the end of the text the end anchors are passed.
-        let ends: Vec<usize> = set.iter().filter(|&&i| b.nfa[i].kind == NfaKind::Eol).map(|&i| b.nfa[i].out).collect();
+        // At the end of the text the end anchors are passed, and a boundary is between a unit and none.
         let mut closed = Vec::new();
-        if !ends.is_empty() {
-            b.closure(&mut closed, &ends, false, true);
-        }
-        d.at_end.push(!ends.is_empty() && b.has_match(&closed));
+        b.closure(&mut closed, set, at_start, true, Some((word, false)));
+        d.at_end.push(b.has_match(&closed));
         Some(id)
     }
     let mut first = Vec::new();
-    b.closure(&mut first, &[start], true, false);
-    d.start = intern(&mut b, &mut d, &mut ids, &mut sets, stride, &mut first)?;
-    let (mut moved, mut next) = (Vec::new(), Vec::new());
+    b.closure(&mut first, &[start], true, false, None);
+    d.start = intern(&mut b, &mut d, &mut states, stride, &mut first, false, true)?;
+    d.empty = d.start == DFA_ACCEPT || d.at_end[d.start as usize];
+    let (mut resolved, mut moved, mut next) = (Vec::new(), Vec::new(), Vec::new());
     let mut id = DFA_FIRST;
-    while id < sets.len() {
+    while id < states.sets.len() {
+        let (set, word, at_start) = states.sets[id].clone();
         for class in 0..stride {
             if class == 0 || class >= classes {
                 // Not ASCII (or no such class).
@@ -347,8 +381,15 @@ pub(crate) fn build_dfa(root: &Node) -> Option<Dfa> {
                 continue;
             }
             let c = *sample.get(class).expect("a class has a byte");
+            // The boundaries at this position are passed now that the unit after it is known.
+            resolved.clear();
+            b.closure(&mut resolved, &set, at_start, false, Some((word, is_word(c))));
+            if b.has_match(&resolved) {
+                d.trans[id * stride + class] = DFA_ACCEPT;
+                continue;
+            }
             moved.clear();
-            for &i in &sets[id] {
+            for &i in &resolved {
                 let s = &nfa[i];
                 if s.kind == NfaKind::Set && (s.set[c >> 6] >> (c & 63)) & 1 != 0 {
                     moved.push(s.out);
@@ -356,8 +397,8 @@ pub(crate) fn build_dfa(root: &Node) -> Option<Dfa> {
             }
             moved.extend_from_slice(&restart);
             next.clear();
-            b.closure(&mut next, &moved, false, false);
-            let to = intern(&mut b, &mut d, &mut ids, &mut sets, stride, &mut next)?;
+            b.closure(&mut next, &moved, false, false, None);
+            let to = intern(&mut b, &mut d, &mut states, stride, &mut next, is_word(c), false)?;
             if b.steps < 0 {
                 return None;
             }
