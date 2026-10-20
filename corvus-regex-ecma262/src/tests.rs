@@ -1592,3 +1592,143 @@ fn needs_settle() {
         assert!(need_passes <= 2 && quick_passes <= 3, "{}: {need_passes} and {quick_passes} passes", short(&pattern));
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The searches for where a match starts.
+
+/// Every search finds what trying every position the first set allows finds: the same matches, with the same
+/// groups, over UTF-8 and over UTF-16, for the patterns of the benchmarks and the shapes each search takes, over
+/// long texts with characters of every width.
+#[test]
+fn the_searches_find_what_every_position_finds() {
+    let patterns = [
+        (r"Sherlock", ""),
+        (r"Sherlock|Street", ""),
+        (r"Sherlock|Holmes|Watson|Irene|Adler|John|Baker", "i"),
+        (r"Sher[a-z]+|Hol[a-z]+", "i"),
+        (r"[a-q][^u-z]{13}x", ""),
+        (r"[a-zA-Z]+ing", ""),
+        (r"\s[a-zA-Z]{0,12}ing\s", ""),
+        (r"\w+\s+Holmes", ""),
+        (r"\w+\s+Holmes\s+\w+", ""),
+        (r"\b\w+n\b", ""),
+        (r".{0,2}(Tom|Sawyer|Huckleberry|Finn)", ""),
+        (r".{2,4}(Tom|Sawyer|Huckleberry|Finn)", ""),
+        (r"Tom.{10,25}river|river.{10,25}Tom", ""),
+        (r"([A-Za-z]awyer|[A-Za-z]inn)\s", ""),
+        (r"[\w\.+-]+@[\w\.-]+\.[\w\.-]+", ""),
+        (r"\p{Sm}", ""),
+        (r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])", ""),
+        (r"Шерлок Холмс|Джон Уотсон", "i"),
+        (r"夏洛克|福尔摩斯", ""),
+        (r"sk", "i"),
+        (r"ks", "i"),
+        (r"\u{1F600}a|b\u{10400}", ""),
+        (r"a\u{1F600}", ""),
+        (r"\ud83d", ""),
+        (r"x*y", ""),
+        (r"[a-c]*b+c", ""),
+        (r"(?:ab)?c", ""),
+        (r"\bé\w*", ""),
+        (r"(?<=a)b|c", ""),
+        (r"[\p{L}--[a-z]]+t", "v"),
+        (r"[\q{abc|de}x]y", "v"),
+    ];
+    let alphabet = [
+        "a",
+        "b",
+        "c",
+        "e",
+        "i",
+        "k",
+        "n",
+        "s",
+        "t",
+        "x",
+        "y",
+        "g",
+        "S",
+        "K",
+        " ",
+        "\n",
+        ".",
+        "@",
+        "1",
+        "2",
+        "5",
+        "+",
+        "=",
+        "\u{17F}",
+        "\u{212A}",
+        "é",
+        "Ш",
+        "е",
+        "р",
+        "л",
+        "о",
+        "к",
+        "Х",
+        "夏",
+        "洛",
+        "克",
+        "\u{1F600}",
+        "\u{10400}",
+        "ing",
+        "Tom",
+        "river",
+        "Holmes",
+        "Sherlock",
+        "sherLOCK",
+        "awyer",
+        "inn",
+        "Watson",
+        "Шерлок Холмс",
+        "夏洛克",
+        "abc",
+        "de",
+    ];
+    let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let texts: Vec<String> = (0..60)
+        .map(|_| {
+            let n = 1 + (next() % 300) as usize;
+            (0..n).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect()
+        })
+        .collect();
+    for (pattern, flags) in patterns {
+        for mode in ["", "u"] {
+            let flags = if flags == "v" { "v".to_string() } else { format!("{flags}{mode}") };
+            let Ok(searched) = Regex::new(pattern, &flags) else { continue };
+            super::search::NO_SEARCH.with(|n| n.set(true));
+            let plain = Regex::new(pattern, &flags).unwrap();
+            // The program that records the groups is built on the first use, so it is built here.
+            let _ = plain.captures("");
+            super::search::NO_SEARCH.with(|n| n.set(false));
+            let _ = searched.captures("");
+            assert!(!matches!(plain.program().search.plan, super::search::Plan::Windows { .. }));
+            for text in &texts {
+                let a: Vec<Vec<Option<(usize, usize)>>> = searched
+                    .captures_iter(text)
+                    .map(|c| c.iter().map(|m| m.map(|m| (m.start(), m.end()))).collect())
+                    .collect();
+                let b: Vec<Vec<Option<(usize, usize)>>> = plain
+                    .captures_iter(text)
+                    .map(|c| c.iter().map(|m| m.map(|m| (m.start(), m.end()))).collect())
+                    .collect();
+                assert_eq!(a, b, "/{pattern}/{flags} on {text:?} over UTF-8");
+                let f: Vec<(usize, usize)> = searched.find_iter(text).map(|m| (m.start(), m.end())).collect();
+                let g: Vec<(usize, usize)> = plain.find_iter(text).map(|m| (m.start(), m.end())).collect();
+                assert_eq!(f, g, "/{pattern}/{flags} on {text:?} over UTF-8, without groups");
+                let t16: Vec<u16> = text.encode_utf16().collect();
+                let f: Vec<(usize, usize)> = searched.find_iter_utf16(&t16).map(|m| (m.start(), m.end())).collect();
+                let g: Vec<(usize, usize)> = plain.find_iter_utf16(&t16).map(|m| (m.start(), m.end())).collect();
+                assert_eq!(f, g, "/{pattern}/{flags} on {text:?} over UTF-16");
+            }
+        }
+    }
+}

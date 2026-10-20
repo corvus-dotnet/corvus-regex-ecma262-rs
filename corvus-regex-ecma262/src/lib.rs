@@ -79,6 +79,7 @@ mod parse;
 mod re2;
 mod regex;
 mod replace;
+mod search;
 // Generated: the properties of strings of the v flag, with the version of Unicode they are from.
 #[allow(dead_code)]
 #[rustfmt::skip]

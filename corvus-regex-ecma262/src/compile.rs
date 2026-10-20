@@ -158,9 +158,6 @@ pub(crate) struct Program {
     pub units: bool,
     /// Every match starts at the start of the text.
     pub anchored: bool,
-    /// Literal text every match starts with, and the same in UTF-16.
-    pub prefix: String,
-    pub prefix16: Vec<u16>,
     /// The least number of bytes a match consumes (see `set_needs`), and of UTF-16 code units.
     pub need: usize,
     pub need16: usize,
@@ -171,6 +168,8 @@ pub(crate) struct Program {
     pub quick: Vec<Quick>,
     /// Every code point a match can start with. `None` when a match can be empty or when the set is not known.
     pub first: Option<CharSet>,
+    /// How the search finds where a match can start (see `search.rs`).
+    pub search: super::search::Search,
 }
 
 struct Compiler {
@@ -209,6 +208,7 @@ pub(crate) fn compile_program(root: Node, unicode: bool, groups: Option<usize>) 
     collect_backrefs(&root, &mut referenced);
     // A choice can be remembered to have failed only where what a group holds cannot change what follows.
     c.memo = referenced.is_empty();
+    let backrefs = !referenced.is_empty();
     match groups {
         Some(n) => {
             for g in 1..=n as i32 {
@@ -235,18 +235,15 @@ pub(crate) fn compile_program(root: Node, unicode: bool, groups: Option<usize>) 
         loops: c.loops,
         units: !unicode,
         anchored: starts_at_bol(&root),
-        prefix: String::new(),
-        prefix16: Vec::new(),
         need,
         need16,
         points: c.points,
         quick,
         first: None,
+        search: super::search::Search::default(),
     };
     if !p.anchored {
-        literal_prefix(&root, &mut p.prefix);
-        p.prefix16 = p.prefix.encode_utf16().collect();
-        if p.prefix.is_empty() {
+        {
             let mut pairs = Vec::new();
             if let Some(nullable) = first_chars(&root, &mut pairs)
                 && !nullable
@@ -254,6 +251,7 @@ pub(crate) fn compile_program(root: Node, unicode: bool, groups: Option<usize>) 
                 p.first = Some(CharSet::new(&pairs, false));
             }
         }
+        p.search = super::search::plan(&root, backrefs, p.first.as_ref(), !unicode);
     }
     p
 }
@@ -926,30 +924,6 @@ fn starts_at_bol(n: &Node) -> bool {
         NodeKind::Group => starts_at_bol(&n.subs[0]),
         NodeKind::Repeat => n.min >= 1 && starts_at_bol(&n.subs[0]),
         _ => false,
-    }
-}
-
-/// Appends the literal text every match of `n` starts with.
-fn literal_prefix(n: &Node, prefix: &mut String) {
-    match n.kind {
-        NodeKind::Char => {
-            if literal_rune(n.r) {
-                push_rune(prefix, n.r);
-            }
-        }
-        NodeKind::Cat => {
-            for sub in &n.subs {
-                if sub.kind != NodeKind::Char || !literal_rune(sub.r) {
-                    if prefix.is_empty() && sub.kind == NodeKind::Group {
-                        literal_prefix(sub, prefix);
-                    }
-                    break;
-                }
-                push_rune(prefix, sub.r);
-            }
-        }
-        NodeKind::Group => literal_prefix(&n.subs[0], prefix),
-        _ => {}
     }
 }
 

@@ -183,8 +183,6 @@ pub trait Text: Copy + 'static {
     /// Whether the units `input[from..to]`, compared equal to a group's, are the same code points: false only when
     /// the comparison ends inside a surrogate pair of the text, which the u flag reads as one code point.
     fn whole(input: &[Self::Unit], from: usize, to: usize) -> bool;
-    /// The offset of the first occurrence of `needle` in `haystack`.
-    fn find(haystack: &[Self::Unit], needle: &[Self::Unit]) -> Option<usize>;
     /// Appends `input[from..to]` to `out`. Over UTF-8 a bound between the halves of a character (which only a
     /// pattern without the u flag can make) cannot be written as UTF-8, and the half character is written as
     /// U+FFFD, as a lossy conversion of the UTF-16 text would write it; so the result is UTF-8 when the input is.
@@ -198,6 +196,8 @@ pub trait Text: Copy + 'static {
     fn advance(input: &[Self::Unit], pos: usize, unicode: bool) -> usize;
     /// The units of a UTF-8 string in this encoding.
     fn encode(s: &str) -> Vec<Self::Unit>;
+    /// The bytes of the text, as the searches for literals read them (the native bytes of each UTF-16 code unit).
+    fn bytes(input: &[Self::Unit]) -> &[u8];
 
     /// The character at the position: a code unit with `units` set, and a code point otherwise.
     #[inline(always)]
@@ -286,11 +286,6 @@ impl Text for Utf8 {
         true
     }
 
-    #[inline]
-    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        memchr::memmem::find(haystack, needle)
-    }
-
     fn push_lossy(out: &mut Vec<u8>, input: &[u8], mut from: usize, mut to: usize) {
         if from >= to {
             return;
@@ -334,6 +329,11 @@ impl Text for Utf8 {
 
     fn encode(s: &str) -> Vec<u8> {
         s.as_bytes().to_vec()
+    }
+
+    #[inline(always)]
+    fn bytes(input: &[u8]) -> &[u8] {
+        input
     }
 }
 
@@ -416,19 +416,6 @@ impl Text for Utf16 {
         !(starts_inside || ends_inside)
     }
 
-    fn find(haystack: &[u16], needle: &[u16]) -> Option<usize> {
-        let (&first, rest) = needle.split_first()?;
-        let mut at = 0;
-        while haystack.len() - at >= needle.len() {
-            at += haystack[at..=haystack.len() - needle.len()].iter().position(|&u| u == first)?;
-            if haystack[at + 1..at + needle.len()] == *rest {
-                return Some(at);
-            }
-            at += 1;
-        }
-        None
-    }
-
     fn push_lossy(out: &mut Vec<u16>, input: &[u16], from: usize, to: usize) {
         if from < to {
             out.extend_from_slice(&input[from..to]);
@@ -451,6 +438,12 @@ impl Text for Utf16 {
 
     fn encode(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
+    }
+
+    #[inline(always)]
+    fn bytes(input: &[u16]) -> &[u8] {
+        // SAFETY: a u16 is two initialised bytes with no padding, and a u8 has no alignment to keep.
+        unsafe { std::slice::from_raw_parts(input.as_ptr().cast::<u8>(), 2 * input.len()) }
     }
 }
 

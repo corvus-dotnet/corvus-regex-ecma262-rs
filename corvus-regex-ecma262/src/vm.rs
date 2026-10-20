@@ -4,8 +4,12 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use super::Rune;
+use std::sync::Arc;
+
+use super::charset::CharSet;
 use super::compile::{Inst, MAX_MEMO_LOOPS, Op, Program};
 use super::fold::{canonicalize, is_fold_word_rune};
+use super::search::{Literals, Plan};
 use super::units::{Text, is_word_unit};
 
 /// Why a match was abandoned. Neither is an answer.
@@ -308,28 +312,186 @@ impl Program {
             }
             return self.run::<T>(st, input, start).then_some((start, st.end));
         }
-        let prefix = T::pick(self.prefix.as_bytes(), &self.prefix16);
-        if !prefix.is_empty() {
-            let mut at = start;
-            loop {
-                // The search for the literal takes time proportional to the text. `at` is at the start of a
-                // character: a literal starts with one.
-                at += T::find(&input[at..], prefix)?;
-                if len - at < need {
+        match &self.search.plan {
+            Plan::Windows { literals, lo, hi } => self.search_windows::<T>(st, input, start, literals, *lo, *hi, need),
+            Plan::AfterLoops { literals, sets, mins } => {
+                self.search_after_loops::<T>(st, input, start, literals, sets, mins, need)
+            }
+            Plan::Scan => self.scan::<T>(st, input, start, need),
+        }
+    }
+
+    /// Whether a start passes the first set.
+    #[inline(always)]
+    fn first_allows<T: Text>(&self, input: &[T::Unit], at: usize) -> bool {
+        let Some(first) = &self.first else { return true };
+        if at >= input.len() {
+            return false;
+        }
+        let c: u32 = input[at].into();
+        if c < 0x80 { first.has_ascii(c as u8) } else { first.contains(T::read(input, at, self.units).0) }
+    }
+
+    /// Tries the start: whether the program matches there, the reason for stopping being in `st.stop`.
+    #[inline(always)]
+    fn try_at<T: Text>(&self, st: &mut State, input: &[T::Unit], at: usize) -> bool {
+        self.first_allows::<T>(input, at) && self.run::<T>(st, input, at)
+    }
+
+    /// The position `n` characters before `at`, not before `floor`: the furthest it gets when there are fewer.
+    #[inline]
+    fn walk_back<T: Text>(&self, input: &[T::Unit], mut at: usize, n: usize, floor: usize) -> (usize, usize) {
+        let mut k = 0;
+        while k < n && at > floor {
+            let w = T::read_last(input, at, self.units).1;
+            if at - w < floor {
+                break;
+            }
+            at -= w;
+            k += 1;
+        }
+        (at, k)
+    }
+
+    /// The search of a pattern each of whose matches holds one of the literals `lo` to `hi` characters after its
+    /// start: each occurrence opens the window of starts that could reach it, tried in order and never twice.
+    #[allow(clippy::too_many_arguments)]
+    fn search_windows<T: Text>(
+        &self,
+        st: &mut State,
+        input: &[T::Unit],
+        start: usize,
+        literals: &Literals,
+        lo: usize,
+        hi: usize,
+        need: usize,
+    ) -> Option<(usize, usize)> {
+        let len = input.len();
+        let bytes = T::bytes(input);
+        let mut next = start;
+        // Every start before this has been tried.
+        let mut untried = start;
+        loop {
+            let q = literals.find(bytes, next, T::UTF8)?;
+            next = q + T::read(input, q, self.units).1;
+            if hi == 0 {
+                // Every alternative starts with its literal: the match starts at the occurrence or not at all.
+                if len - q < need {
                     return None;
                 }
-                if self.run::<T>(st, input, at) {
-                    return Some((at, st.end));
+                if self.try_at::<T>(st, input, q) {
+                    return Some((q, st.end));
                 }
                 if st.stop != STOP_NONE {
                     return None;
                 }
-                at += T::decode(input, at).1;
+                continue;
             }
+            let (last, back) = self.walk_back::<T>(input, q, lo, start);
+            if back < lo || last < untried {
+                continue;
+            }
+            let (mut s, _) = self.walk_back::<T>(input, q, hi, start);
+            while s <= last {
+                if s >= untried {
+                    if len - s < need {
+                        return None;
+                    }
+                    if self.try_at::<T>(st, input, s) {
+                        return Some((s, st.end));
+                    }
+                    if st.stop != STOP_NONE {
+                        return None;
+                    }
+                }
+                if s == len {
+                    break;
+                }
+                s += T::read(input, s, self.units).1;
+            }
+            untried = untried.max(s);
         }
+    }
+
+    /// The search of a pattern each of whose matches is runs of the loops' sets, then the literal: the runs before
+    /// each occurrence are walked back to the earliest start, the only one tried for it.
+    #[allow(clippy::too_many_arguments)]
+    fn search_after_loops<T: Text>(
+        &self,
+        st: &mut State,
+        input: &[T::Unit],
+        start: usize,
+        literals: &Literals,
+        sets: &[Arc<CharSet>],
+        mins: &[usize],
+        need: usize,
+    ) -> Option<(usize, usize)> {
+        let len = input.len();
+        let bytes = T::bytes(input);
         let units = self.units;
+        let mut next = start;
+        let mut tried: Option<usize> = None;
+        'occurrences: loop {
+            let q = literals.find(bytes, next, T::UTF8)?;
+            next = q + T::read(input, q, units).1;
+            let mut s = q;
+            for k in (0..sets.len()).rev() {
+                let run_end = s;
+                while s > start {
+                    let c: u32 = input[s - 1].into();
+                    let (r, w) = if c < 0x80 { (c as Rune, 1) } else { T::read_last(input, s, units) };
+                    if !sets[k].contains(r) || s - w < start {
+                        break;
+                    }
+                    s -= w;
+                }
+                if mins[k] == 1 && s == run_end {
+                    continue 'occurrences;
+                }
+            }
+            if tried.is_some_and(|t| s <= t) {
+                continue;
+            }
+            if len - s < need {
+                return None;
+            }
+            if self.try_at::<T>(st, input, s) {
+                return Some((s, st.end));
+            }
+            if st.stop != STOP_NONE {
+                return None;
+            }
+            tried = Some(s);
+        }
+    }
+
+    /// The end of the run of members of a set from a position.
+    #[inline]
+    fn end_of_run<T: Text>(&self, set: &CharSet, input: &[T::Unit], mut at: usize) -> usize {
+        while at < input.len() {
+            let c: u32 = input[at].into();
+            let (r, w) = if c < 0x80 { (c as Rune, 1) } else { T::read(input, at, self.units) };
+            if !set.contains(r) {
+                break;
+            }
+            at += w;
+        }
+        at
+    }
+
+    /// The search that tries every position the first set allows.
+    fn scan<T: Text>(&self, st: &mut State, input: &[T::Unit], start: usize, need: usize) -> Option<(usize, usize)> {
+        let len = input.len();
+        let units = self.units;
+        let search = &self.search;
         let mut at = start;
+        let first_bytes = if T::UTF8 { search.first_bytes.as_ref() } else { None };
+        let bytes = T::bytes(input);
         loop {
+            if let Some(fb) = first_bytes {
+                // Every match starts with a member of the first set, which starts with one of these bytes.
+                at = fb.find(bytes, at)?;
+            }
             if len - at < need {
                 return None;
             }
@@ -338,11 +500,25 @@ impl Program {
             }
             let c: u32 = input[at].into();
             let (r, w) = if c < 0x80 { (c as Rune, 1) } else { T::read(input, at, units) };
+            if search.leading_word_boundary && at > 0 && is_word_unit(input[at - 1].into()) {
+                // Inside a word, where \b cannot hold: the rest of the word is passed over.
+                let first = self.first.as_ref().expect("a leading word boundary has a first set");
+                at = self.end_of_run::<T>(first, input, at).max(at + w);
+                continue;
+            }
             if self.first.as_ref().is_none_or(|first| first.contains(r)) && self.run::<T>(st, input, at) {
                 return Some((at, st.end));
             }
             if st.stop != STOP_NONE {
                 return None;
+            }
+            if let Some(set) = &search.skip_run
+                && set.contains(r)
+            {
+                // The start failed after its leading loop ate the run from here: every start in the rest of the
+                // run fails the same way.
+                at = self.end_of_run::<T>(set, input, at + w).max(at + w);
+                continue;
             }
             at += w;
         }
