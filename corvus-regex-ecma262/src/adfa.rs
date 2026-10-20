@@ -26,6 +26,8 @@ const MAX_STEPS: i64 = 2_000_000;
 const DEAD: u16 = 0;
 /// The flag of a transition across which a match ends before the unit.
 const MATCHED: u16 = 0x8000;
+/// The same flag in the premultiplied table.
+const FAST_MATCHED: u32 = 0x8000_0000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -150,8 +152,9 @@ impl Builder {
 pub(crate) struct Anchored {
     class: [u8; 128],
     shift: u32,
-    /// `trans[state << shift | class]`: the next state, with `MATCHED` when a match ends before the unit.
-    trans: Vec<u16>,
+    /// `fast[state * stride + class]`: the next state, premultiplied by the stride, with `FAST_MATCHED` when a match
+    /// ends before the unit.
+    fast: Vec<u32>,
     /// For each state: a match ends at the end of the text.
     at_end: Vec<bool>,
     /// The start state for each of: the unit before is a word character (bit 1), the start of the text (bit 0).
@@ -176,29 +179,33 @@ impl Anchored {
             let c: u32 = input[start - 1].into();
             c < 0x80 && is_word_byte(c as u8)
         };
-        let mut s = self.starts[usize::from(word) << 1 | usize::from(start == 0)];
+        let s = self.starts[usize::from(word) << 1 | usize::from(start == 0)];
         if s == DEAD {
             return Found::None;
         }
         let mut last = None;
         let mut p = start;
-        let (trans, shift, class) = (&self.trans[..], self.shift, &self.class);
+        let (trans, class) = (&self.fast[..], &self.class);
+        // The state is kept premultiplied by the stride, so a step is one load and an add.
+        let mut at = (s as usize) << self.shift;
         while p < input.len() {
             let c: u32 = input[p].into();
             if c >= 0x80 {
                 return Found::Bail;
             }
-            let t = trans[(s as usize) << shift | class[c as usize] as usize];
-            if t & MATCHED != 0 {
+            // SAFETY: `at` is a state's row (a multiple of the stride below the table's length, as every entry of
+            // the table is) and a class is below the stride.
+            let t = unsafe { *trans.get_unchecked(at + class[c as usize] as usize) };
+            if t & FAST_MATCHED != 0 {
                 last = Some(p);
             }
-            s = t & !MATCHED;
-            if s == DEAD {
+            at = (t & !FAST_MATCHED) as usize;
+            if at == 0 {
                 return last.map_or(Found::None, Found::End);
             }
             p += 1;
         }
-        if self.at_end[s as usize] {
+        if self.at_end[at >> self.shift] {
             return Found::End(p);
         }
         last.map_or(Found::None, Found::End)
@@ -381,7 +388,8 @@ pub(crate) fn build(root: &Node) -> Option<Anchored> {
         }
         id += 1;
     }
-    Some(Anchored { class, shift: shift as u32, trans, at_end, starts })
+    let fast = trans.iter().map(|&t| (u32::from(t & !MATCHED) << shift) | if t & MATCHED != 0 { FAST_MATCHED } else { 0 }).collect();
+    Some(Anchored { class, shift: shift as u32, fast, at_end, starts })
 }
 
 /// An automaton of the terms before the anchors of a search, read backwards (accepting where any of them can start):
