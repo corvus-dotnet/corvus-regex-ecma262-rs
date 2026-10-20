@@ -96,7 +96,7 @@ fn a_match_has_a_limit_when_asked() {
 
 #[test]
 fn the_header_declares_what_the_library_exports() {
-    let header = include_str!("../include/corvus_regex_ecma262.h");
+    let header = include_str!("../include/corvus_regex_ecma262.h").replace("\r\n", "\n");
     let source = include_str!("../src/lib.rs");
     let exported: Vec<&str> = source
         .split("pub unsafe extern \"C\" fn ")

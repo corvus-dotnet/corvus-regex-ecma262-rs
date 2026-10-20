@@ -65,8 +65,12 @@ fn rare(b: u8) -> bool {
 }
 
 impl Finder {
-    fn new(literals: &[Vec<u8>], fingerprint: bool) -> Finder {
+    fn new(literals: &[Vec<u8>], fingerprint: bool, utf16: bool) -> Finder {
         if literals.len() == 1 {
+            if utf16 {
+                let finder = memmem::FinderBuilder::new().build_forward_with_ranker(Utf16Rank, &literals[0]);
+                return Finder::One(finder.into_owned());
+            }
             return Finder::One(memmem::Finder::new(&literals[0]).into_owned());
         }
         // Two literals whose first bytes are rare are found by the automaton's search for those bytes; any others by
@@ -102,6 +106,29 @@ impl Finder {
     }
 }
 
+/// How common each byte is in the bytes of UTF-16 text, for `memmem`'s choice of the needle's rarest bytes: its own
+/// table is of UTF-8 text, where a zero byte is rare, and in UTF-16 the high byte of every ASCII unit is zero. So
+/// zero is the commonest, then the high byte of Cyrillic, then the low bytes roughly as English text ranks them (the
+/// high bytes of the Han ideographs, 0x4E to 0x9F, are ASCII letters' bytes too, and rank as those).
+struct Utf16Rank;
+
+impl memchr::arch::all::packedpair::HeuristicFrequencyRank for Utf16Rank {
+    fn rank(&self, byte: u8) -> u8 {
+        match byte {
+            0x00 => 255,
+            0x04 => 240,
+            b' ' => 230,
+            b'e' | b't' | b'a' | b'o' | b'i' | b'n' | b's' | b'h' | b'r' => 220,
+            b'd' | b'l' | b'u' | b'c' | b'm' | b'f' | b'w' | b'y' | b'p' | b'g' => 200,
+            b'b' | b'v' | b',' | b'.' | b'\n' | b'\r' => 180,
+            b'A'..=b'Z' => 120,
+            b'k' | b'x' | b'j' | b'q' | b'z' => 100,
+            b'0'..=b'9' => 90,
+            _ => 60,
+        }
+    }
+}
+
 /// The literals of a search, over UTF-8 and over the bytes of UTF-16 code units.
 #[derive(Clone, Debug)]
 pub(crate) struct Literals {
@@ -117,7 +144,7 @@ impl Literals {
         let utf8: Vec<Vec<u8>> = literals.iter().map(|l| as_string(l).into_bytes()).collect();
         let utf16: Vec<Vec<u8>> =
             literals.iter().map(|l| as_string(l).encode_utf16().flat_map(u16::to_ne_bytes).collect()).collect();
-        Literals { utf8: Finder::new(&utf8, fingerprint), utf16: Finder::new(&utf16, fingerprint) }
+        Literals { utf8: Finder::new(&utf8, fingerprint, false), utf16: Finder::new(&utf16, fingerprint, true) }
     }
 
     /// The position (in units of the text) of the leftmost occurrence at or after `from`. `bytes` is the text's
