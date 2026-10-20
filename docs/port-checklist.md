@@ -90,38 +90,41 @@ after each.
 
 ### The rows still above `regex`
 
-The record run at 7ffc43b (cores 0 to 11 after a three-minute settle, load 0.16, each figure the median of five passes
-of two seconds) has this engine over UTF-8 at a median of 0.93 of `regex`'s time over the 57 rows. The engines run
-one after another, each over every row, so a row's figures are minutes apart; on this machine (a laptop under WSL)
-that moves a row by up to 30%. Each row above `regex` in it was therefore timed again A/B, this engine and `regex`
-alternately in five rounds:
+Measured with the interleaved harness at 97d9cea (7 rounds, this engine, `regex`, regress, V8 and the ea6a7d1 build
+in turn; see `docs/benchmarks/README.md`). A row is above or below `regex` only where the rounds say so: a one-sided
+Mann-Whitney test at p < 0.01, at least three rounds in four the same way, and a difference of medians beyond both
+engines' spread. By that test this engine over UTF-8 is below `regex` on 12 rows, level on 44 (median ratio 0.97,
+the dot-all row left out), and above on one:
 
-| Row | Record run | A/B | Why |
-|---|--:|--:|---|
-| `Tom.{10,25}river\|river.{10,25}Tom` | 1.31 | 1.02 | Level: 1,160.9 against 1,135.1 us in the A/B, 1,142 against 1,238 us run by the harness over the Leipzig rows alone. |
-| `([A-Za-z]awyer\|[A-Za-z]inn)\s` | 1.25 | 0.96 | Level, as above (981.0 against 1,020.8 us). |
-| `Шерлок Холмс`, `夏洛克·福尔摩斯` | 1.12, 1.10 | 0.96, 0.98 | Level in the A/B and in the run before. |
-| `Holmes.{0,25}Watson\|Watson.{0,25}Holmes` | 1.08 | 1.06 to 1.19 | Both find the 542 occurrences with the same Teddy searcher and check each with an automaton; Teddy takes 37.8 us here against 34.4 us in `regex`, the check 19.9 against 18.1 us. Reading on through the window after a failed occurrence, as `regex`'s lazy automaton does, was tried two ways and both were slower: looking at the window's units for a literal's first byte before calling the search (62.9 to 68.9 us over UTF-8, 88 to 138 us over UTF-16) and running the forward automaton (item 50) from each occurrence (1.12 times the time). Not an ECMA-262 rule. |
-| `Sherlock\s+Holmes` | 1.08 | 1.03 to 1.10 | One `memmem` search for `Sherlock` and the automaton at each of its 97 occurrences, as `regex` does; 80% of both profiles is the same `memmem`. |
-| 14 rows from 1.00 to 1.05 | | at or below 1.0 in at least one A/B | The same searchers as `regex` on each. |
+| Row | This engine | `regex` | Ratio | Why |
+|---|--:|--:|--:|---|
+| `Holmes.{0,25}Watson\|Watson.{0,25}Holmes` | 66.6 us | 59.5 us | 1.12 | Both find the 542 occurrences with the same Teddy searcher and check each with an automaton; Teddy takes 37.8 us here against 34.4 us in `regex`, the check 19.9 against 18.1 us. Reading on through the window after a failed occurrence, as `regex`'s lazy automaton does, was tried two ways and both were slower: looking at the window's units for a literal's first byte before calling the search (62.9 to 68.9 us over UTF-8, 88 to 138 us over UTF-16) and running the forward automaton (item 50) from each occurrence (1.12 times the time). Not an ECMA-262 rule. |
 
-IPv4, above `regex` before the forward automaton, is now 0.88 to 0.94 of it.
+IPv4, above `regex` before the forward automaton, is level with it.
 
 ### UTF-16 against UTF-8
 
-In the record run the median row over UTF-16 takes 1.5 times its UTF-8 time; the Russian and Chinese rows, where UTF-16
-is the shorter encoding, take 0.66 to 1.0 of it. The rows over 2 are those whose UTF-16 text leaves a level of cache
-its UTF-8 text fits in, measured here as one `memchr` pass over buffers of the texts' sizes:
+In the same run the median row over UTF-16 takes 1.49 times its UTF-8 time; the Russian and Chinese rows, where
+UTF-16 is the shorter encoding, take 0.68 to 1.05 of it. The rows over 2 are those whose UTF-16 text leaves a level of
+cache its UTF-8 text fits in, measured here as one `memchr` pass over buffers of the texts' sizes:
 
-| Text | UTF-8 | UTF-16 | One read of the UTF-8 size | One read of the UTF-16 size | Rows (UTF-16/UTF-8) |
+| Text | UTF-8 | UTF-16 | One read of the UTF-8 size | One read of the UTF-16 size | Rows over 2 (UTF-16/UTF-8) |
 |---|--:|--:|--:|--:|---|
-| Leipzig | 16 MB, in the 24 MB L3 cache | 32 MB, beyond it | 389 us | 1,948 us (5.0 times) | all eleven, 1.9 to 3.0: `Twain` 2.82, `\p{Sm}` 3.01 |
-| mariomka | 6.8 MB | 13.6 MB | 99 us | 277 us (2.8 times) | `[\w\.+-]+@…` 2.12 |
-| Sherlock | 0.6 MB, in the 1.25 MB L2 cache of a core | 1.2 MB, at its edge | 4.8 us | 11.0 us (2.3 times) | `Sherlock\|Street` 2.50, `.*` 2.21 |
+| Leipzig | 16 MB, in the 24 MB L3 cache | 32 MB, beyond it | 389 us | 1,948 us (5.0 times) | the eleven Leipzig rows, 2.1 to 3.1 |
+| mariomka | 6.8 MB | 13.6 MB | 99 us | 277 us (2.8 times) | `[\w\.+-]+@…` 2.13 |
+| Sherlock | 0.6 MB, in the 1.25 MB L2 cache of a core | 1.2 MB, at its edge | 4.8 us | 11.0 us (2.3 times) | `.*` 2.04 |
 
-Every Leipzig row over UTF-16 is within 1.0 to 1.5 times the 1,948 us it takes to read the text once. Before this work
+Every Leipzig row over UTF-16 is within 1.0 to 1.6 times the 1,948 us it takes to read the text once. Before this work
 the case-insensitive rows over UTF-16 were 5 to 9 times their UTF-8 time (`Sher[a-z]+\|Hol[a-z]+` /i 626 against
-76 us) and `\p{Sm}` 5.3 times; they are now 1.0 to 1.9 times, and `\p{Sm}` is within 1.5 times one read of the text.
+76 us) and `\p{Sm}` 5.3 times; they are now 1.1 to 1.8 times, and `\p{Sm}` is within 1.6 times one read of the text.
+
+`.*` with the s flag is answered without reading the text (8.8 ns over UTF-8, 10.3 ns over UTF-16): the pattern is one
+greedy loop, of least count 0 or 1 and no upper bound, of a class that holds every character (`Shape::Loop` with
+`RunEnd::All`), the program records no group, the search is not sticky and the pattern is not anchored; the match is
+then from where the search starts (moved back to a pair's start with the u or v flag) to the end.
+`tests/api.rs` (`a_run_of_the_dot_with_the_s_flag_is_the_rest_of_the_text`) checks it against the matcher over UTF-16
+with lone halves anywhere and last, from every start (between the halves of a pair included), with and without the u
+flag and with the sticky flag. Rows under 100 ns are kept out of the medians above.
 
 Tried and taken out, each slower on the rows it was for: a search that folds case in place of the written-out forms;
 the long s and the Kelvin sign looked for apart (item 22's reference way); an unanchored forward automaton with a
