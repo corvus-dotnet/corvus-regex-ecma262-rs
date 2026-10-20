@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The benchmark harness, runnable by this repository's nightly workflow and by the central benchmark site alike: it
+# The benchmark harness, which the central benchmark site runs each night (as the image, Dockerfile) and anyone can run: it
 # builds the engine and its competitors, works out the compliance of each ECMA-262 engine over the test data, runs
 # every engine over the Industry workloads, and writes the run's one data file in the results page's shape.
 #
@@ -14,7 +14,7 @@
 # - test data directory: the data/ directory of github.com/corvus-dotnet/ecma262-regex-test-data; without it the
 #   repository is cloned at depth 1.
 #
-# Optional settings: SECONDS_EACH (2) and PASSES (5) for each figure; CORES, a taskset core list to run the timed parts
+# Optional settings: SECONDS_EACH (2) and PASSES (5) for each figure, or JOB=short for a quick look (0.1 s, one pass); CORES, a taskset core list to run the timed parts
 # on; SETTLE, seconds to wait between the builds and the timed parts (0; 180 for a measured run on a quiet machine);
 # SKIP_BUILD=1 when the binaries are built (the image); REGRESS_COMPLIANCE=1 to work out regress's compliance again (over an hour) rather than take
 # tools/benchmarks/compliance-regress.txt; RUN_URL, the address of the run for the data file.
@@ -25,8 +25,9 @@ workloads="$(abs "${1:?workloads.json}")"
 texts="$(mkdir -p "${2:?texts directory}" && cd "$2" && pwd)"
 out_file="$(abs "${3:?out.json}")"
 data="${4:-}"
-seconds="${SECONDS_EACH:-2}"
-passes="${PASSES:-5}"
+if [ "${JOB:-}" = short ]; then short_seconds=0.1 short_passes=1; else short_seconds=2 short_passes=5; fi
+seconds="${SECONDS_EACH:-$short_seconds}"
+passes="${PASSES:-$short_passes}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 timed() { if [ -n "${CORES:-}" ]; then taskset -c "$CORES" "$@"; else "$@"; fi; }

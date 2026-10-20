@@ -12,14 +12,16 @@ with the flags i, m and s (its row is absent where the pattern does not compile,
 `\w`, `.` and `$` do); V8 runs with `gu` added.
 
 Beside its figures each engine carries its compliance with the
-[ECMA-262 test data](https://github.com/corvus-dotnet/ecma262-regex-test-data): the counts of right and wrong answers,
-of valid patterns refused and of invalid ones accepted, or "not ECMA-262" for regex, which does not claim it.
+[ECMA-262 test data](https://github.com/corvus-dotnet/ecma262-regex-test-data), judged by the data's own rule: the
+counts of right and wrong answers, of valid patterns refused, of invalid ones accepted, and of answers never given
+(`limited`: a limit, a crash or a hang, counted once for every answer the record would have had), or "not ECMA-262"
+for regex, which does not claim it. regress has no UTF-8 interface for captures, so `captures.jsonl` judges it over
+UTF-16 alone.
 
-**The results** are on the central page, [corvus-oss.org/corvus-regex-ecma262-benchmarks](https://corvus-oss.org/corvus-regex-ecma262-benchmarks/),
-beside the engines of the other languages. This repository publishes the data of its nightly run, a GitHub-hosted
-runner with every engine in one job, as
-[benchmarks/latest.json](https://raw.githubusercontent.com/corvus-dotnet/corvus-regex-ecma262-rs/gh-pages/benchmarks/latest.json)
-on its gh-pages branch, with every day's file under `benchmarks/runs/`.
+**The results** are on one page, the central benchmark site,
+[corvus-oss.org/corvus-regex-ecma262-benchmarks](https://corvus-oss.org/corvus-regex-ecma262-benchmarks/), which runs
+this repository's harness image each night on its runner beside the engines of the other languages. This repository
+publishes no figures of its own.
 
 **To run them**, with Rust and Node 24 on the path:
 
@@ -33,12 +35,13 @@ runs every workload and writes the data file in the shape of the results page
 measured run on a quiet machine, `CORES=0-11 SETTLE=180` pins the timed parts to those cores after a settle of three
 minutes.
 
-**As an image**, the same harness with everything built in (`Dockerfile`), released as
-`ghcr.io/corvus-dotnet/corvus-regex-ecma262-rs:<version>` and `:latest`:
+**As an image**, the same harness with everything built in (`Dockerfile`), published as
+`ghcr.io/corvus-dotnet/corvus-regex-ecma262-rs:latest` from main and with the release's tag from each release
+(`.github/workflows/harness-image.yml`, which smoke-runs it on two workloads first):
 
 ```sh
 docker run --rm -v <workloads.json>:/workloads.json:ro -v <texts dir>:/texts:ro -v <out dir>:/out ghcr.io/corvus-dotnet/corvus-regex-ecma262-rs:latest
 ```
 
-writes `<out dir>/industry.json`; the test data is cloned inside unless its `data/` directory is mounted at `/data`.
-The nightly workflow builds and runs this image.
+writes `<out dir>/industry.json`; the test data is cloned inside unless its `data/` directory is mounted at `/data`,
+and `-e JOB=short` makes a quick look of it.

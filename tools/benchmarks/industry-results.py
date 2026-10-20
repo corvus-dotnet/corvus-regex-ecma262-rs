@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Writes the data file of an Industry benchmark run, in the shape of the results page
 (tools/benchmarks/results-page/generate_site.py documents it: meta, vocab, measures, impls, schemas, results). The
-central page at https://corvus-oss.org/regex-benchmarks/ is built from every repository's latest file; this
-repository builds no page of its own.
+central benchmark site (https://corvus-oss.org/corvus-regex-ecma262-benchmarks/) runs this repository's harness image
+each night and builds the one page of figures from its data file; this repository publishes no results of its own.
 
 Usage: industry-results.py [--workloads <workloads.json>] --run <harness results json> --v8 <V8 results json> --out <data file>
                            --compliance-corvus <runner output> --compliance-regress <runner output>

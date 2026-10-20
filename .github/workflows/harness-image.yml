@@ -1,0 +1,62 @@
+# The benchmark harness image: built and smoke-run on every push to main and every release, and published to
+# ghcr.io/corvus-dotnet/corvus-regex-ecma262-rs (`:latest` from main, the release's tag from a release). This
+# repository publishes no benchmark results of its own: the central benchmark site
+# (https://corvus-oss.org/corvus-regex-ecma262-benchmarks/) runs this image each night on its runner, beside every
+# other Corvus ECMA-262 engine, and is the one page of figures.
+name: harness-image
+on:
+  push:
+    branches:
+    - main
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: harness-image
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build, smoke-run and publish the harness image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
+    - name: Build the harness image
+      run: docker build --build-arg COMMIT="${GITHUB_SHA::7}" -t harness .
+    - name: "Smoke-run it: two workloads, the short job, as the central site runs it"
+      run: |
+        python3 -c "import json; w=json.load(open('tools/benchmarks/workloads.json')); json.dump([x for x in w if x['id'] in ('sherlock: aei','sherlock: zqj')], open('workloads.json','w'), ensure_ascii=False)"
+        mkdir -p texts out && chmod 777 out
+        curl -sSfL -o texts/sherlock.txt.gz https://raw.githubusercontent.com/dotnet/performance/main/src/benchmarks/micro/libraries/System.Text.RegularExpressions/TestData/sherlock.txt.gz
+        docker run --rm -e JOB=short -v "$PWD/workloads.json:/workloads.json:ro" -v "$PWD/texts:/texts:ro" -v "$PWD/out:/out" harness
+        python3 - <<'PY'
+        import json
+        d = json.load(open("out/industry.json"))
+        schemas = sorted(s["name"] for s in d["schemas"])
+        impls = sorted(i["name"] for i in d["impls"])
+        assert schemas == ["sherlock: aei", "sherlock: zqj"], schemas
+        engines = ["V8", "corvus-regex-ecma262 UTF-16", "corvus-regex-ecma262 UTF-8", "regex", "regress"]
+        assert impls == engines, impls
+        for name in engines:
+            for w in schemas:
+                assert d["results"][name].get(w), (name, w)
+        for i in d["impls"]:
+            c = i["compliance"]
+            assert c == "not ECMA-262" or {"right", "wrong", "refused", "acceptedInvalid", "limited"} <= set(c), (i["name"], c)
+        print("smoke run wrote", len(impls), "engines over", len(schemas), "workloads")
+        PY
+    - name: Publish the image
+      if: github.ref == 'refs/heads/main' || github.event_name == 'release'
+      run: |
+        echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+        image=ghcr.io/corvus-dotnet/corvus-regex-ecma262-rs
+        docker tag harness "$image:latest" && docker push "$image:latest"
+        if [ '${{ github.event_name }}' = 'release' ]; then docker tag harness "$image:${{ github.event.release.tag_name }}" && docker push "$image:${{ github.event.release.tag_name }}"; fi
