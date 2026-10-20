@@ -1,43 +1,59 @@
 #!/usr/bin/env bash
-# The measured benchmark run, the record in docs/benchmarks: the compliance of each engine over the ECMA-262 test
-# data, then every engine over the Industry workloads, then the record and its page.
+# The benchmark harness, runnable by this repository's nightly workflow and by the central benchmark site alike: it
+# builds the engine and its competitors, works out the compliance of each ECMA-262 engine over the test data, runs
+# every engine over the Industry workloads, and writes the run's one data file in the results page's shape.
 #
-#   tools/benchmarks/run.sh <output directory> <test data directory> [seconds] [passes]
+#   tools/benchmarks/run.sh <workloads.json> <texts directory> <out.json> [test data directory]
 #
-# Before it runs nothing else may run on the machine (no build, no other benchmark), and the load must be below 1.5.
-# The engines are built and the compliance runs are made first; then the machine settles for three minutes, and the
-# timed runs are made under taskset on the cores CORES names (0-11, the performance cores of the reference machine).
-# NODE is the Node 24 the test data was written with (V8 13.6). The workloads are tools/benchmarks/workloads.json,
-# written from the .NET reference engine's Industry.cs by tools/benchmarks/v8/workloads.py. DOCS is where the record
-# is written (docs/benchmarks); SKIP_COMPLIANCE=1 keeps the compliance files already in the output directory.
+# It needs Rust (rustup installs the toolchain rust-toolchain.toml names) and Node 24 on PATH for the V8 rows.
+# - workloads.json: the Industry workloads ({name, pattern, flags, file, id}), as tools/benchmarks/v8/workloads.py
+#   writes them from the .NET reference engine's Industry.cs (tools/benchmarks/workloads.json is a copy).
+# - texts directory: the .txt.gz files the workloads name (those of the .NET benchmark); a file not there is fetched
+#   from dotnet/performance into it.
+# - out.json: the data file (meta, vocab, measures, impls, schemas, results; see tools/benchmarks/industry-results.py).
+# - test data directory: the data/ directory of github.com/corvus-dotnet/ecma262-regex-test-data; without it the
+#   repository is cloned at depth 1.
+#
+# Optional settings: SECONDS_EACH (2) and PASSES (5) for each figure; CORES, a taskset core list to run the timed parts
+# on; SETTLE, seconds to wait between the builds and the timed parts (0; 180 for a measured run on a quiet machine);
+# SKIP_BUILD=1 when the binaries are built (the image); REGRESS_COMPLIANCE=1 to work out regress's compliance again (over an hour) rather than take
+# tools/benchmarks/compliance-regress.txt; RUN_URL, the address of the run for the data file.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/../.." && pwd)"
-out="$(mkdir -p "${1:?output directory}" && cd "$1" && pwd)"
-data="${2:?test data directory (ecma262-regex-test-data/data)}"
-seconds="${3:-2}"
-passes="${4:-5}"
-cores="${CORES:-0-11}"
-node="${NODE:-node}"
-docs="${DOCS:-docs/benchmarks}"
+abs() { mkdir -p "$(dirname "$1")"; echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; }
+workloads="$(abs "${1:?workloads.json}")"
+texts="$(mkdir -p "${2:?texts directory}" && cd "$2" && pwd)"
+out_file="$(abs "${3:?out.json}")"
+data="${4:-}"
+seconds="${SECONDS_EACH:-2}"
+passes="${PASSES:-5}"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+timed() { if [ -n "${CORES:-}" ]; then taskset -c "$CORES" "$@"; else "$@"; fi; }
 cd "$here"
-load="$(cut -d' ' -f1 /proc/loadavg)"
-if awk "BEGIN { exit !($load >= 1.5) }"; then
-  echo "load is $load; wait for it to fall below 1.5" >&2
-  exit 1
+if [ -z "$data" ]; then
+  git clone --quiet --depth 1 https://github.com/corvus-dotnet/ecma262-regex-test-data "$work/test-data"
+  data="$work/test-data/data"
 fi
-cargo build --release -j 4 --bin industry --bin dataset
-if [ "${SKIP_COMPLIANCE:-0}" != 1 ]; then
-  ./target/release/dataset "$data" "$out/wrong-corvus.tsv" > "$out/compliance-corvus.txt" 2>&1 || true
-  ./target/release/dataset "$data" "$out/wrong-regress.tsv" --engine regress > "$out/compliance-regress.txt" 2>&1 || true
+# The image (Dockerfile) has them built already.
+if [ "${SKIP_BUILD:-0}" != 1 ]; then cargo build --release -j 4 --bin industry --bin dataset; fi
+./target/release/dataset "$data" "$work/wrong-corvus.tsv" > "$work/compliance-corvus.txt" 2>&1 || true
+node tools/benchmarks/v8/dataset.mjs "$data" > "$work/compliance-v8.txt" 2>&1 || true
+if [ "${REGRESS_COMPLIANCE:-0}" = 1 ]; then
+  cp target/release/dataset "$work/dataset-regress"
+  "$work/dataset-regress" "$data" "$work/wrong-regress.tsv" --engine regress > "$work/compliance-regress.txt" 2>&1 || true
+else
+  cp tools/benchmarks/compliance-regress.txt "$work/compliance-regress.txt"
 fi
-tail -1 "$out/compliance-corvus.txt" "$out/compliance-regress.txt"
-echo "built; settling for 3 minutes"
-sleep 180
-echo "load $(cut -d' ' -f1 /proc/loadavg) after the settle"
-taskset -c "$cores" ./target/release/industry tools/benchmarks/workloads.json --seconds "$seconds" --passes "$passes" --out "$out/run.json" 2> "$out/run.log"
-taskset -c "$cores" "$node" tools/benchmarks/v8/industry.mjs tools/benchmarks/workloads.json "$seconds" "$passes" > "$out/v8.json" 2> "$out/v8.log"
-python3 tools/benchmarks/industry-results.py --run "$out/run.json" --v8 "$out/v8.json" --compliance-corvus "$out/compliance-corvus.txt" --compliance-regress "$out/compliance-regress.txt" --host pinned --out-dir "$docs"
-python3 tools/benchmarks/results-page/generate_site.py --data "$docs/industry.json" --out "$docs/index.html"
-cp "$out/run.json" "$docs/industry-run.json"
-cp "$out/v8.json" "$docs/industry-v8.json"
-echo "done $(date -u +%FT%TZ)"
+tail -n 1 "$work/compliance-corvus.txt" "$work/compliance-v8.txt" "$work/compliance-regress.txt"
+if [ "${SETTLE:-0}" -gt 0 ]; then
+  echo "settling for $SETTLE s"
+  sleep "$SETTLE"
+fi
+export CORVUS_REGEX_TEXTS="$texts"
+timed ./target/release/industry "$workloads" --seconds "$seconds" --passes "$passes" --out "$work/run.json" 2> "$work/run.log"
+timed node tools/benchmarks/v8/industry.mjs "$workloads" "$seconds" "$passes" > "$work/v8.json" 2> "$work/v8.log"
+python3 tools/benchmarks/industry-results.py --workloads "$workloads" --run "$work/run.json" --v8 "$work/v8.json" --out "$out_file" \
+  --compliance-corvus "$work/compliance-corvus.txt" --compliance-regress "$work/compliance-regress.txt" \
+  --compliance-v8 "$work/compliance-v8.txt" --run-url "${RUN_URL:-}"
+if [ -n "${KEEP:-}" ]; then mkdir -p "$KEEP" && cp "$work"/*.json "$work"/*.txt "$work"/*.log "$KEEP"/; fi

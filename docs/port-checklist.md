@@ -45,7 +45,7 @@ here, and the plan leaves it out. Where this port does a thing another way, the 
 | 22 | The long s and the Kelvin sign, whose UTF-8 is longer than s and k, looked for apart | done | Another way: they are forms like any other in the literals of the one search, which takes literals of different lengths, so nothing is looked for apart and no window is needed for them. |
 | 23 | The fingerprint search's positions chosen by rarity, beyond ASCII the bytes that tell the literals apart | not applicable | `aho-corasick` chooses the bytes Teddy looks at (the first bytes of each literal); this port uses the crate as it is. |
 | 24 | The first set found by a vectorised search for its units | done | Over UTF-8: `memchr` for up to three bytes, Teddy over one-byte literals for up to sixty-four (the first set's ASCII members and the lead bytes of its other members), after a probe of sixteen bytes one at a time where they are common. |
-| 25 | The same over UTF-16 | to do | Over UTF-16 every unit is tested against the first set; no row of the benchmarks has asked for it. |
+| 25 | The same over UTF-16 | to do | Over UTF-16 every unit is tested against the first set (`\\p{Sm}` over the Leipzig text is 26 times slower over UTF-16 than over UTF-8). The fingerprint search over UTF-16 also looks at the zero high bytes of ASCII units, which tell nothing apart. |
 | 26 | A failed start skips the rest of its leading loop's run | done | `Search::skip_run`. |
 | 27 | A start inside a word skipped where the pattern starts with `\b` and every first character is a word character | done | `Search::leading_word_boundary`. |
 | 28 | A minimum length rules out short rests | done | From the engine this crate came from (`need`). |
@@ -74,7 +74,7 @@ evaluator, trying every position its first set allows. Each column adds one sear
 start (memmem), then two literals anywhere (the automaton), then three or more (Teddy), then the windows at distances,
 then the case-insensitive forms, then the walk back over leading loops with the skip over a failed loop's run and the
 leading `\b`. The steps after these (the first set's bytes, the writing out of small repetitions, the anchors of three
-characters, the literal alone) are in the record of the final run, `docs/benchmarks/industry.md`. regex is the same
+characters, the literal alone) were measured in the full runs reported with the work, whose data the nightly workflow now publishes. regex is the same
 look at the `regex` crate.
 
 | Workload | scan | + needle | + 2 literals | + fingerprint | + windows | + forms | + loops | regex |

@@ -75,7 +75,9 @@ impl Finder {
         }
         // Two literals whose first bytes are rare are found by the automaton's search for those bytes; any others by
         // the fingerprint search.
-        let fingerprint = fingerprint || !literals.iter().all(|l| l.first().copied().is_some_and(rare));
+        // Over UTF-16 every other byte of an ASCII literal is zero, which no search for rare bytes can use, so the
+        // fingerprint search always takes several literals there.
+        let fingerprint = fingerprint || utf16 || !literals.iter().all(|l| l.first().copied().is_some_and(rare));
         if fingerprint
             && literals.len() <= MAX_FORMS
             && let Some(searcher) =

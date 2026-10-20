@@ -106,21 +106,17 @@ browser, a configuration written for Node, or anything that must give the answer
 
 ## Benchmarks
 
-The Industry workloads of dotnet/performance (the Sherlock Holmes, Leipzig and mariomka texts, the rebar names),
-against `regex`, `regress` (an ECMA-262 engine) and V8: the record is
-[docs/benchmarks/industry.md](docs/benchmarks/industry.md), with its interactive page at
-[corvus-dotnet.github.io/corvus-regex-ecma262-rs](https://corvus-dotnet.github.io/corvus-regex-ecma262-rs/), and the
-run of each day on a GitHub-hosted runner at
-[benchmarks/ci](https://corvus-dotnet.github.io/corvus-regex-ecma262-rs/benchmarks/ci/). Each engine's compliance with
-the test data is on the page beside its figures.
+The Industry workloads of dotnet/performance (the Sherlock Holmes, Leipzig and mariomka texts, the rebar names), this
+crate against `regex`, `regress` (an ECMA-262 engine) and V8, each engine with its compliance with the test data
+beside its figures: see [docs/benchmarks](docs/benchmarks/README.md), and the results on the central page,
+[corvus-oss.org/regex-benchmarks](https://corvus-oss.org/regex-benchmarks/).
 
 ## Repository
 
 - `corvus-regex-ecma262`: the crate.
 - `corvus-regex-ecma262-capi`: the C library, its header and a smoke test in C.
 - `tools`: the data-set runner (`cargo run --release --bin dataset -- <data dir> <wrong.tsv> [--engine regress]`) and
-  the benchmark harness (`cargo run --release --bin industry -- tools/benchmarks/workloads.json`), with the record
-  script and the page generator under `tools/benchmarks`.
+  the benchmark harness (`tools/benchmarks/run.sh`, over `cargo run --release --bin industry`).
 - `docs/design.md`: what differs from the .NET reference engine and why; `docs/port-checklist.md`: each optimisation
   of the reference, done, not applicable or to do.
 

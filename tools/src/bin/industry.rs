@@ -204,10 +204,33 @@ fn facts(seconds: &str, passes: &str) -> String {
         ("os", first_line("uname", &["-sr"])),
         ("load", load),
         ("rustc", env!("CORVUS_RUSTC_VERSION").to_string()),
-        ("commit", first_line("git", &["rev-parse", "HEAD"])),
+        // The commit the image was built from (CORVUS_COMMIT, set by the Dockerfile), or the checkout's.
+        (
+            "commit",
+            std::env::var("CORVUS_COMMIT")
+                .ok()
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| first_line("git", &["rev-parse", "HEAD"])),
+        ),
         ("date", first_line("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])),
         ("seconds", seconds.to_string()),
         ("passes", passes.to_string()),
+        // On a GitHub-hosted runner, what the runner says it is.
+        ("runner", std::env::var("RUNNER_NAME").unwrap_or_default()),
+        ("runner_os", std::env::var("RUNNER_OS").unwrap_or_default()),
+        (
+            "image",
+            format!(
+                "{} {}",
+                std::env::var("ImageOS").unwrap_or_default(),
+                std::env::var("ImageVersion").unwrap_or_default()
+            )
+            .trim()
+            .to_string(),
+        ),
+        ("corvus-regex-ecma262", env!("CORVUS_VERSION").to_string()),
+        ("regex", env!("REGEX_VERSION").to_string()),
+        ("regress", env!("REGRESS_VERSION").to_string()),
     ];
     let body: Vec<String> = fields.iter().map(|(k, v)| format!("{}:{}", quote(k), quote(v))).collect();
     format!("{{{}}}", body.join(","))
@@ -259,7 +282,9 @@ fn main() {
         }
         results.push(format!("{}:{{{}}}", quote(engine), rows.join(",")));
     }
-    let out = format!("{{\"facts\":{facts},\"results\":{{{}}}}}\n", results.join(","));
+    // The time the run ended, read when it did.
+    let end = first_line("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]);
+    let out = format!("{{\"facts\":{facts},\"end\":{},\"results\":{{{}}}}}\n", quote(&end), results.join(","));
     match opt("--out") {
         Some(file) => std::fs::write(file, out).unwrap(),
         None => print!("{out}"),

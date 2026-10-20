@@ -1,8 +1,9 @@
 # The Industry benchmarks, daily: every engine in one job on one runner, so that the figures of a run are comparable
-# with each other. This crate over UTF-8 and UTF-16, regex and regress (the harness, tools/src/bin/industry.rs), then V8
-# under Node 24 (tools/benchmarks/v8), then the compliance of each engine over the ECMA-262 test data, the record and
-# the results page, published to the site at benchmarks/ci/ with the run's data kept under benchmarks/ci/runs/. The
-# committed record (docs/benchmarks) is the pinned run and the reference; this is the run of the day.
+# with each other. The harness image (Dockerfile, tools/benchmarks/run.sh) builds and runs this crate over UTF-8 and UTF-16, regex and regress (the
+# harness, tools/src/bin/industry.rs), then V8 under Node 24 (tools/benchmarks/v8), with the compliance of each
+# ECMA-262 engine over the test data, and writes ONE data file in the results page's shape, published to gh-pages as
+# benchmarks/latest.json and benchmarks/runs/<yyyy-mm-dd>-<sha>.json, every day's file kept. No page is built here: the
+# central page at https://corvus-oss.org/regex-benchmarks/ is built from every repository's latest.json.
 name: benchmarks
 on:
   schedule:
@@ -10,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: The seconds of each workload of each engine (2 is the record's; less is for a quick look)
+        description: The seconds of each workload of each engine (2 is the default; less is for a quick look)
         default: '2'
 
 permissions:
@@ -24,7 +25,7 @@ jobs:
   industry:
     name: Industry benchmarks, every engine on one runner
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 240
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -33,49 +34,25 @@ jobs:
         ref: 41ed6db477c0d57192673a3a1a76a3b7a194603b
         path: ecma262-regex-test-data
         persist-credentials: false
-    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-      with:
-        node-version: '24'
-    - name: Install the toolchain of rust-toolchain.toml
-      run: rustup show
-    - name: Build the harness and the data-set runner
-      run: cargo build -j 4 --release --bin industry --bin dataset
-    - name: Compliance over the ECMA-262 test data
+    - name: Fetch the texts
       run: |
-        ./target/release/dataset ecma262-regex-test-data/data wrong-corvus.tsv > compliance-corvus.txt 2>&1 || true
-        ./target/release/dataset ecma262-regex-test-data/data wrong-regress.tsv --engine regress > compliance-regress.txt 2>&1 || true
-        tail -1 compliance-corvus.txt compliance-regress.txt
-    - name: Run this crate, regex and regress
-      # The harness downloads the texts into ~/.local/share/corvus-regex-benchmarks on first use; V8 reads them there.
+        mkdir -p texts
+        for f in $(python3 -c "import json; print(' '.join(sorted({w['file'] for w in json.load(open('tools/benchmarks/workloads.json'))})))"); do
+          curl -sSfL -o "texts/$f" "https://raw.githubusercontent.com/dotnet/performance/main/src/benchmarks/micro/libraries/System.Text.RegularExpressions/TestData/$f"
+        done
+    - name: Build the harness image (the image the release workflow pushes to ghcr.io)
+      run: docker build --build-arg COMMIT="${GITHUB_SHA::7}" -t harness .
+    - name: Run the harness image
       run: |
-        seconds='${{ github.event.inputs.seconds || '2' }}'
-        ./target/release/industry tools/benchmarks/workloads.json --seconds "$seconds" --passes 5 --out run.json 2> run.log || { tail -50 run.log; exit 1; }
-        tail -3 run.log
-    - name: Run V8 (Node 24)
-      run: |
-        seconds='${{ github.event.inputs.seconds || '2' }}'
-        node --version
-        node tools/benchmarks/v8/industry.mjs tools/benchmarks/workloads.json "$seconds" 5 > v8.json 2> v8.log
-        tail -3 v8.log
-    - name: Write the record and the page
-      run: |
-        python3 tools/benchmarks/industry-results.py --run run.json --v8 v8.json --compliance-corvus compliance-corvus.txt --compliance-regress compliance-regress.txt --host ci --out-dir out --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-        cp run.json out/industry-run.json
-        cp v8.json out/industry-v8.json
-        python3 tools/benchmarks/results-page/generate_site.py --data out/industry.json --out out/index.html
-        head -12 out/industry.md
+        mkdir -p out
+        docker run --rm -e SECONDS_EACH='${{ github.event.inputs.seconds || '2' }}' -e RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+          -v "$PWD/tools/benchmarks/workloads.json:/workloads.json:ro" -v "$PWD/texts:/texts:ro" \
+          -v "$PWD/ecma262-regex-test-data/data:/data:ro" -v "$PWD/out:/out" harness
     - name: Keep the run
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: industry-${{ github.run_id }}
-        path: |
-          out
-          run.log
-          v8.log
-          compliance-*.txt
-    - name: Publish to the site
-      # The page at benchmarks/ci/ is replaced and the run's data kept under benchmarks/ci/runs/; the rest of gh-pages
-      # is untouched (.github/scripts/Update-GhPages.ps1).
+        path: out
+    - name: Publish the data file to gh-pages
       if: github.ref == 'refs/heads/main'
-      shell: pwsh
-      run: ./.github/scripts/Update-GhPages.ps1 -Mode Benchmarks -Source out -RunName "$(Get-Date -AsUTC -Format yyyy-MM-dd)-$($env:GITHUB_SHA.Substring(0, 7))"
+      run: tools/benchmarks/publish.sh out/industry.json "$(date -u +%F)-${GITHUB_SHA::7}"
