@@ -87,10 +87,28 @@ after each.
 | 48 | Up to four literals with one rare first byte found by `memchr` for it and a compare of each | done | `Finder::Shared`, as `regex` finds `Sherlock\|Street` (its prefilter is a `memchr` of `S`). |
 | 49 | Literals with forms written out in full answered by the search alone | done | `Shape::Literals` takes them too (`the` under the i flag is eight literals, and the search's leftmost-first match is the pattern's); an alternation of literals with forms cut short is compared at each occurrence by the anchored automaton where the text is ASCII. |
 
+### The rows still above `regex`
+
+The record run at ea6a7d1 (cores 0 to 11 after a three-minute settle, load 0.07, each figure the median of five passes
+of two seconds) has this engine over UTF-8 at a median of 0.94 of `regex`'s time over the 57 rows, and above it on
+12. Ten of those are within 5%, and each of them measured at or below `regex` in at least one of the A/B runs of the
+work, whose rounds differ by that much from one to the next: `Sherlock` (1.03), `Sherlock Holmes` (1.01),
+`Sherlock Holmes` /i (1.04), `Sherlock\s+Holmes` (1.05), `Sherlock|Holmes` (1.03), `Sher[a-z]+|Hol[a-z]+` (1.05),
+`Sherlock|Holmes|Watson` (1.03), `^Sherlock Holmes|Sherlock Holmes$` /m (1.03), `Twain` (1.01) and
+`the\s+\w+` (1.00). Both engines run the same searcher on each (`memmem` or Teddy, from the same crates) and the
+profiles split the same way. Two are above by more, and neither is forced by an ECMA-262 rule:
+
+| Row | This engine | `regex` | Ratio | Why |
+|---|--:|--:|--:|---|
+| `Holmes.{0,25}Watson\|Watson.{0,25}Holmes` | 69.5 us | 59.1 us | 1.18 (1.11 in the last A/B) | Both find the 542 occurrences with the same Teddy searcher and check each with an automaton. Profiled: Teddy 37.8 us here against 34.4 us in `regex` over the same bytes, the check 19.9 us against 18.1 us. After a failed occurrence this engine starts the search again at the next character, where `regex`'s lazy automaton reads on through the window and calls its search only from its start state. ECMA-262's `.` stopping at CR as well as LF makes the window shorter, not longer. |
+| IPv4 (`(?:(?:25[0-5]\|…)\.){3}…`) | 2,243.8 us | 2,078.9 us | 1.08 (1.03 to 1.05 in the A/B runs) | No literal: every one of the text's 107,073 digits is a start, and the anchored automaton runs from each (about 7 ns a start), where `regex`'s lazy automaton reads the text once unanchored. The search for the digits (Teddy over one-byte literals after a probe) takes less time here than `regex`'s. |
+
 Tried and taken out, each slower on the rows it was for: a search that folds case in place of the written-out forms;
 the long s and the Kelvin sign looked for apart (item 22's reference way); an unanchored forward automaton with a
 backward one to find the start (no row gained); budgets of 64 literals shared round the anchors, and anchors of four
-characters.
+characters; Teddy for `Sherlock|Street` (3.4 times slower than `memchr` for `S`); the byte cut of a literal inside a
+character (the Cyrillic letters with a three-byte form, 1.2 times slower); the anchored automaton for the forms of one
+literal (`the` /i, 1.1 times slower than comparing them).
 
 ## The search layer, step by step
 
