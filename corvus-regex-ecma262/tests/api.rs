@@ -1,0 +1,174 @@
+//! The public surface: what each member gives, over UTF-8 and UTF-16, as `RegExp` and `String.prototype` give it.
+
+use corvus_regex_ecma262::{Error, Flags, Regex};
+
+fn utf16(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+#[test]
+fn flags_are_read_as_new_regexp_reads_them() {
+    let f = Flags::parse("dgimsuy").unwrap();
+    assert!(f.has_indices && f.global && f.ignore_case && f.multiline && f.dot_all && f.unicode && f.sticky);
+    assert_eq!(f.to_string(), "dgimsuy");
+    assert_eq!(Flags::parse("v").unwrap().to_string(), "v");
+    for bad in ["uv", "gg", "x", "u "] {
+        assert!(matches!(Regex::new("a", bad), Err(Error::Flags(_))), "{bad:?}");
+    }
+    assert_eq!(Regex::new("a+", "gi").unwrap().to_string(), "/a+/gi");
+}
+
+#[test]
+fn a_pattern_is_read_by_the_grammar_of_its_flags() {
+    // An identity escape is Annex B's alone, and set notation the v flag's alone.
+    assert!(Regex::new(r"\&", "").is_ok());
+    assert!(matches!(Regex::new(r"\&", "u"), Err(Error::Invalid(_))));
+    assert!(Regex::new(r"[\w--\d]", "v").unwrap().is_match("a"));
+    assert!(!Regex::new(r"^[\w--\d]$", "v").unwrap().is_match("1"));
+    assert!(Regex::new(r"^[\w--\d]$", "u").is_err());
+    assert!(Regex::is_valid(r"\p{RGI_Emoji}", "v"));
+    assert!(!Regex::is_valid(r"\p{RGI_Emoji}", "u"));
+    assert!(!Regex::is_valid(r"[^\p{RGI_Emoji}]", "v"));
+}
+
+#[test]
+fn find_and_find_at() {
+    let re = Regex::new(r"\d+", "").unwrap();
+    let m = re.find("ab 12 345").unwrap();
+    assert_eq!((m.start(), m.end(), m.as_str()), (3, 5, "12"));
+    assert_eq!(re.find_at("ab 12 345", 5).unwrap().as_str(), "345");
+    assert!(re.find_at("ab 12 345", 10).is_none());
+    assert!(re.find("none").is_none());
+}
+
+#[test]
+fn the_sticky_flag_anchors_each_match_at_its_start() {
+    let re = Regex::new("a", "y").unwrap();
+    assert!(re.find("ba").is_none());
+    assert_eq!(re.find_at("ba", 1).unwrap().start(), 1);
+    assert!(!re.is_match("ba"));
+    let all: Vec<usize> = re.find_iter("aab").map(|m| m.start()).collect();
+    assert_eq!(all, [0, 1]);
+}
+
+#[test]
+fn a_global_search_steps_over_an_empty_match_by_a_character() {
+    let re = Regex::new("", "u").unwrap();
+    let starts: Vec<usize> = re.find_iter("a\u{1F600}b").map(|m| m.start()).collect();
+    assert_eq!(starts, [0, 1, 5, 6]);
+    // Without the u flag the step is a code unit, which over UTF-8 stands between the halves at the third byte.
+    let re = Regex::new("", "").unwrap();
+    let starts: Vec<usize> = re.find_iter("a\u{1F600}b").map(|m| m.start()).collect();
+    assert_eq!(starts, [0, 1, 3, 5, 6]);
+    let starts: Vec<usize> = re.find_iter_utf16(&utf16("a\u{1F600}b")).map(|m| m.start()).collect();
+    assert_eq!(starts, [0, 1, 2, 3, 4]);
+}
+
+#[test]
+fn captures_and_names() {
+    let re = Regex::new(r"(?<y>\d{4})-(?<m>\d{2})(?:-(?<d>\d{2}))?", "").unwrap();
+    assert_eq!(re.captures_len(), 4);
+    assert_eq!(re.group_names().collect::<Vec<_>>(), ["y", "m", "d"]);
+    let caps = re.captures("on 2026-10!").unwrap();
+    assert_eq!(caps.get(0).unwrap().as_str(), "2026-10");
+    assert_eq!(caps.name("y").unwrap().as_str(), "2026");
+    assert_eq!(caps.name("m").unwrap().range(), 8..10);
+    assert!(caps.name("d").is_none());
+    assert!(caps.get(3).is_none() && caps.get(4).is_none());
+    // Two groups of one name in separate alternatives: the one that took part.
+    let re = Regex::new(r"(?<x>a)|(?<x>b)", "").unwrap();
+    assert_eq!(re.captures("b").unwrap().name("x").unwrap().start(), 0);
+}
+
+#[test]
+fn the_groups_of_a_repetition_are_those_of_its_last_iteration() {
+    let re = Regex::new(r"(?:(a)|b)+", "").unwrap();
+    let caps = re.captures("ab").unwrap();
+    assert!(caps.get(1).is_none(), "the last iteration took b, so group 1 is cleared");
+    let mut locs = re.capture_locations();
+    let m = re.captures_read_at(&mut locs, "xba", 0).unwrap();
+    assert_eq!((m.start(), m.end()), (1, 3));
+    assert_eq!(locs.get(1), Some((2, 3)));
+}
+
+#[test]
+fn replace_substitutes_as_get_substitution_does() {
+    let re = Regex::new(r"(\w)(\w)?", "").unwrap();
+    assert_eq!(re.replace("ab cd", "[$2$1]"), "[ba] cd");
+    assert_eq!(re.replace_all("ab c", "[$2$1]"), "[ba] [c]");
+    assert_eq!(Regex::new(r"(\w)(\w)?", "g").unwrap().replace("ab c", "[$2$1]"), "[ba] [c]");
+    let re = Regex::new("b", "").unwrap();
+    assert_eq!(re.replace("abc", "<$&|$`|$'|$$|$1|$<n>>"), "a<b|a|c|$|$1|$<n>>c");
+    let re = Regex::new("(?<n>b)", "").unwrap();
+    assert_eq!(re.replace("abc", "<$<n>|$<m>|$01|$10|$<n"), "a<b||b|b0|$<nc");
+    // The name runs to the next `>`, wherever it is.
+    assert_eq!(re.replace("abc", "<$<n|$1>"), "a<c");
+    let re = Regex::new(r"(?<first>\w+) (?<last>\w+)", "").unwrap();
+    assert_eq!(re.replace_with("Ada Lovelace", |c| c.name("last").unwrap().as_str().to_uppercase()), "LOVELACE");
+    // Nothing matched: the text itself.
+    assert!(matches!(re.replace("x", "y"), std::borrow::Cow::Borrowed("x")));
+}
+
+#[test]
+fn split_splices_the_groups_in() {
+    let re = Regex::new(r"(-)|(\+)", "").unwrap();
+    let parts: Vec<Option<String>> = re.split("a-b+c").into_iter().map(|p| p.map(|s| s.into_owned())).collect();
+    let want = [Some("a"), Some("-"), None, Some("b"), None, Some("+"), Some("c")];
+    assert_eq!(parts, want.map(|p| p.map(String::from)));
+    assert_eq!(re.splitn("a-b+c", 2).len(), 2);
+    // An empty match at the start or the end of the text splits nothing, and the empty text is one piece unless the
+    // pattern matches it.
+    let re = Regex::new("", "").unwrap();
+    assert_eq!(re.split("ab").len(), 2);
+    assert_eq!(re.split("").len(), 0);
+    assert_eq!(Regex::new("x", "").unwrap().split("").len(), 1);
+}
+
+#[test]
+fn utf16_text_with_lone_surrogates() {
+    let text = [0x61, 0xD800, 0x62, 0xD83D, 0xDE00];
+    // With the u flag a lone surrogate is a code point of its own, and a pair is one character.
+    let re = Regex::new(r"^a\ud800b.$", "u").unwrap();
+    assert!(re.is_match_utf16(&text));
+    let re = Regex::new(r"^a.b..$", "").unwrap();
+    assert!(re.is_match_utf16(&text), "without the u flag a pair is two units");
+    let re = Regex::new(r"\udc00", "u").unwrap();
+    assert!(!re.is_match_utf16(&utf16("\u{10400}")), "the half of a whole pair is not a lone surrogate");
+    let re = Regex::new(r"(?<x>\w)", "").unwrap();
+    let caps = re.captures_utf16(&text).unwrap();
+    assert_eq!(caps.name("x").unwrap().as_slice(), &[0x61]);
+    assert_eq!(
+        re.replace_all_utf16(&text, &utf16("<$1>")).into_owned(),
+        [0x3C, 0x61, 0x3E, 0xD800, 0x3C, 0x62, 0x3E, 0xD83D, 0xDE00]
+    );
+}
+
+#[test]
+fn a_backreference_does_not_end_inside_a_surrogate_pair_with_the_u_flag() {
+    // The group holds a lone high surrogate; what follows is a pair, one code point that is not it.
+    let re = Regex::new(r"^(.)\1", "u").unwrap();
+    assert!(!re.is_match_utf16(&[0xD800, 0xD800, 0xDC00]));
+    assert!(Regex::new(r"^(.)\1", "").unwrap().is_match_utf16(&[0xD800, 0xD800, 0xDC00]));
+}
+
+#[test]
+fn a_half_character_over_utf8_is_written_as_a_replacement_character() {
+    // Without the u flag the pattern matches the high half of the character, which UTF-8 cannot hold.
+    let re = Regex::new(r"\ud83d", "").unwrap();
+    let m = re.find("a\u{1F600}").unwrap();
+    assert_eq!((m.start(), m.end()), (1, 3));
+    assert_eq!(m.as_str(), "");
+    assert_eq!(m.as_cow(), "\u{FFFD}");
+    assert_eq!(re.replace("a\u{1F600}", "x"), "ax\u{FFFD}");
+}
+
+#[test]
+fn modifiers_and_flags_mean_the_same() {
+    for (flags, pattern) in [("i", "k"), ("", "(?i:k)")] {
+        let re = Regex::new(&format!("^{pattern}$"), &format!("{flags}u")).unwrap();
+        assert!(re.is_match("K") && re.is_match("\u{212A}"), "/{pattern}/{flags}u");
+    }
+    assert!(Regex::new("^b$", "m").unwrap().is_match("a\nb\nc"));
+    assert!(Regex::new("a.b", "s").unwrap().is_match("a\nb"));
+    assert!(!Regex::new("a.b", "").unwrap().is_match("a\nb"));
+}

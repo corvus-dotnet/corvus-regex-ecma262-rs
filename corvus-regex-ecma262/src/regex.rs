@@ -168,9 +168,6 @@ impl Regex {
 
     /// [`Regex::new`] with the flags already read.
     pub fn with_flags(pattern: &str, flags: Flags) -> Result<Regex, Error> {
-        if flags.unicode_sets {
-            return Err(Error::Flags("the flag v is not supported yet".to_string()));
-        }
         let syntax = flags.syntax();
         on_a_deep_stack(pattern, || {
             let (root, facts, ps) = read_with(pattern, syntax)?;

@@ -1,5 +1,21 @@
 //! Regular expressions with the grammar and the answers of ECMA-262 (the `RegExp` of JavaScript), for Rust.
 //!
+//! ```
+//! use corvus_regex_ecma262::Regex;
+//!
+//! let re = Regex::new(r"(?<word>\p{L}+)(?=!)", "gu").unwrap();
+//! let words: Vec<&str> = re.find_iter("Hej! Grüß dich!").map(|m| m.as_str()).collect();
+//! assert_eq!(words, ["Hej", "dich"]);
+//! assert_eq!(re.replace("Hej! Grüß dich!", "<$<word>>"), "<Hej>! Grüß <dich>!");
+//! ```
+//!
+//! [`Regex`] has `is_match`, `find`, `find_iter`, `captures`, `captures_iter`, `replace`, `replace_all` and
+//! `split` over `&str`, and the same over UTF-16 (`&[u16]`, which may hold lone surrogates) with the suffix `_utf16`.
+//! Positions are in the units of the text: bytes of UTF-8, or UTF-16 code units. Nothing is transcoded, and a match
+//! allocates nothing once the thread's working memory has grown to what the pattern and the text need (a
+//! [`Captures`] is a vector of its groups; [`Regex::captures_read_at`] reads them into a [`CaptureLocations`]
+//! without allocating).
+//!
 //! A pattern is read as `new RegExp(pattern, flags)` reads it: with the u flag by the grammar of the u flag and
 //! matched by code point; with none by the Annex B grammar and matched by UTF-16 code unit, as ECMA-262 matches a
 //! pattern with no u flag. The i, m and s flags are the modifiers in force at the start of the pattern, which a
@@ -50,9 +66,10 @@
 //!
 //! The grammar is that of ECMAScript 2025. It includes lookbehind, named groups, group names shared between
 //! separate alternatives, modifier groups, and Unicode property escapes for every property, value and alias
-//! ECMA-262 lists, with Unicode 17 data. The properties and the case folding come from the tables of `ucd.rs` and
-//! never from the standard library or from a dependency, so a pattern matches the same texts whatever built the
-//! program.
+//! ECMA-262 lists, with Unicode 17 data, and the v flag of ECMAScript 2024: nested classes, the difference and the
+//! intersection of classes, strings in a class (`\q{...}`) and the seven properties of strings. The properties and
+//! the case folding come from the tables of `ucd.rs` and `strings_gen.rs` and never from the standard library or
+//! from a dependency, so a pattern matches the same texts whatever built the program.
 
 mod charset;
 mod compile;
@@ -62,6 +79,10 @@ mod parse;
 mod re2;
 mod regex;
 mod replace;
+// Generated: the properties of strings of the v flag, with the version of Unicode they are from.
+#[allow(dead_code)]
+#[rustfmt::skip]
+mod strings_gen;
 // Generated: it has names of scripts and properties that only the tests read.
 #[allow(dead_code)]
 #[rustfmt::skip]
@@ -235,6 +256,7 @@ impl Flags {
     pub(crate) fn syntax(&self) -> parse::Syntax {
         parse::Syntax {
             unicode: self.unicode || self.unicode_sets,
+            sets: self.unicode_sets,
             icase: self.ignore_case,
             multiline: self.multiline,
             dot_all: self.dot_all,

@@ -5,8 +5,8 @@ use std::fmt;
 use std::sync::{Arc, LazyLock};
 
 use super::Rune;
-use super::charset::{CharSet, DIGIT_PAIRS, DOT_SET, MAX_RUNE, SPACE_PAIRS, WORD_PAIRS, property_set};
-use super::fold::{FOLD_WORD_SET, NOT_FOLD_WORD_SET, fold_closure};
+use super::charset::{CharSet, DIGIT_PAIRS, DOT_SET, MAX_RUNE, SPACE_PAIRS, WORD_PAIRS, property_set, string_property};
+use super::fold::{FOLD_WORD_SET, NOT_FOLD_WORD_SET, canonicalize, fold_closure};
 use super::ucd;
 use super::units::{high_surrogate, low_surrogate};
 
@@ -188,6 +188,10 @@ pub(crate) struct Parser {
     p: Vec<Rune>,
     i: usize,
     unicode: bool,
+    /// The grammar of the v flag.
+    sets: bool,
+    /// The sequences of the property of strings the last class escape named (the v flag), or `None`.
+    escape_strings: Option<&'static [Vec<Rune>]>,
     depth: usize,
     /// `group_count` and `has_names` come from a scan of the whole pattern before parsing, because the meaning of
     /// `\1` and `\k` depends on groups that may follow them.
@@ -222,6 +226,8 @@ static NOT_SPACE_SET: LazyLock<Arc<CharSet>> = LazyLock::new(|| CharSet::shared(
 pub(crate) struct Syntax {
     /// The grammar of the u flag. Without it, the Annex B grammar of a pattern with no u or v flag.
     pub unicode: bool,
+    /// The grammar of the v flag inside a class, and the properties of strings. It comes with `unicode`.
+    pub sets: bool,
     /// The i, m and s flags: the modifiers in force at the start of the pattern.
     pub icase: bool,
     pub multiline: bool,
@@ -249,6 +255,8 @@ pub(crate) fn parse_with(pattern: &str, syntax: Syntax) -> Parse<(Node, Parser)>
         p,
         i: 0,
         unicode,
+        sets: syntax.sets,
+        escape_strings: None,
         depth: 0,
         group_count: 0,
         has_names: false,
@@ -868,6 +876,12 @@ impl Parser {
             return Ok((self.char_node(octal), true));
         }
         if let Some(set) = self.class_escape(c)? {
+            if let Some(strings) = self.escape_strings {
+                // A property of strings (the v flag): the class of its code points and its sequences.
+                let set = self.fold_if(&set)?;
+                let value = self.strings_value(set, strings)?;
+                return Ok((self.class_node(value, false)?, true));
+            }
             return Ok((self.set_node(set)?, true));
         }
         let escaped = self.character_escape(false)?;
@@ -899,6 +913,7 @@ impl Parser {
     /// Reads a class escape such as `\d` or `\p{...}` whose letter is `c`. It returns `None`, consuming nothing,
     /// when `c` does not start one.
     fn class_escape(&mut self, c: Rune) -> Parse<Option<Arc<CharSet>>> {
+        self.escape_strings = None;
         let set = match u8::try_from(c).unwrap_or(0) {
             b'd' => &DIGIT_SET,
             b'D' => &NOT_DIGIT_SET,
@@ -938,10 +953,22 @@ impl Parser {
                     return self.fail("invalid property name");
                 }
                 let Some(set) = property_set(&expr) else {
+                    if self.sets
+                        && c == ch('p')
+                        && let Some(property) = string_property(&expr)
+                    {
+                        // A property of strings, which the v flag alone names, and which has no complement.
+                        self.charge(RANGE_SIZE * (property.set.ranges.len() / 2 + property.strings.len()))?;
+                        self.escape_strings = Some(&property.strings);
+                        return Ok(Some(property.set.clone()));
+                    }
                     return self.fail("invalid property name");
                 };
                 if c == ch('P') {
                     self.charge(RANGE_SIZE * set.ranges.len() / 2)?;
+                    // With the v flag the complement is of the case-folded set; with the u flag the fold comes
+                    // after it.
+                    let set = if self.sets { self.fold_if(&set)? } else { set };
                     return Ok(Some(CharSet::shared(&set.ranges, true)));
                 }
                 return Ok(Some(set));
@@ -1088,6 +1115,9 @@ impl Parser {
 
     /// Reads a character class from its `[` to its `]`.
     fn class(&mut self) -> Parse<Node> {
+        if self.sets {
+            return self.class_set_expression();
+        }
         self.i += 1;
         let negated = self.eat('^');
         let mut pairs: Vec<Rune> = Vec::new();
@@ -1158,5 +1188,325 @@ impl Parser {
             return Ok((0, Some(set)));
         }
         Ok((self.character_escape(true)?, None))
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // The v flag. Its grammar changes a class and nothing outside it. A class is read as a value of two parts, its
+    // code points and its strings (each of a length other than one, the empty string among them), with a flag for
+    // whether its syntax may hold a string, which ECMA-262's MayContainStrings decides from the syntax and not from
+    // what the strings turn out to be. A string of one character is a character of the class. The union, the
+    // intersection (`&&`) and the difference (`--`) act on both parts, strings compared whole. With the i flag each
+    // operand is case folded as it is read, so that the complement of a class, and of `\P{...}`, is of the folded
+    // set (with the u flag the fold comes after the complement). A class with strings is a group of an
+    // alternation: the strings longest first, each a sequence of characters, then the set. (This is the design of
+    // the .NET reference engine, section 3.2.)
+
+    /// The set with every character equivalent to one of its members, inside a case-insensitive group, and the set
+    /// itself outside one.
+    fn fold_if(&mut self, set: &Arc<CharSet>) -> Parse<Arc<CharSet>> {
+        if self.icase { self.fold(set) } else { Ok(set.clone()) }
+    }
+
+    /// Reads a class of the v flag's grammar from its `[` to its `]`.
+    fn class_set_expression(&mut self) -> Parse<Node> {
+        self.i += 1;
+        let negated = self.eat('^');
+        let start = self.i;
+        let value = self.class_set_contents()?;
+        if !self.eat(']') {
+            return self.fail("unterminated character class");
+        }
+        if negated && value.may_contain_strings {
+            self.i = start;
+            return self.fail("negated character class may contain strings");
+        }
+        self.class_node(value, negated)
+    }
+
+    /// Reads the contents of a class of the v flag's grammar, up to its `]`.
+    fn class_set_contents(&mut self) -> Parse<ClassSetValue> {
+        if self.peek() == ch(']') {
+            return Ok(ClassSetValue::empty());
+        }
+        let (mut value, range) = self.class_set_element()?;
+        let op = self.set_operator();
+        if op != 0 {
+            // An intersection or a difference: operands only, with the one operator between every two.
+            if range {
+                return self.fail("invalid set operation in character class");
+            }
+            while self.set_operator() == op {
+                self.i += 2;
+                if self.peek() == ch(']') || !self.more() {
+                    return self.fail("invalid set operation in character class");
+                }
+                let (operand, operand_range) = self.class_set_element()?;
+                if operand_range {
+                    return self.fail("invalid set operation in character class");
+                }
+                self.charge(RANGE_SIZE * (value.set.ranges.len() + operand.set.ranges.len()) / 2)?;
+                value = if op == ch('&') { value.intersect(operand) } else { value.subtract(operand) };
+            }
+            if self.peek() != ch(']') {
+                return self.fail("invalid set operation in character class");
+            }
+            return Ok(value);
+        }
+        // A union.
+        while self.more() && self.peek() != ch(']') {
+            if self.set_operator() != 0 {
+                return self.fail("invalid set operation in character class");
+            }
+            let (operand, _) = self.class_set_element()?;
+            self.charge(RANGE_SIZE * (value.set.ranges.len() + operand.set.ranges.len()) / 2)?;
+            value = value.union(operand);
+        }
+        Ok(value)
+    }
+
+    /// The set operator at the position (`&` for `&&`, `-` for `--`), or 0.
+    fn set_operator(&self) -> Rune {
+        if self.i + 1 < self.p.len()
+            && self.p[self.i] == self.p[self.i + 1]
+            && (self.p[self.i] == ch('&') || self.p[self.i] == ch('-'))
+        {
+            return self.p[self.i];
+        }
+        0
+    }
+
+    /// Reads one element of a class of the v flag's grammar: an operand, or a range of two characters, which it
+    /// reports.
+    fn class_set_element(&mut self) -> Parse<(ClassSetValue, bool)> {
+        self.charge(NODE_SIZE)?;
+        let c = self.peek();
+        if c == ch('[') {
+            // A nested class: its strings count as strings whether or not there are any.
+            let start = self.i;
+            self.depth += 1;
+            if self.depth > MAX_NESTING {
+                return Err(ParseError::TooLarge(TooLargeError { limit: Limit::Nesting, value: MAX_NESTING }));
+            }
+            self.i += 1;
+            let negated = self.eat('^');
+            let inner = self.class_set_contents()?;
+            if !self.eat(']') {
+                return self.fail("unterminated character class");
+            }
+            self.depth -= 1;
+            if negated {
+                if inner.may_contain_strings {
+                    self.i = start;
+                    return self.fail("negated character class may contain strings");
+                }
+                return Ok((ClassSetValue::of(Arc::new(inner.set.complement())), false));
+            }
+            return Ok((inner, false));
+        }
+        if c == ch('\\') {
+            if self.i + 1 >= self.p.len() {
+                return self.fail("\\ at end of pattern");
+            }
+            let e = self.p[self.i + 1];
+            if e == ch('q') {
+                self.i += 2;
+                return Ok((self.class_string_disjunction()?, false));
+            }
+            self.i += 1;
+            if let Some(set) = self.class_escape(e)? {
+                if let Some(strings) = self.escape_strings {
+                    let set = self.fold_if(&set)?;
+                    return Ok((self.strings_value(set, strings)?, false));
+                }
+                // A class escape is folded as one operand; \P is already the complement of a folded set.
+                let set = if e == ch('P') { set } else { self.fold_if(&set)? };
+                return Ok((ClassSetValue::of(set), false));
+            }
+            self.i -= 1;
+        }
+        let first = self.class_set_character()?;
+        if self.peek() == ch('-') && self.set_operator() == 0 {
+            let dash = self.i;
+            self.i += 1;
+            let next = self.peek();
+            let escape_class = next == ch('\\')
+                && self.i + 1 < self.p.len()
+                && u8::try_from(self.p[self.i + 1]).is_ok_and(|e| b"qdDwWsSpP".contains(&e));
+            if next == ch(']') || next == ch('[') || escape_class {
+                self.i = dash;
+                return self.fail("invalid character class range");
+            }
+            let second = self.class_set_character()?;
+            if second < first {
+                self.i = dash;
+                return self.fail("range out of order in character class");
+            }
+            let set = self.fold_if(&CharSet::shared(&[first, second], false))?;
+            return Ok((ClassSetValue::of(set), true));
+        }
+        let set = self.fold_if(&CharSet::shared(&[first, first], false))?;
+        Ok((ClassSetValue::of(set), false))
+    }
+
+    /// Reads one character of a class of the v flag's grammar: a character that is not a syntax character and does
+    /// not begin a reserved double punctuator, or an escape, which may be of a reserved punctuator.
+    fn class_set_character(&mut self) -> Parse<Rune> {
+        if !self.more() {
+            return self.fail("unterminated character class");
+        }
+        let c = self.p[self.i];
+        if c == ch('\\') {
+            if self.i + 1 >= self.p.len() {
+                return self.fail("\\ at end of pattern");
+            }
+            let e = self.p[self.i + 1];
+            if e == ch('b') {
+                self.i += 2;
+                return Ok(0x08);
+            }
+            if u8::try_from(e).is_ok_and(|e| b"&-!#%,:;<=>@`~".contains(&e)) {
+                self.i += 2;
+                return Ok(e);
+            }
+            self.i += 1;
+            return self.character_escape(true);
+        }
+        if u8::try_from(c).is_ok_and(|c| b"()[]{}/-\\|".contains(&c)) {
+            return self.fail("invalid character in character class");
+        }
+        if self.i + 1 < self.p.len()
+            && self.p[self.i + 1] == c
+            && u8::try_from(c).is_ok_and(|c| b"&!#$%*+,.:;<=>?@^`~".contains(&c))
+        {
+            return self.fail("invalid set operation in character class");
+        }
+        self.i += 1;
+        Ok(c)
+    }
+
+    /// Reads the strings of `\q{...}` after its `\q`. A string of one character is a character of the class.
+    fn class_string_disjunction(&mut self) -> Parse<ClassSetValue> {
+        if !self.eat('{') {
+            return self.fail("invalid escape");
+        }
+        let mut current: Vec<Rune> = Vec::new();
+        let mut value = ClassSetValue::empty();
+        loop {
+            if !self.more() {
+                return self.fail("unterminated character class");
+            }
+            let c = self.peek();
+            if c == ch('|') || c == ch('}') {
+                self.i += 1;
+                if current.len() == 1 {
+                    let set = self.fold_if(&CharSet::shared(&[current[0], current[0]], false))?;
+                    value.set = Arc::new(value.set.union(&set));
+                } else {
+                    value.may_contain_strings = true;
+                    self.charge(NODE_SIZE * current.len().max(1))?;
+                    let s = self.canonical_string(&current);
+                    if !value.strings.contains(&s) {
+                        value.strings.push(s);
+                    }
+                }
+                current.clear();
+                if c == ch('}') {
+                    break;
+                }
+                continue;
+            }
+            current.push(self.class_set_character()?);
+        }
+        Ok(value)
+    }
+
+    /// The value of a property of strings: its code points, and its sequences (case folded in a case-insensitive
+    /// group).
+    fn strings_value(&mut self, set: Arc<CharSet>, strings: &[Vec<Rune>]) -> Parse<ClassSetValue> {
+        let strings = strings.iter().map(|s| self.canonical_string(s)).collect();
+        Ok(ClassSetValue { set, strings, may_contain_strings: true })
+    }
+
+    /// A string as its code points, each canonicalized in a case-insensitive group so that strings are compared as
+    /// ECMA-262 compares them.
+    fn canonical_string(&self, code_points: &[Rune]) -> Vec<Rune> {
+        code_points.iter().map(|&c| if self.icase { canonicalize(c, true) } else { c }).collect()
+    }
+
+    /// The node of a class of the v flag's grammar: its set, or, where it holds strings, the alternatives of its
+    /// strings longest first and then its set, as ECMA-262 orders them, in a group.
+    fn class_node(&mut self, value: ClassSetValue, negated: bool) -> Parse<Node> {
+        if negated {
+            return Ok(Node::set(Arc::new(value.set.complement())));
+        }
+        if value.strings.is_empty() {
+            return Ok(Node::set(value.set));
+        }
+        let mut ordered = value.strings;
+        ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        let mut alternatives = Vec::with_capacity(ordered.len() + 1);
+        for s in &ordered {
+            self.charge(NODE_SIZE * (s.len() + 1))?;
+            match s.len() {
+                0 => alternatives.push(Node::new(NodeKind::Empty)),
+                _ => {
+                    let chars = s.iter().map(|&c| self.char_node(c)).collect();
+                    alternatives.push(Node::with_subs(NodeKind::Cat, chars));
+                }
+            }
+        }
+        if !value.set.ranges.is_empty() {
+            alternatives.push(Node::set(value.set));
+        }
+        Ok(Node::with_subs(NodeKind::Group, vec![Node::with_subs(NodeKind::Alt, alternatives)]))
+    }
+}
+
+/// The value of a class of the v flag's grammar: its code points, its strings (each of a length other than one, the
+/// empty string among them), and whether its syntax may hold a string.
+struct ClassSetValue {
+    set: Arc<CharSet>,
+    strings: Vec<Vec<Rune>>,
+    may_contain_strings: bool,
+}
+
+impl ClassSetValue {
+    fn empty() -> ClassSetValue {
+        ClassSetValue { set: CharSet::shared(&[], false), strings: Vec::new(), may_contain_strings: false }
+    }
+
+    fn of(set: Arc<CharSet>) -> ClassSetValue {
+        ClassSetValue { set, strings: Vec::new(), may_contain_strings: false }
+    }
+
+    fn union(mut self, b: ClassSetValue) -> ClassSetValue {
+        for s in b.strings {
+            if !self.strings.contains(&s) {
+                self.strings.push(s);
+            }
+        }
+        ClassSetValue {
+            set: Arc::new(self.set.union(&b.set)),
+            strings: self.strings,
+            may_contain_strings: self.may_contain_strings || b.may_contain_strings,
+        }
+    }
+
+    fn intersect(self, b: ClassSetValue) -> ClassSetValue {
+        let strings = self.strings.into_iter().filter(|s| b.strings.contains(s)).collect();
+        ClassSetValue {
+            set: Arc::new(self.set.intersect(&b.set)),
+            strings,
+            may_contain_strings: self.may_contain_strings && b.may_contain_strings,
+        }
+    }
+
+    fn subtract(self, b: ClassSetValue) -> ClassSetValue {
+        let strings = self.strings.into_iter().filter(|s| !b.strings.contains(s)).collect();
+        ClassSetValue {
+            set: Arc::new(self.set.subtract(&b.set)),
+            strings,
+            may_contain_strings: self.may_contain_strings,
+        }
     }
 }

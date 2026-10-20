@@ -269,3 +269,82 @@ fn property_pairs(expr: &str) -> Option<Vec<Rune>> {
 fn category_pairs(value: &str) -> Option<Vec<Rune>> {
     ucd::category(category_name(value)?).map(|t| t.pairs())
 }
+
+impl CharSet {
+    /// The code points in both sets.
+    pub(crate) fn intersect(&self, other: &CharSet) -> CharSet {
+        let (a, b) = (self.ranges.as_chunks::<2>().0, other.ranges.as_chunks::<2>().0);
+        let (mut i, mut j) = (0, 0);
+        let mut pairs = Vec::new();
+        while i < a.len() && j < b.len() {
+            let lo = a[i][0].max(b[j][0]);
+            let hi = a[i][1].min(b[j][1]);
+            if lo <= hi {
+                pairs.push(lo);
+                pairs.push(hi);
+            }
+            if a[i][1] < b[j][1] {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        CharSet::new(&pairs, false)
+    }
+
+    /// The code points of this set that are not in the other.
+    pub(crate) fn subtract(&self, other: &CharSet) -> CharSet {
+        self.intersect(&CharSet::new(&other.ranges, true))
+    }
+
+    /// The code points of either set.
+    pub(crate) fn union(&self, other: &CharSet) -> CharSet {
+        let mut pairs = self.ranges.clone();
+        pairs.extend_from_slice(&other.ranges);
+        CharSet::new(&pairs, false)
+    }
+
+    /// The code points not in the set.
+    pub(crate) fn complement(&self) -> CharSet {
+        CharSet::new(&self.ranges, true)
+    }
+}
+
+/// The value of a property of strings, which only the v flag can name: its single code points and its sequences.
+pub(crate) struct StringProperty {
+    pub(crate) set: Arc<CharSet>,
+    pub(crate) strings: Vec<Vec<Rune>>,
+}
+
+static STRING_PROPERTIES: LazyLock<Vec<StringProperty>> = LazyLock::new(|| {
+    let mut all = Vec::new();
+    let mut union: Vec<Rune> = Vec::new();
+    let mut every: Vec<Vec<Rune>> = Vec::new();
+    for (_, code_points, sequences) in super::strings_gen::PROPERTIES.iter() {
+        let mut pairs = Vec::new();
+        for item in code_points.split(' ').filter(|s| !s.is_empty()) {
+            let (lo, hi) = item.split_once("..").unwrap_or((item, item));
+            pairs.push(Rune::from_str_radix(lo, 16).expect("a hexadecimal code point"));
+            pairs.push(Rune::from_str_radix(hi, 16).expect("a hexadecimal code point"));
+        }
+        let strings: Vec<Vec<Rune>> = sequences
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(' ').map(|c| Rune::from_str_radix(c, 16).expect("a hexadecimal code point")).collect())
+            .collect();
+        union.extend_from_slice(&pairs);
+        every.extend(strings.iter().cloned());
+        all.push(StringProperty { set: CharSet::shared(&pairs, false), strings });
+    }
+    all.push(StringProperty { set: CharSet::shared(&union, false), strings: every });
+    all
+});
+
+/// The property of strings of the name (`RGI_Emoji` and the six it is the union of), or `None`.
+pub(crate) fn string_property(name: &str) -> Option<&'static StringProperty> {
+    if name == "RGI_Emoji" {
+        return STRING_PROPERTIES.last();
+    }
+    let k = super::strings_gen::PROPERTIES.iter().position(|(n, _, _)| *n == name)?;
+    Some(&STRING_PROPERTIES[k])
+}
