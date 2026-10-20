@@ -9,7 +9,7 @@ use std::sync::Arc;
 use super::charset::CharSet;
 use super::compile::{Inst, MAX_MEMO_LOOPS, Op, Program};
 use super::fold::{canonicalize, is_fold_word_rune};
-use super::search::{Literals, Plan};
+use super::search::{Literals, Plan, Shape};
 use super::units::{Text, is_word_unit};
 
 /// Why a match was abandoned. Neither is an answer.
@@ -253,6 +253,14 @@ impl Program {
         limit: Option<Duration>,
         caps: Option<&mut [usize]>,
     ) -> Result<Option<(usize, usize)>, MatchError> {
+        // A pattern of a simple shape with no group is answered by the search alone, with nothing of the matcher's.
+        if self.groups == 0
+            && !sticky
+            && !self.anchored
+            && let Some(found) = self.shape_search::<T>(input, start)
+        {
+            return Ok(found);
+        }
         STATE.with(|cell| match cell.try_borrow_mut() {
             Ok(mut st) => self.match_with::<T>(&mut st, input, start, sticky, limit, caps),
             // The thread is already inside a match, which nothing in the crate does. A match is then given a
@@ -321,6 +329,89 @@ impl Program {
         }
     }
 
+    /// The first match at or after `start` of a pattern of a simple shape, or `None` when it has none.
+    #[inline]
+    fn shape_search<T: Text>(&self, input: &[T::Unit], start: usize) -> Option<Option<(usize, usize)>> {
+        let len = input.len();
+        let need = if T::UTF8 { self.need } else { self.need16 };
+        if matches!(self.search.shape, Shape::None) {
+            return None;
+        }
+        if start > len || len - start < need {
+            return Some(None);
+        }
+        let units = self.units;
+        let bytes = T::bytes(input);
+        Some(match &self.search.shape {
+            Shape::None => unreachable!(),
+            Shape::Literals => {
+                let Plan::Windows { literals, .. } = &self.search.plan else { return None };
+                literals.find_match(bytes, start, T::UTF8)
+            }
+            Shape::Forms(alternatives) => {
+                let Plan::Windows { literals, .. } = &self.search.plan else { return None };
+                let mut next = start;
+                loop {
+                    let Some(q) = literals.find(bytes, next, T::UTF8) else { break None };
+                    let mut found = None;
+                    'alternatives: for alt in alternatives {
+                        let mut p = q;
+                        for f in alt {
+                            if p >= len {
+                                continue 'alternatives;
+                            }
+                            let c: u32 = input[p].into();
+                            let (r, w) = if c < 0x80 { (c as Rune, 1) } else { T::read(input, p, units) };
+                            if !f.contains(&r) {
+                                continue 'alternatives;
+                            }
+                            p += w;
+                        }
+                        found = Some((q, p));
+                        break;
+                    }
+                    if found.is_some() {
+                        break found;
+                    }
+                    next = q + T::read(input, q, units).1;
+                }
+            }
+            Shape::Set(set) => self.next_member::<T>(set, input, start).map(|(at, w)| (at, at + w)),
+            Shape::Loop(set, min, end) => {
+                let from = if *min == 0 {
+                    start
+                } else {
+                    let Some((at, w)) = self.next_member::<T>(set, input, start) else { return Some(None) };
+                    let _ = w;
+                    at
+                };
+                let to = if T::UTF8 { end.end8(bytes, from) } else { None };
+                Some((from, to.unwrap_or_else(|| self.end_of_run::<T>(set, input, from))))
+            }
+        })
+    }
+
+    /// The first member of the set at or after `at`, and its width.
+    #[inline]
+    fn next_member<T: Text>(&self, set: &CharSet, input: &[T::Unit], mut at: usize) -> Option<(usize, usize)> {
+        let first_bytes = if T::UTF8 { self.search.first_bytes.as_ref() } else { None };
+        let bytes = T::bytes(input);
+        loop {
+            if let Some(fb) = first_bytes {
+                at = fb.find(bytes, at)?;
+            }
+            if at >= input.len() {
+                return None;
+            }
+            let c: u32 = input[at].into();
+            let (r, w) = if c < 0x80 { (c as Rune, 1) } else { T::read(input, at, self.units) };
+            if if c < 0x80 { set.has_ascii(c as u8) } else { set.contains(r) } {
+                return Some((at, w));
+            }
+            at += w;
+        }
+    }
+
     /// Whether a start passes the first set.
     #[inline(always)]
     fn first_allows<T: Text>(&self, input: &[T::Unit], at: usize) -> bool {
@@ -378,10 +469,6 @@ impl Program {
                 // Every alternative starts with its literal: the match starts at the occurrence or not at all.
                 if len - q < need {
                     return None;
-                }
-                if let Some((bytes8, units16)) = self.search.literal {
-                    // The pattern is the literal: the occurrence is the match.
-                    return Some((q, q + if T::UTF8 { bytes8 } else { units16 }));
                 }
                 if self.try_at::<T>(st, input, q) {
                     return Some((q, st.end));

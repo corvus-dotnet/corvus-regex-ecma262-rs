@@ -92,17 +92,19 @@ impl Finder {
         Finder::Automaton(automaton)
     }
 
-    /// The start of the leftmost occurrence at or after `from`.
+    /// The leftmost occurrence at or after `from` (the first literal, in their order, of those that start there).
     #[inline]
-    fn find(&self, haystack: &[u8], from: usize) -> Option<usize> {
+    fn find(&self, haystack: &[u8], from: usize) -> Option<(usize, usize)> {
         if from > haystack.len() {
             return None;
         }
         match self {
-            Finder::One(f) => f.find(&haystack[from..]).map(|i| from + i),
-            Finder::Packed(s) => s.find_in(haystack, aho_corasick::Span::from(from..haystack.len())).map(|m| m.start()),
+            Finder::One(f) => f.find(&haystack[from..]).map(|i| (from + i, from + i + f.needle().len())),
+            Finder::Packed(s) => {
+                s.find_in(haystack, aho_corasick::Span::from(from..haystack.len())).map(|m| (m.start(), m.end()))
+            }
             Finder::Automaton(a) => {
-                a.find(aho_corasick::Input::new(haystack).span(from..haystack.len())).map(|m| m.start())
+                a.find(aho_corasick::Input::new(haystack).span(from..haystack.len())).map(|m| (m.start(), m.end()))
             }
         }
     }
@@ -136,7 +138,16 @@ impl memchr::arch::all::packedpair::HeuristicFrequencyRank for Utf16Rank {
 pub(crate) struct Literals {
     utf8: Finder,
     utf16: Finder,
+    /// Every literal is ASCII, so over UTF-16 the low bytes of the units are packed into bytes and searched for by the
+    /// UTF-8 search (a unit beyond ASCII packs to 0x80, which no literal holds), as the .NET reference engine's packed
+    /// fingerprint search does: the zero high bytes of ASCII units are then not looked at.
+    ascii: bool,
+    /// The most code units of a literal.
+    longest: usize,
 }
+
+/// The units packed into bytes at a time for the UTF-16 search of ASCII literals.
+const PACK: usize = 4096;
 
 impl Literals {
     /// The search for the literals, each a sequence of code points.
@@ -146,24 +157,69 @@ impl Literals {
         let utf8: Vec<Vec<u8>> = literals.iter().map(|l| as_string(l).into_bytes()).collect();
         let utf16: Vec<Vec<u8>> =
             literals.iter().map(|l| as_string(l).encode_utf16().flat_map(u16::to_ne_bytes).collect()).collect();
-        Literals { utf8: Finder::new(&utf8, fingerprint, false), utf16: Finder::new(&utf16, fingerprint, true) }
+        let ascii = literals.iter().all(|l| l.iter().all(|&r| r < 0x80));
+        let longest = literals.iter().map(Vec::len).max().unwrap_or(0);
+        Literals {
+            utf8: Finder::new(&utf8, fingerprint, false),
+            utf16: Finder::new(&utf16, fingerprint, true),
+            ascii,
+            longest,
+        }
     }
 
     /// The position (in units of the text) of the leftmost occurrence at or after `from`. `bytes` is the text's
     /// bytes and `utf8` says whether a unit is one of them.
     #[inline]
     pub(crate) fn find(&self, bytes: &[u8], from: usize, utf8: bool) -> Option<usize> {
+        self.find_match(bytes, from, utf8).map(|(start, _)| start)
+    }
+
+    /// [`Literals::find`], with where the occurrence ends.
+    #[inline]
+    pub(crate) fn find_match(&self, bytes: &[u8], from: usize, utf8: bool) -> Option<(usize, usize)> {
         if utf8 {
             return self.utf8.find(bytes, from);
         }
+        if self.ascii && self.longest < PACK {
+            return self.find_packed(bytes, from);
+        }
         let mut at = 2 * from;
         loop {
-            let i = self.utf16.find(bytes, at)?;
+            let (i, e) = self.utf16.find(bytes, at)?;
             if i & 1 == 0 {
-                return Some(i / 2);
+                return Some((i / 2, e / 2));
             }
             at = i + 1;
         }
+    }
+
+    /// The search over UTF-16 for ASCII literals: the low bytes of a chunk of units packed into bytes, searched by the
+    /// UTF-8 search. An occurrence that starts so near the end of a chunk that a longer one could start before it and
+    /// end beyond the chunk is looked for again in the next chunk, which starts that far back.
+    fn find_packed(&self, bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+        let units = bytes.len() / 2;
+        let overlap = self.longest.saturating_sub(1);
+        let mut buf = [0u8; PACK];
+        let mut at = from;
+        while at <= units {
+            let end = (at + PACK).min(units);
+            for (k, slot) in buf[..end - at].iter_mut().enumerate() {
+                let i = 2 * (at + k);
+                let u = u16::from_ne_bytes([bytes[i], bytes[i + 1]]);
+                *slot = if u < 0x80 { u as u8 } else { 0x80 };
+            }
+            let last = end == units;
+            if let Some((s, e)) = self.utf8.find(&buf[..end - at], 0)
+                && (last || s < end - at - overlap)
+            {
+                return Some((at + s, at + e));
+            }
+            if last {
+                return None;
+            }
+            at = end - overlap;
+        }
+        None
     }
 }
 
@@ -179,6 +235,95 @@ pub(crate) enum Plan {
     AfterLoops { literals: Literals, sets: Vec<Arc<CharSet>>, mins: Vec<usize> },
 }
 
+/// The shape of a pattern whose matches the search finds without running the matcher (the .NET reference engine's
+/// simple shapes). Only for a pattern with no group.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum Shape {
+    #[default]
+    None,
+    /// Literals and nothing else, an alternation of them or one: the search's own match (`Plan::Windows`), which is
+    /// the first literal in the pattern's order of those that start leftmost, as ECMA-262 finds it.
+    Literals,
+    /// An alternation of literals each of whose characters has several forms (a letter under the i flag): at each
+    /// occurrence the search finds, the alternatives are compared in order.
+    Forms(Vec<Vec<Vec<Rune>>>),
+    /// One class and nothing else: every member is a match.
+    Set(Arc<CharSet>),
+    /// One greedy loop of a class with no upper bound and a least count of zero or one: a match is the run of
+    /// members from where it starts.
+    Loop(Arc<CharSet>, usize, RunEnd),
+}
+
+/// How the end of a run of a loop's members is found.
+#[derive(Clone, Debug)]
+pub(crate) enum RunEnd {
+    /// A member at a time.
+    Each,
+    /// The set holds every character: the run is the rest of the text.
+    All,
+    /// The set holds every character but up to three ASCII ones, found by `memchr`.
+    Stops(Vec<u8>),
+    /// The set holds every character but the four line terminators (the dot): LF and CR are found by `memchr`, with
+    /// the lead byte of U+2028 and U+2029, which is looked at further where it is found.
+    Line,
+}
+
+impl RunEnd {
+    fn of(set: &CharSet) -> RunEnd {
+        let complement = set.complement();
+        if complement.ranges.is_empty() {
+            return RunEnd::All;
+        }
+        if complement.ranges == [0x0A, 0x0A, 0x0D, 0x0D, 0x2028, 0x2029] {
+            return RunEnd::Line;
+        }
+        let mut stops = Vec::new();
+        for &[lo, hi] in complement.ranges.as_chunks::<2>().0 {
+            if hi >= 0x80 || hi - lo >= 3 || stops.len() + (hi - lo + 1) as usize > 3 {
+                return RunEnd::Each;
+            }
+            stops.extend((lo..=hi).map(|r| r as u8));
+        }
+        RunEnd::Stops(stops)
+    }
+
+    /// The end of the run that starts at `at` in UTF-8 text, or `None` when it is to be found a member at a time.
+    #[inline]
+    pub(crate) fn end8(&self, input: &[u8], at: usize) -> Option<usize> {
+        let rest = &input[at..];
+        Some(match self {
+            RunEnd::Each => return None,
+            RunEnd::All => input.len(),
+            RunEnd::Stops(b) => {
+                at + match b[..] {
+                    [a] => memchr::memchr(a, rest),
+                    [a, c] => memchr::memchr2(a, c, rest),
+                    [a, c, d] => memchr::memchr3(a, c, d, rest),
+                    _ => None,
+                }
+                .unwrap_or(rest.len())
+            }
+            RunEnd::Line => {
+                let mut k = 0;
+                loop {
+                    match memchr::memchr3(b'\n', b'\r', 0xE2, &rest[k..]) {
+                        None => break input.len(),
+                        Some(i) => {
+                            let j = k + i;
+                            if rest[j] != 0xE2
+                                || rest.get(j + 1) == Some(&0x80) && matches!(rest.get(j + 2), Some(0xA8 | 0xA9))
+                            {
+                                break at + j;
+                            }
+                            k = j + 1;
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
 /// What a pattern's search knows of it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Search {
@@ -192,9 +337,8 @@ pub(crate) struct Search {
     /// The bytes a match can start with over UTF-8, searched for together when they are few: the first set's ASCII
     /// members and the lead bytes of its other members.
     pub(crate) first_bytes: Option<FirstBytes>,
-    /// The pattern is one literal and nothing else, of this many bytes of UTF-8 and UTF-16 code units: every
-    /// occurrence the search finds is a match, and the matcher does not run.
-    pub(crate) literal: Option<(usize, usize)>,
+    /// The shape of a pattern the search answers without the matcher (see [`Shape`]).
+    pub(crate) shape: Shape,
 }
 
 /// A search for any of a few bytes: `memchr` for up to three, and the fingerprint search of one-byte literals for
@@ -423,7 +567,7 @@ fn counts(anchors: &[Anchor]) -> Vec<usize> {
             .iter()
             .zip(&counts)
             .enumerate()
-            .filter(|(_, (_, n))| **n > 1)
+            .filter(|(_, (a, n))| **n > 1 && product(a, **n) > 1)
             .max_by_key(|(_, (a, n))| product(a, **n))
         else {
             break;
@@ -439,6 +583,64 @@ fn starts_with_word(n: &Node, first: Option<&CharSet>) -> bool {
     first.is_some_and(|f| {
         f.ranges.last().is_some_and(|&last| last < 0x80) && (0..0x80u8).all(|c| !f.has_ascii(c) || is_word_byte(c))
     })
+}
+
+/// The top-level alternatives of a tree: the alternatives of an alternation (in a group or not), or the tree.
+fn alternatives(root: &Node) -> Vec<&Node> {
+    match root.kind {
+        NodeKind::Alt => root.subs.iter().collect(),
+        NodeKind::Group if root.group == 0 && root.subs[0].kind == NodeKind::Alt => root.subs[0].subs.iter().collect(),
+        _ => vec![root],
+    }
+}
+
+/// The literal shapes of a tree whose anchors are `found`: literals and nothing else, exact or with forms.
+fn shape_of_literals(root: &Node, found: &[Anchor], counts: &[usize]) -> Shape {
+    if holds_group(root) {
+        return Shape::None;
+    }
+    let alts = alternatives(root);
+    let mut all: Vec<Vec<Vec<Rune>>> = Vec::with_capacity(alts.len());
+    for alt in &alts {
+        let ts = terms(alt);
+        let chars: Option<Vec<Vec<Rune>>> = ts.iter().map(|t| forms(t)).collect();
+        match chars {
+            Some(c) if !c.is_empty() => all.push(c),
+            _ => return Shape::None,
+        }
+    }
+    let exact = all.iter().all(|alt| alt.iter().all(|f| f.len() == 1));
+    // Exact literals written out in full are the search's own literals, in the pattern's order.
+    if exact
+        && found.len() == all.len()
+        && found.iter().zip(&all).zip(counts).all(|((a, alt), &n)| a.lo == 0 && a.hi == 0 && n == alt.len())
+    {
+        return Shape::Literals;
+    }
+    Shape::Forms(all)
+}
+
+/// The class and loop shapes of a tree that is one term.
+fn shape_of_one(root: &Node) -> Shape {
+    if holds_group(root) {
+        return Shape::None;
+    }
+    let ts = terms(root);
+    if ts.len() != 1 {
+        return Shape::None;
+    }
+    let t = ts[0];
+    match t.kind {
+        NodeKind::Set if !t.class().is_empty() => Shape::Set(t.class().clone()),
+        NodeKind::Repeat if !t.lazy && t.min <= 1 => match open_loop(t) {
+            Some((set, min)) if !set.is_empty() => {
+                let end = RunEnd::of(&set);
+                Shape::Loop(set, min, end)
+            }
+            _ => Shape::None,
+        },
+        _ => Shape::None,
+    }
 }
 
 /// Whether a node holds a capturing group.
@@ -478,7 +680,8 @@ pub(crate) fn plan(root: &Node, backrefs: bool, first: Option<&CharSet>, units: 
         let mut literals: Vec<Vec<Rune>> = Vec::new();
         let (mut lo, mut hi) = (usize::MAX, 0);
         let mut forms = false;
-        for (a, count) in found.iter().zip(counts(&found)) {
+        let counts = counts(&found);
+        for (a, &count) in found.iter().zip(&counts) {
             lo = lo.min(a.lo);
             hi = hi.max(a.hi);
             forms |= a.chars.iter().any(|f| f.len() > 1);
@@ -490,20 +693,12 @@ pub(crate) fn plan(root: &Node, backrefs: bool, first: Option<&CharSet>, units: 
         }
         if !literals.is_empty() && literals.len() <= MAX_LITERALS && literals.iter().all(|l| !l.is_empty()) {
             let fingerprint = literals.len() >= 3 || forms;
-            if literals.len() == 1
-                && found.len() == 1
-                && found[0].chars.len() == ts.len()
-                && literals[0].len() == ts.len()
-                && ts.iter().all(|t| t.kind == NodeKind::Char)
-                && !holds_group(root)
-            {
-                let s: String = literals[0].iter().map(|&r| char::from_u32(r as u32).expect("a literal")).collect();
-                search.literal = Some((s.len(), s.encode_utf16().count()));
-            }
+            search.shape = shape_of_literals(root, &found, &counts);
             search.plan = Plan::Windows { literals: Literals::new(&literals, fingerprint), lo, hi };
             return search;
         }
     }
+    search.shape = shape_of_one(root);
     if backrefs {
         return search;
     }

@@ -1659,6 +1659,17 @@ fn the_searches_find_what_every_position_finds() {
         (r"(?<=a)b|c", ""),
         (r"[\p{L}--[a-z]]+t", "v"),
         (r"[\q{abc|de}x]y", "v"),
+        (r"\w+", ""),
+        (r".*", ""),
+        (r".+", "s"),
+        (r"[^\n]*", ""),
+        (r"[^\n.]+", ""),
+        (r"\p{L}", ""),
+        (r"[\ud800-\udfff]", ""),
+        (r"Tom|river|Tomas", ""),
+        (r"ab|a", ""),
+        (r"sherlock|holmes|k", "i"),
+        (r"\u{1F600}|Ш", ""),
     ];
     let alphabet = [
         "a",
