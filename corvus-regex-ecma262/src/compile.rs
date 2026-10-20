@@ -286,13 +286,112 @@ pub(crate) fn simplify(mut n: Node, open: &mut Vec<i32>) -> Node {
     if opened {
         open.pop();
     }
+    if n.kind == NodeKind::Cat && n.subs.iter().any(|sub| sub.kind == NodeKind::Cat) {
+        // A sequence inside a sequence (a written-out repetition) is the same sequence: flat, so that what reads the
+        // terms (the searches, the first characters) sees them all.
+        let mut flat = Vec::with_capacity(n.subs.len());
+        for sub in std::mem::take(&mut n.subs) {
+            if sub.kind == NodeKind::Cat {
+                flat.extend(sub.subs);
+            } else {
+                flat.push(sub);
+            }
+        }
+        n.subs = flat;
+    }
     if n.kind == NodeKind::Repeat && n.max != 0 && !consumes(&n.subs[0]) {
         if n.min == 0 {
             return Node::new(NodeKind::Empty);
         }
         return n.subs.pop().expect("a repetition has a body");
     }
+    if unrolling()
+        && n.kind == NodeKind::Repeat
+        && n.min == n.max
+        && (2..=32).contains(&n.max)
+        && matches!(n.subs[0].kind, NodeKind::Set | NodeKind::Char)
+    {
+        // An exact count of one character or class is that many of it in a row: a straight run of tests without a
+        // loop's counting, which pays where a search tries the run at every occurrence of a literal after it
+        // ([a-q][^u-z]{13}x). (The .NET reference engine's Simplify.)
+        return unroll(n);
+    }
+    if unrolling()
+        && n.kind == NodeKind::Repeat
+        && (1..=4).contains(&n.max)
+        && n.min >= 1
+        && !nullable(&n.subs[0])
+        && !has_capture(&n.subs[0])
+        && size(&n.subs[0]) <= 32
+        && matches!(n.subs[0].kind, NodeKind::Group | NodeKind::Alt | NodeKind::Cat)
+    {
+        // A small counted repetition of a body that holds no group and cannot be empty is the body written out,
+        // with the copies beyond the least count optional one inside the other: the same matches in the same order,
+        // without a loop's counting. A body of one character stays a counted loop, which the matcher runs without
+        // choices.
+        return unroll(n);
+    }
     n
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Keeps every counted repetition a loop, for the tests of the loops' needs and memo points.
+    pub(crate) static NO_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether small counted repetitions are written out.
+#[inline]
+fn unrolling() -> bool {
+    #[cfg(test)]
+    if NO_UNROLL.with(std::cell::Cell::get) {
+        return false;
+    }
+    true
+}
+
+/// Writes out a counted repetition (see `simplify`): X{2,4} is X X (X (X)?)?, the optional copies one inside the
+/// other, so that a copy is tried only when the one before it matched.
+fn unroll(n: Node) -> Node {
+    let body = &n.subs[0];
+    let mut terms: Vec<Node> = (0..n.min).map(|_| body.clone()).collect();
+    if n.max > n.min {
+        let mut optional: Option<Node> = None;
+        for _ in n.min..n.max {
+            let copy = body.clone();
+            let inner = match optional.take() {
+                None => copy,
+                Some(o) => Node { subs: vec![copy, o], ..Node::new(NodeKind::Cat) },
+            };
+            optional = Some(Node { min: 0, max: 1, lazy: n.lazy, subs: vec![inner], ..Node::new(NodeKind::Repeat) });
+        }
+        terms.extend(optional);
+    }
+    if terms.len() == 1 {
+        return terms.pop().expect("one term");
+    }
+    let mut flat = Vec::with_capacity(terms.len());
+    for t in terms {
+        if t.kind == NodeKind::Cat {
+            flat.extend(t.subs);
+        } else {
+            flat.push(t);
+        }
+    }
+    Node { subs: flat, ..Node::new(NodeKind::Cat) }
+}
+
+/// Whether a node holds a capturing group, a backreference or a lookaround.
+fn has_capture(n: &Node) -> bool {
+    n.kind == NodeKind::Group && n.group > 0
+        || n.kind == NodeKind::Backref
+        || n.kind == NodeKind::Look
+        || n.subs.iter().any(has_capture)
+}
+
+/// The number of nodes of a tree.
+fn size(n: &Node) -> usize {
+    1 + n.subs.iter().map(size).sum::<usize>()
 }
 
 /// Whether `n` can match one character or more. It errs towards true.

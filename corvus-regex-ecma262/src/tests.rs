@@ -134,7 +134,16 @@ fn parse_u(pattern: &str) -> parse::Node {
     parse::parse(pattern, true).unwrap_or_else(|e| panic!("parse({}): {e:?}", short(pattern))).0
 }
 
+/// The program of a pattern with every counted repetition kept as a loop (see `simplify`), which is what the tests
+/// of the needs and the memo points of loops read.
 fn program(pattern: &str) -> Program {
+    super::compile::NO_UNROLL.with(|n| n.set(true));
+    let p = program_unrolled(pattern);
+    super::compile::NO_UNROLL.with(|n| n.set(false));
+    p
+}
+
+fn program_unrolled(pattern: &str) -> Program {
     compile_program(parse_u(pattern), true, None)
 }
 

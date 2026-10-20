@@ -55,11 +55,23 @@ enum Finder {
     Automaton(AhoCorasick),
 }
 
+/// Whether a byte is rare enough in text for a search for it alone to pay: not a lower case letter (but the rarest
+/// five), a space or the commonest punctuation, nor a byte beyond ASCII, where the lead bytes of a script are common.
+fn rare(b: u8) -> bool {
+    b.is_ascii_uppercase()
+        || b.is_ascii_digit()
+        || b.is_ascii_punctuation() && !b",.'\"-".contains(&b)
+        || b"jqxzk".contains(&b)
+}
+
 impl Finder {
     fn new(literals: &[Vec<u8>], fingerprint: bool) -> Finder {
         if literals.len() == 1 {
             return Finder::One(memmem::Finder::new(&literals[0]).into_owned());
         }
+        // Two literals whose first bytes are rare are found by the automaton's search for those bytes; any others by
+        // the fingerprint search.
+        let fingerprint = fingerprint || !literals.iter().all(|l| l.first().copied().is_some_and(rare));
         if fingerprint
             && literals.len() <= MAX_FORMS
             && let Some(searcher) =
@@ -160,8 +172,13 @@ pub(crate) enum FirstBytes {
     One(u8),
     Two(u8, u8),
     Three(u8, u8, u8),
-    Packed(packed::Searcher),
+    /// The fingerprint search, and the bytes as a table for the few bytes looked at before it is called: where the
+    /// bytes are common a call costs more than it passes over.
+    Packed(packed::Searcher, Box<[bool; 256]>),
 }
+
+/// The bytes looked at one by one before the fingerprint search is called.
+const PROBE: usize = 16;
 
 impl FirstBytes {
     fn new(set: &CharSet, units: bool) -> Option<FirstBytes> {
@@ -190,7 +207,8 @@ impl FirstBytes {
             [a, b] => Some(FirstBytes::Two(a, b)),
             [a, b, c] => Some(FirstBytes::Three(a, b, c)),
             _ if list.len() <= MAX_FORMS => {
-                packed::Config::new().builder().extend(list.iter().map(|&b| [b])).build().map(FirstBytes::Packed)
+                let searcher = packed::Config::new().builder().extend(list.iter().map(|&b| [b])).build();
+                searcher.map(|searcher| FirstBytes::Packed(searcher, Box::new(bytes)))
             }
             _ => None,
         }
@@ -204,7 +222,11 @@ impl FirstBytes {
             FirstBytes::One(a) => memchr::memchr(*a, rest),
             FirstBytes::Two(a, b) => memchr::memchr2(*a, *b, rest),
             FirstBytes::Three(a, b, c) => memchr::memchr3(*a, *b, *c, rest),
-            FirstBytes::Packed(s) => {
+            FirstBytes::Packed(s, table) => {
+                if let Some(i) = rest.iter().take(PROBE).position(|&b| table[b as usize]) {
+                    return Some(from + i);
+                }
+                let from = from + PROBE.min(rest.len());
                 return s.find_in(haystack, aho_corasick::Span::from(from..haystack.len())).map(|m| m.start());
             }
         };
