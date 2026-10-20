@@ -8,11 +8,11 @@ here, and the plan leaves it out. Where this port does a thing another way, the 
 
 | Count | |
 |---|---|
-| Done | 44 |
+| Done | 45 |
 | Not applicable | 5 |
 | To do | 0 |
 
-Items 1 to 38 are the reference's; items 39 to 49 are what bringing the engine level with the `regex` crate added.
+Items 1 to 38 are the reference's; items 39 to 50 are what bringing the engine level with the `regex` crate added.
 
 ## Section 4.2: the program and the working memory
 
@@ -47,7 +47,7 @@ Items 1 to 38 are the reference's; items 39 to 49 are what bringing the engine l
 | 22 | The long s and the Kelvin sign, whose UTF-8 is longer than s and k, looked for apart | done | Another way: they are forms like any other in the literals of the one search, which takes literals of different lengths, so nothing is looked for apart and no window is needed for them. |
 | 23 | The fingerprint search's positions chosen by rarity, beyond ASCII the bytes that tell the literals apart | not applicable | `aho-corasick` chooses the bytes Teddy looks at (the first bytes of each literal); this port uses the crate as it is. |
 | 24 | The first set found by a vectorised search for its units | done | Over UTF-8: `memchr` for up to three bytes, Teddy over one-byte literals for up to sixty-four (the first set's ASCII members and the lead bytes of its other members), after a probe of sixteen bytes one at a time where they are common. |
-| 25 | The same over UTF-16 | done | `FirstUnits`: sixteen units at a time against up to four ASCII ranges and, where the first set has members beyond ASCII, every unit beyond it, in a loop the compiler makes into vector instructions, after a probe of eight units one at a time; a candidate is then tested against the first set. Several ASCII literals are searched for in the low bytes of the units packed into bytes, in chunks that grow from 64 to 4,096 units (`Literals::find_packed`), so the zero high bytes are not looked at; one literal stays with `memmem` over the units' bytes, ranked for UTF-16. |
+| 25 | The same over UTF-16 | done | `simd16.rs`, AVX2 chosen at run time with SSE2 under it: the first set's units as up to eight ranges (a member beyond the BMP as its lead surrogate, more ranges merged across the narrowest gaps, the ASCII and Latin ones last), a block of ASCII units tested against the ASCII ranges alone; single units by equality, sixty-four units a step on vector boundaries as `memchr` reads. A candidate is then tested against the first set, and the trail half of a pair is passed over. |
 | 26 | A failed start skips the rest of its leading loop's run | done | `Search::skip_run`. |
 | 27 | A start inside a word skipped where the pattern starts with `\b` and every first character is a word character | done | `Search::leading_word_boundary`. |
 | 28 | A minimum length rules out short rests | done | From the engine this crate came from (`need`). |
@@ -81,34 +81,56 @@ after each.
 | 42 | Case-insensitive anchors cut to one length by `regex`'s literal rule | done | `counts` (`Seq::optimize_by_preference`): full if ten literals or fewer, else five characters if that makes ten or fewer, else four if sixty-four or fewer, else three, two, one. Where an anchor is cut, its UTF-8 literals are cut to the bytes of the shortest (`utf8_cuts`), as `regex` cuts by bytes, so the long s and the Kelvin sign make no extra literals. |
 | 43 | Two literals by the automaton only when they start with the same rare byte | done | `Finder::new`; any other pair goes to Teddy, which looks at three bytes. |
 | 44 | A failed start of a leading loop's run passes over the occurrences in the rest of the run | done | `search_after_loops` with one loop: every occurrence in the run walks back to the start just tried. |
-| 45 | Over UTF-16, ASCII literals searched for in the packed low bytes of the units | done | Item 25. |
+| 45 | Over UTF-16, literals found by searches of the code units themselves | done | One literal: `Needle16`, the vector search for its two rarest units (ranked for UTF-16) and a compare. Up to four literals with one rare first unit: the vector search for it. Several: the low bytes of the units packed into bytes by a vector loop and searched (`Literals::find_packed`), the case forms of a case-insensitive set folded to lower case on both sides so a few literals are searched where there were many (the .NET reference's packed case-insensitive search), and the literals with the long s or the Kelvin sign looked for apart at those units, in a chunk that holds a unit beyond ASCII. The chunk packed last is kept between the searches of one global search (`find_iter`), which borrows the text, so it is not packed again. A run of a loop ends where the vector search finds a unit the loop's class leaves out. |
 | 46 | The anchor and what follows it checked at each occurrence before any start is walked back to | done | The anchored automaton of the anchors' rests (an alternation of each anchor and the terms after it, to the end of the pattern), run at each occurrence of a window or of a literal after loops, stopping at the first place a match could end (`Anchored::matches_at`). Left out where the anchor ends its alternative. `\b\w+n\b` is the row: an `n` inside a word is passed over without walking back to the word's start. |
 | 47 | The reverse automaton's table premultiplied, and the look for a nearer occurrence made without a search call on a few bytes | done | `Reverse::starts`, `Literals::find_within`. |
 | 48 | Up to four literals with one rare first byte found by `memchr` for it and a compare of each | done | `Finder::Shared`, as `regex` finds `Sherlock\|Street` (its prefilter is a `memchr` of `S`). |
 | 49 | Literals with forms written out in full answered by the search alone | done | `Shape::Literals` takes them too (`the` under the i flag is eight literals, and the search's leftmost-first match is the pattern's); an alternation of literals with forms cut short is compared at each occurrence by the anchored automaton where the text is ASCII. |
+| 50 | A pattern with no literal read once by a forward automaton, not tried at every start its first set allows | done | `adfa::build_forward`, built on the first search that wants it: the anchored automaton with a start joined at every unit behind the threads already alive, the threads of the current start kept apart so that a state with no thread of an earlier start is known. From a candidate the first set finds, it reads on to where a match first ends (the starts from the candidate to there are then tried, the first that matches being the leftmost) or to a state with no earlier thread (no match starts before it, and the first-set search goes on from there). A unit beyond ASCII hands the starts so far to the matcher. IPv4 is the row: every digit was a start. |
 
 ### The rows still above `regex`
 
-The record run at ea6a7d1 (cores 0 to 11 after a three-minute settle, load 0.07, each figure the median of five passes
-of two seconds) has this engine over UTF-8 at a median of 0.94 of `regex`'s time over the 57 rows, and above it on
-12. Ten of those are within 5%, and each of them measured at or below `regex` in at least one of the A/B runs of the
-work, whose rounds differ by that much from one to the next: `Sherlock` (1.03), `Sherlock Holmes` (1.01),
-`Sherlock Holmes` /i (1.04), `Sherlock\s+Holmes` (1.05), `Sherlock|Holmes` (1.03), `Sher[a-z]+|Hol[a-z]+` (1.05),
-`Sherlock|Holmes|Watson` (1.03), `^Sherlock Holmes|Sherlock Holmes$` /m (1.03), `Twain` (1.01) and
-`the\s+\w+` (1.00). Both engines run the same searcher on each (`memmem` or Teddy, from the same crates) and the
-profiles split the same way. Two are above by more, and neither is forced by an ECMA-262 rule:
+The record run at 7ffc43b (cores 0 to 11 after a three-minute settle, load 0.16, each figure the median of five passes
+of two seconds) has this engine over UTF-8 at a median of 0.93 of `regex`'s time over the 57 rows. The engines run
+one after another, each over every row, so a row's figures are minutes apart; on this machine (a laptop under WSL)
+that moves a row by up to 30%. Each row above `regex` in it was therefore timed again A/B, this engine and `regex`
+alternately in five rounds:
 
-| Row | This engine | `regex` | Ratio | Why |
-|---|--:|--:|--:|---|
-| `Holmes.{0,25}Watson\|Watson.{0,25}Holmes` | 69.5 us | 59.1 us | 1.18 (1.11 in the last A/B) | Both find the 542 occurrences with the same Teddy searcher and check each with an automaton. Profiled: Teddy 37.8 us here against 34.4 us in `regex` over the same bytes, the check 19.9 us against 18.1 us. After a failed occurrence this engine starts the search again at the next character, where `regex`'s lazy automaton reads on through the window and calls its search only from its start state. ECMA-262's `.` stopping at CR as well as LF makes the window shorter, not longer. |
-| IPv4 (`(?:(?:25[0-5]\|…)\.){3}…`) | 2,243.8 us | 2,078.9 us | 1.08 (1.03 to 1.05 in the A/B runs) | No literal: every one of the text's 107,073 digits is a start, and the anchored automaton runs from each (about 7 ns a start), where `regex`'s lazy automaton reads the text once unanchored. The search for the digits (Teddy over one-byte literals after a probe) takes less time here than `regex`'s. |
+| Row | Record run | A/B | Why |
+|---|--:|--:|---|
+| `Tom.{10,25}river\|river.{10,25}Tom` | 1.31 | 1.02 | Level: 1,160.9 against 1,135.1 us in the A/B, 1,142 against 1,238 us run by the harness over the Leipzig rows alone. |
+| `([A-Za-z]awyer\|[A-Za-z]inn)\s` | 1.25 | 0.96 | Level, as above (981.0 against 1,020.8 us). |
+| `Шерлок Холмс`, `夏洛克·福尔摩斯` | 1.12, 1.10 | 0.96, 0.98 | Level in the A/B and in the run before. |
+| `Holmes.{0,25}Watson\|Watson.{0,25}Holmes` | 1.08 | 1.06 to 1.19 | Both find the 542 occurrences with the same Teddy searcher and check each with an automaton; Teddy takes 37.8 us here against 34.4 us in `regex`, the check 19.9 against 18.1 us. Reading on through the window after a failed occurrence, as `regex`'s lazy automaton does, was tried two ways and both were slower: looking at the window's units for a literal's first byte before calling the search (62.9 to 68.9 us over UTF-8, 88 to 138 us over UTF-16) and running the forward automaton (item 50) from each occurrence (1.12 times the time). Not an ECMA-262 rule. |
+| `Sherlock\s+Holmes` | 1.08 | 1.03 to 1.10 | One `memmem` search for `Sherlock` and the automaton at each of its 97 occurrences, as `regex` does; 80% of both profiles is the same `memmem`. |
+| 14 rows from 1.00 to 1.05 | | at or below 1.0 in at least one A/B | The same searchers as `regex` on each. |
+
+IPv4, above `regex` before the forward automaton, is now 0.88 to 0.94 of it.
+
+### UTF-16 against UTF-8
+
+In the record run the median row over UTF-16 takes 1.5 times its UTF-8 time; the Russian and Chinese rows, where UTF-16
+is the shorter encoding, take 0.66 to 1.0 of it. The rows over 2 are those whose UTF-16 text leaves a level of cache
+its UTF-8 text fits in, measured here as one `memchr` pass over buffers of the texts' sizes:
+
+| Text | UTF-8 | UTF-16 | One read of the UTF-8 size | One read of the UTF-16 size | Rows (UTF-16/UTF-8) |
+|---|--:|--:|--:|--:|---|
+| Leipzig | 16 MB, in the 24 MB L3 cache | 32 MB, beyond it | 389 us | 1,948 us (5.0 times) | all eleven, 1.9 to 3.0: `Twain` 2.82, `\p{Sm}` 3.01 |
+| mariomka | 6.8 MB | 13.6 MB | 99 us | 277 us (2.8 times) | `[\w\.+-]+@…` 2.12 |
+| Sherlock | 0.6 MB, in the 1.25 MB L2 cache of a core | 1.2 MB, at its edge | 4.8 us | 11.0 us (2.3 times) | `Sherlock\|Street` 2.50, `.*` 2.21 |
+
+Every Leipzig row over UTF-16 is within 1.0 to 1.5 times the 1,948 us it takes to read the text once. Before this work
+the case-insensitive rows over UTF-16 were 5 to 9 times their UTF-8 time (`Sher[a-z]+\|Hol[a-z]+` /i 626 against
+76 us) and `\p{Sm}` 5.3 times; they are now 1.0 to 1.9 times, and `\p{Sm}` is within 1.5 times one read of the text.
 
 Tried and taken out, each slower on the rows it was for: a search that folds case in place of the written-out forms;
 the long s and the Kelvin sign looked for apart (item 22's reference way); an unanchored forward automaton with a
 backward one to find the start (no row gained); budgets of 64 literals shared round the anchors, and anchors of four
 characters; Teddy for `Sherlock|Street` (3.4 times slower than `memchr` for `S`); the byte cut of a literal inside a
 character (the Cyrillic letters with a three-byte form, 1.2 times slower); the anchored automaton for the forms of one
-literal (`the` /i, 1.1 times slower than comparing them).
+literal (`the` /i, 1.1 times slower than comparing them); over UTF-16, the case forms of a set packed as their own bytes
+(Teddy with 32 literals in eight buckets took 24 ms on the Leipzig text against 3.8 ms in sixteen, and folding the
+packed text to lower case beat both) and a separate kernel for one unit before the loads were aligned.
 
 ## The search layer, step by step
 

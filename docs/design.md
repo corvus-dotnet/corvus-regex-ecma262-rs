@@ -48,10 +48,11 @@ has these searches in crates every Rust program already depends on, so this port
 - three literals or more, and the forms of a case-insensitive literal: `aho-corasick`'s packed searcher, Teddy;
 - the first set over UTF-8: `memchr` for up to three bytes, Teddy over one-byte literals for up to sixty-four.
 
-Over UTF-16 one literal is found by `memmem` over the bytes of the code units, ranked for UTF-16, and an occurrence at
-an odd byte offset is passed over. Several ASCII literals are found in the low bytes of the units packed into bytes,
-in chunks that grow from 64 to 4,096 units, so the zero high bytes are never looked at. The first set is tested
-sixteen units at a time against up to four ASCII ranges.
+Over UTF-16 the searches read the code units themselves (`simd16.rs`, AVX2 chosen at run time, SSE2 under it): one
+literal by the vector search for its two rarest units, the first set by up to eight unit ranges, a run of a loop to the
+first unit its class leaves out, and several literals in the low bytes of the units packed into bytes, a case-insensitive
+set folded to lower case so that a few literals are searched where there were many, the long s and the Kelvin sign
+looked for apart. The chunk packed last is kept between the searches of one global search.
 
 What is searched for is worked out from the syntax tree once (`search.rs`): an anchor is a literal, each character of
 which may have several forms, that every alternative holds at a known or bounded number of characters from its start.
@@ -75,7 +76,10 @@ unit beyond ASCII:
   backtracking order would;
 - the terms before a window's anchors are read backwards from each occurrence (the `regex` crate's reverse search),
   so only the starts they allow are tried, and the anchored automaton of the anchor and what follows it is run at the
-  occurrence first, so an occurrence nothing can follow is passed over before any start is walked back to.
+  occurrence first, so an occurrence nothing can follow is passed over before any start is walked back to;
+- for a pattern with no literal, a forward automaton (the anchored one with a start joined at every unit) reads the
+  text once from each candidate its first set finds, to where a match first ends or no thread of an earlier start is
+  left, so the starts are tried only where a match is known to begin.
 
 The simple shapes (a literal, an alternation of literals with or without forms, one class, one unbounded loop of a
 class) are answered by the search alone, and a run of `.` is one `memchr3` for the line terminators.
