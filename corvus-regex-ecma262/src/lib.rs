@@ -168,7 +168,7 @@ fn read(pattern: &str) -> Result<(parse::Node, Facts, parse::Parser), Error> {
     Ok((root, facts, ps))
 }
 
-/// The number of groups a pattern may open and still be read on the stack of the thread that asks.
+/// The number of groups and classes a pattern may open and still be read on the stack of the thread that asks.
 const SHALLOW: usize = 32;
 
 /// The stack of the thread that reads a pattern with more groups than that. The parser, the compiler and the
@@ -200,9 +200,12 @@ pub(crate) fn deep<T: Send>(work: impl FnOnce() -> T + Send) -> Option<T> {
     })
 }
 
-/// Whether a pattern opens few enough groups to be read on the stack of the thread that asks.
+/// Whether a pattern opens few enough groups and classes to be read on the stack of the thread that asks. A class of
+/// the v flag's grammar may hold a class, and the parser goes a level deeper for each, as it does for a group, so a
+/// `[` counts as a `(` does. In the other grammars a `[` opens no level, and counting it only sends a pattern with
+/// many of them to the deep stack, which is safe.
 pub(crate) fn shallow(pattern: &str) -> bool {
-    pattern.bytes().filter(|&b| b == b'(').count() <= SHALLOW
+    pattern.bytes().filter(|&b| b == b'(' || b == b'[').count() <= SHALLOW
 }
 
 /// The error of a pattern that nests deeply when no thread could be started to read it: the pattern is refused as
