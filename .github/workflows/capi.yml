@@ -109,8 +109,13 @@ jobs:
         run: |
           $unpacked = Join-Path (Resolve-Path ..).Path "unpacked"
           New-Item -ItemType Directory -Force $unpacked | Out-Null
-          if ($IsWindows) { Expand-Archive -Path $env:CRE_ARCHIVE -DestinationPath $unpacked } else { tar -xzf $env:CRE_ARCHIVE -C $unpacked }
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if ($IsWindows) {
+            # A cmdlet, which throws on a failure (and sets no exit code).
+            Expand-Archive -Path $env:CRE_ARCHIVE -DestinationPath $unpacked
+          } else {
+            tar -xzf $env:CRE_ARCHIVE -C $unpacked
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
           Add-Content $env:GITHUB_ENV "CRE_UNPACKED=$(Join-Path $unpacked $env:CRE_PACKAGE_NAME)"
       - name: The smoke test against the archive
         if: ${{ !matrix.container }}
