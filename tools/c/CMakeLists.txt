@@ -1,20 +1,26 @@
-# The C tools: the data-set runner over the C library (dataset), and with CRE_QUICKJS the same runner over QuickJS's
-# libregexp (dataset-quickjs). Each is a C program that includes corvus_regex_ecma262.h and links the library as a
+# The C tools: the data-set runner over the C library (dataset), with CRE_QUICKJS the same runner over QuickJS's
+# libregexp (dataset-quickjs), and with CRE_BENCH the Industry benchmark harness (industry, POSIX only) over the C
+# library, libregexp and PCRE2. Each is a C program that includes corvus_regex_ecma262.h and links the library as a
 # consumer does:
 #
 #   cargo build --release -p corvus-regex-ecma262-capi
-#   cmake -S tools/c -B build/tools -DCRE_LIB_DIR=$PWD/target/release [-DCRE_QUICKJS=ON]
+#   cmake -S tools/c -B build/tools -DCRE_LIB_DIR=$PWD/target/release [-DCRE_QUICKJS=ON] [-DCRE_BENCH=ON]
 #   cmake --build build/tools --config Release
 #   build/tools/bin/dataset <ecma262-regex-test-data>/data wrong-cases-c.tsv
 #
 # With CRE_PREFIX (an unpacked release archive) instead of CRE_LIB_DIR, the library is the archive's, found through
-# its CMake package. QuickJS is quickjs-ng at a pinned release (QUICKJS_URL), downloaded at configure time.
+# its CMake package. QuickJS is quickjs-ng and PCRE2 is PCRE2, each at a pinned release (QUICKJS_URL, PCRE2_URL),
+# downloaded at configure time.
 cmake_minimum_required(VERSION 3.24)
 project(corvus_regex_ecma262_tools C)
 
 set(CRE_LIB_DIR "" CACHE PATH "The directory with the library cargo built (target/release)")
 set(CRE_PREFIX "" CACHE PATH "An unpacked release archive, used through its CMake package")
 option(CRE_QUICKJS "Build the runner over QuickJS's libregexp too" OFF)
+option(CRE_BENCH "Build the Industry benchmark harness (with QuickJS and PCRE2)" OFF)
+if(CRE_BENCH)
+  set(CRE_QUICKJS ON)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -94,3 +100,24 @@ if(CRE_QUICKJS)
   target_compile_options(dataset-quickjs PRIVATE ${warnings})
 endif()
 
+if(CRE_BENCH)
+  # PCRE2 with its JIT, from the release's own archive (which carries the JIT's sources).
+  set(PCRE2_URL "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.49/pcre2-10.49.tar.gz")
+  set(PCRE2_SHA256 "929f0b20e62879252a15886b06c89f1edef61a363cbd5826fb041080a5e557ae")
+  set(PCRE2_SUPPORT_JIT ON CACHE BOOL "" FORCE)
+  set(PCRE2_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(PCRE2_BUILD_PCRE2GREP OFF CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+  FetchContent_Declare(pcre2 URL "${PCRE2_URL}" URL_HASH SHA256=${PCRE2_SHA256} DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(pcre2)
+  add_executable(industry industry.c)
+  target_compile_definitions(industry PRIVATE "QUICKJS_VERSION=\"${QUICKJS_VERSION} (quickjs-ng)\"")
+  target_link_libraries(industry PRIVATE cre_tools_json quickjs_regexp pcre2-8-static ${cre_library} m)
+  target_compile_options(industry PRIVATE ${warnings})
+  get_target_property(cre_location ${cre_library} IMPORTED_LOCATION)
+  if(cre_location)
+    get_filename_component(cre_location_dir "${cre_location}" DIRECTORY)
+    set_target_properties(industry PROPERTIES BUILD_RPATH "${cre_location_dir}")
+  endif()
+endif()

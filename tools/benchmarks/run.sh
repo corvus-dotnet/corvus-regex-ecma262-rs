@@ -26,13 +26,9 @@ workloads="$(abs "${1:?workloads.json}")"
 texts="$(mkdir -p "${2:?texts directory}" && cd "$2" && pwd)"
 out_file="$(abs "${3:?out.json}")"
 data="${4:-}"
-# The interleaved protocol (tools/src/bin/industry.rs): ROUNDS rounds, each figure SECONDS_EACH seconds of PASSES
-# passes in a process of its own; a figure whose rounds spread over SPREAD is listed in the run's facts.
-if [ "${JOB:-}" = short ]; then d_rounds=3 d_seconds=0.1 d_passes=1; else d_rounds=7 d_seconds=0.3 d_passes=3; fi
-rounds="${ROUNDS:-$d_rounds}"
-seconds="${SECONDS_EACH:-$d_seconds}"
-passes="${PASSES:-$d_passes}"
-spread="${SPREAD:-0.05}"
+# The interleaved protocol (tools/src/bin/industry.rs): its numbers are in tools/benchmarks/protocol.sh, shared with
+# the C harness.
+. "$here/tools/benchmarks/protocol.sh"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 timed() { if [ -n "${CORES:-}" ]; then taskset -c "$CORES" "$@"; else "$@"; fi; }

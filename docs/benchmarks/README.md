@@ -79,3 +79,28 @@ docker run --rm -v <workloads.json>:/workloads.json:ro -v <texts dir>:/texts:ro 
 
 writes `<out dir>/industry.json`; the test data is cloned inside unless its `data/` directory is mounted at `/data`,
 and `-e JOB=short` makes a quick look of it.
+
+## From C
+
+The C library has a harness of its own, in C (`tools/c/industry.c`, driven by `tools/c/run.sh`), under the same
+protocol and writing the same data file, with the engines a C program would choose between: the C library over UTF-8
+and over UTF-16 (through its header, a global search made once per text and reset for each count), QuickJS's
+`libregexp` (quickjs-ng 0.17.0, an ECMA-262 engine in C, over the text as QuickJS holds a string: 8-bit when every
+character is Latin-1, UTF-16 otherwise), PCRE2 10.49 with its JIT (not ECMA-262: the pattern as it is in UTF mode with
+the flags i, m and s, its row marked where its count differs from V8's) and V8. The C library and libregexp run with
+the workload's flags and `u`.
+
+Their compliance comes from the C data-set runner (`tools/c/dataset.c`), a C program that judges the C library through
+its header exactly as `tools/src/bin/dataset.rs` judges the crate, with the same counts, and judges `libregexp` the way
+the Rust runner judges regress: over UTF-16 alone (it has no UTF-8 interface), with the global search, replace and
+split written over its exec, each match given 2 seconds and 256 MB. QuickJS's compliance is worked out once and kept in
+`tools/c/compliance-quickjs.txt`, since many patterns take libregexp to its limit and the run takes some tens of
+minutes (`QUICKJS_COMPLIANCE=1` works it out again).
+
+The C image, `ghcr.io/corvus-dotnet/corvus-regex-ecma262-c` (`tools/c/Dockerfile`, published by
+`.github/workflows/c-harness-image.yml` as the Rust image is), has the same entry point contract, and the central site
+runs it as a source of its own:
+
+```sh
+docker run --rm -v <workloads.json>:/workloads.json:ro -v <texts dir>:/texts:ro -v <out dir>:/out ghcr.io/corvus-dotnet/corvus-regex-ecma262-c:latest
+```

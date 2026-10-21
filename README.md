@@ -72,7 +72,9 @@ return `MatchError` when it is reached.
 ### From C
 
 The `corvus-regex-ecma262-capi` crate builds `libcorvus_regex_ecma262` (shared and static), with the header
-`corvus-regex-ecma262-capi/include/corvus_regex_ecma262.h`, which documents every function. Each member of `Regex`
+`corvus-regex-ecma262-capi/include/corvus_regex_ecma262.h`, which documents every function; each GitHub release has
+an archive of them for each platform, with a CMake package (`find_package(corvus_regex_ecma262)`) and a pkg-config
+file. Each member of `Regex`
 has its C function, over UTF-8 and (with the suffix `_utf16`) over UTF-16: `is_match`, `find`, the groups by number
 (into a buffer the caller owns) and by name (into a reusable `cre_captures`), the global search (`cre_matches`),
 `replace` and `replace_all` with every `$` form, and `split`, each matching function with a `_limit` form that takes
@@ -131,7 +133,10 @@ beside its figures: see [docs/benchmarks](docs/benchmarks/README.md), and the re
 ## Repository
 
 - `corvus-regex-ecma262`: the crate.
-- `corvus-regex-ecma262-capi`: the C library, its header and a smoke test in C.
+- `corvus-regex-ecma262-capi`: the C library, its header, a smoke test in C and `package.ps1`, which lays out a release
+  archive (the header, the shared and the static library, a CMake package and a pkg-config file).
+- `tools/c`: the C tools over the C library, each a C program that links it through its header: the data-set runner
+  (`dataset`, and `dataset-quickjs` over QuickJS's libregexp) and the benchmark harness (`tools/c/run.sh`).
 - `tools`: the data-set runner (`cargo run --release --bin dataset -- <data dir> <wrong.tsv> [--engine regress]`) and
   the benchmark harness (`tools/benchmarks/run.sh`, over `cargo run --release --bin industry`).
 - `docs/design.md`: what differs from the .NET reference engine and why; `docs/port-checklist.md`: each optimisation
@@ -139,11 +144,16 @@ beside its figures: see [docs/benchmarks](docs/benchmarks/README.md), and the re
 
 ## Releasing
 
-Bump `version` in `corvus-regex-ecma262/Cargo.toml`, push it, and publish a GitHub release tagged `v<version>` on that
-commit. The release runs two workflows: `crates-publish.yml` tests the crate, runs the ECMA-262 test data and publishes
-it to crates.io by trusted publishing (no token is stored), and `harness-image.yml` publishes the benchmark image under
-the release's tag, which the central benchmark page runs from that night. A tag that does not match the version fails
-the publish.
+Bump `version` in `corvus-regex-ecma262/Cargo.toml` and in `corvus-regex-ecma262-capi/Cargo.toml` (the C library's
+version is the engine's, with `CRE_VERSION_*` in its `src/lib.rs` and header; a test checks they agree), push it, and
+publish a GitHub release tagged `v<version>` on that commit. The one release carries everything, through four
+workflows: `crates-publish.yml` tests the crate, runs the ECMA-262 test data and publishes it to crates.io by trusted
+publishing (no token is stored); `capi-publish.yml` builds the C library's archives for Linux (x64 and arm64, glibc and
+musl), macOS (arm64 and x64) and Windows (x64 and arm64), tests each by building the smoke test against it, and
+attaches them to the release; and `harness-image.yml` and `c-harness-image.yml` publish the benchmark images under the
+release's tag, which the central benchmark page runs from that night. A tag that does not match the version fails the
+publish. `capi-publish.yml` can also be run by hand with a tag, to attach the archives to a release made before it
+existed; it refuses when the engine's sources have changed since that tag.
 
 ## Licence
 
