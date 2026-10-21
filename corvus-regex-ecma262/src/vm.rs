@@ -232,6 +232,16 @@ impl State {
     }
 }
 
+/// The first place at or after `at` that the window `skip` does not rule out: one unit read rules out the starts of a
+/// window none of whose positions it can be. A call of its own, so that the search it is part of keeps its size.
+#[inline(never)]
+fn skip_ahead<T: Text>(skip: &super::adfa::Skip, input: &[T::Unit], mut at: usize) -> usize {
+    while at + skip.hi < input.len() && !skip.hit(input[at + skip.hi].into()) {
+        at += skip.len;
+    }
+    at
+}
+
 /// Whether a position of UTF-16 text is between the halves of a pair.
 #[inline]
 fn mid_pair(units: &[u16], at: usize) -> bool {
@@ -979,6 +989,9 @@ impl Program {
         let bytes = T::bytes(input);
         let units16 = T::units16(input);
         loop {
+            if let Some(skip) = &self.skip {
+                at = skip_ahead::<T>(skip, input, at);
+            }
             if let Some(fb) = first_bytes {
                 // Every match starts with a member of the first set, which starts with one of these bytes.
                 at = fb.find(bytes, at)?;

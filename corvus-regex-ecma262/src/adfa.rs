@@ -44,13 +44,15 @@ enum Kind {
 struct State {
     kind: Kind,
     set: [u64; 2],
+    /// Whether the set holds a character beyond ASCII, which the automaton gives up at.
+    wide: bool,
     out: usize,
     alt: usize,
 }
 
 impl State {
     fn new(kind: Kind, out: usize) -> State {
-        State { kind, set: [0; 2], out, alt: 0 }
+        State { kind, set: [0; 2], wide: false, out, alt: 0 }
     }
 }
 
@@ -86,9 +88,12 @@ impl Builder {
                 if (0..128).contains(&n.r) {
                     set[(n.r >> 6) as usize] = 1 << (n.r & 63);
                 }
-                self.add(State { set, ..State::new(Kind::Set, next) })
+                self.add(State { set, wide: n.r >= 128, ..State::new(Kind::Set, next) })
             }
-            NodeKind::Set => self.add(State { set: n.class().ascii, ..State::new(Kind::Set, next) }),
+            NodeKind::Set => {
+                let wide = n.class().ranges.last().is_some_and(|&hi| hi >= 128);
+                self.add(State { set: n.class().ascii, wide, ..State::new(Kind::Set, next) })
+            }
             NodeKind::Cat => {
                 for sub in n.subs.iter().rev() {
                     next = self.compile(sub, next);
@@ -380,6 +385,114 @@ impl Det<'_> {
 
 fn is_word(c: usize) -> bool {
     is_word_byte(c as u8)
+}
+
+/// The positions of a pattern read before a match can end: V8's Boyer-Moore lookahead (`BoyerMooreLookahead` in its
+/// regexp compiler). For a window of positions `lo..=hi` of every match, the units each can be (`table` for ASCII,
+/// `wide` for any other) are joined; a unit at `hi` from a place that is none of them rules out the starts from that
+/// place to `hi - lo` units on, so the search reads one unit in `hi - lo + 1` where the window's units are rare.
+#[derive(Clone, Debug)]
+pub(crate) struct Skip {
+    /// The window's last position, the one read.
+    pub(crate) hi: usize,
+    /// The starts one unit rules out, `hi - lo + 1`.
+    pub(crate) len: usize,
+    table: [bool; 128],
+    wide: bool,
+}
+
+impl Skip {
+    /// Whether the unit can be at some position of the window.
+    #[inline(always)]
+    pub(crate) fn hit(&self, c: u32) -> bool {
+        if c < 128 { self.table[c as usize] } else { self.wide }
+    }
+}
+
+/// The most positions looked at for a window.
+const SKIP_POSITIONS: usize = 16;
+
+/// How often a unit is found in text, roughly: what a window's worth is reckoned by.
+fn frequency(c: usize) -> f64 {
+    match c as u8 {
+        b' ' => 0.15,
+        b'a'..=b'z' => 0.06,
+        b'\n' | b'\r' | b'.' | b',' => 0.015,
+        b'A'..=b'Z' | b'0'..=b'9' => 0.004,
+        _ => 0.003,
+    }
+}
+
+/// The window of a tree (after `simplify`) worth reading one unit of instead of every unit, or `None`: the units each
+/// position before a match can end can be, from the pattern's automaton without its determinisation, and the window
+/// whose units are rare enough that one unit read passes over three starts or more, reckoned by `frequency`.
+pub(crate) fn skip_window(root: &Node) -> Option<Skip> {
+    let mut b = Builder { states: Vec::new(), failed: false };
+    let match_ = b.add(State::new(Kind::Match, 0));
+    let start = b.compile(root, match_);
+    if b.failed {
+        return None;
+    }
+    let nfa = &b.states[..];
+    // The states each depth's threads are at, assertions taken as passed (they only rule threads out).
+    let closure = |from: &[usize]| -> Option<Vec<usize>> {
+        let (mut seen, mut stack, mut sets) = (vec![false; nfa.len()], from.to_vec(), Vec::new());
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut seen[i], true) {
+                continue;
+            }
+            match nfa[i].kind {
+                // A match can end here: no later position is known.
+                Kind::Match => return None,
+                Kind::Set => sets.push(i),
+                Kind::Split => stack.extend([nfa[i].out, nfa[i].alt]),
+                Kind::Bol | Kind::Eol | Kind::Word | Kind::NotWord => stack.push(nfa[i].out),
+            }
+        }
+        Some(sets)
+    };
+    let mut positions: Vec<([bool; 128], bool)> = Vec::new();
+    let mut threads = vec![start];
+    while positions.len() < SKIP_POSITIONS {
+        let Some(sets) = closure(&threads) else { break };
+        let (mut table, mut wide) = ([false; 128], false);
+        for &i in &sets {
+            for (c, slot) in table.iter_mut().enumerate() {
+                *slot |= (nfa[i].set[c >> 6] >> (c & 63)) & 1 == 1;
+            }
+            wide |= nfa[i].wide;
+        }
+        positions.push((table, wide));
+        // A character beyond ASCII takes more than one unit of UTF-8: the positions after it are not known.
+        if wide {
+            break;
+        }
+        threads = sets.iter().map(|&i| nfa[i].out).collect();
+    }
+    let mut best: Option<(f64, usize, usize)> = None;
+    for lo in 0..positions.len() {
+        let (mut table, mut wide) = ([false; 128], false);
+        for (hi, (t, w)) in positions.iter().enumerate().skip(lo) {
+            for c in 0..128 {
+                table[c] |= t[c];
+            }
+            wide |= w;
+            let p: f64 = (0..128).filter(|&c| table[c]).map(frequency).sum::<f64>() + if wide { 0.1 } else { 0.0 };
+            let worth = (hi - lo + 1) as f64 * (1.0 - p.min(1.0));
+            if worth >= 3.0 && best.is_none_or(|(w, _, _)| worth > w) {
+                best = Some((worth, lo, hi));
+            }
+        }
+    }
+    let (_, lo, hi) = best?;
+    let (mut table, mut wide) = ([false; 128], false);
+    for (t, w) in &positions[lo..=hi] {
+        for c in 0..128 {
+            table[c] |= t[c];
+        }
+        wide |= w;
+    }
+    Some(Skip { hi, len: hi - lo + 1, table, wide })
 }
 
 /// Builds the anchored automaton of a tree (after `simplify`), or `None` when the pattern has none.

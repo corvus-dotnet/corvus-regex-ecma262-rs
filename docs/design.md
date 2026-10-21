@@ -84,7 +84,8 @@ unit beyond ASCII:
   occurrence first, so an occurrence nothing can follow is passed over before any start is walked back to;
 - for a pattern with no literal, a forward automaton (the anchored one with a start joined at every unit) reads the
   text once from each candidate its first set finds, to where a match first ends or no thread of an earlier start is
-  left, so the starts are tried only where a match is known to begin.
+  left, so the starts are tried only where a match is known to begin; before the first set is searched for, a window
+  of positions whose units are rare is read one unit at a time, V8's Boyer-Moore lookahead (`adfa::Skip`).
 
 The simple shapes (a literal, an alternation of literals with or without forms, one class, one unbounded loop of a
 class) are answered by the search alone, and a run of `.` is one `memchr3` for the line terminators.

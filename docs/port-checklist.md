@@ -8,7 +8,7 @@ here, and the plan leaves it out. Where this port does a thing another way, the 
 
 | Count | |
 |---|---|
-| Done | 48 |
+| Done | 49 |
 | Not applicable | 5 |
 | To do | 0 |
 
@@ -155,6 +155,7 @@ wrong after each.
 |---|---|---|---|
 | 52 | A few literals found by two of their byte positions, each holding one or two values, compared over a vector of starts (PCRE2's `fast_forward_char_pair_simd`) | done | `pair8.rs`, `Finder::Pair`: the positions are the rarest pair (by `memchr`'s table of byte frequencies) whose values are apart, a position whose two values differ in one bit (the cases of an ASCII letter, the lead bytes of a Cyrillic letter's cases) compared once with that bit set; the kernel gives the block of the first candidates and they are compared out of its loop, which keeps it in registers, and a word's cases written out are known a literal once the bytes pass the sets of each position. Where the two positions hold common bytes the fingerprint search is kept (`Tom\|river` took 1.24 times its time, `[A-Za-z]awyer\|[A-Za-z]inn` 4.3 times). `Sherlock\|Holmes` 47 to 25 us (PCRE2 29), `Sher[a-z]+\|Hol[a-z]+` 46 to 34 (36), `Holmes.{0,25}Watson\|...` 67 to 39 (35), `Holmes` /i 51 to 27 (43), `the` /i 287 to 199 (247), `Twain` /i 1,247 to 925 (936), `Шерлок Холмс` /i 170 to 88 (82). |
 | 53 | One literal with a byte rare in text found by `memchr` for that byte, as V8 searches a literal pattern for its first character | done | `Finder::Rare`, for a literal holding one of `ZXQKVJzqjx` (one in a thousand bytes of English text or fewer), the rarest of them: `memchr` reads a block at twice the speed of `memmem`'s search for the two rarest bytes, which is kept for every other literal (a capital letter, one in five hundred, is found too often over the Leipzig text, read from memory: `Holmes` 777 us against 651). `zqj` 14.6 to 5.5 us (V8 5.3), `aqj` 14.6 to 6.8 (V8 204). |
+| 54 | A window of positions read one unit at a time before the first set is searched for (V8's Boyer-Moore lookahead, `BoyerMooreLookahead` in its regexp compiler) | done | `adfa::Skip`, for a pattern the forward automaton reads (item 50): the units each position can be before a match can end, from the pattern's automaton without its determinisation (ASCII sets and whether a character beyond ASCII can be there, the positions after such a character not known), and the window whose units are rare enough by a rough table of text frequencies that one unit read passes over three starts or more. A unit at the window's end that none of its positions can be rules out the starts of the window. IPv4 is the row: its first set, the digits, is one byte in sixty of the mariomka text, and its window is eleven positions of digits and dots, so one byte in eleven is read where no digit or dot is near: 1,856 to 682 us over UTF-8 (V8 739), 2,020 to 832 over UTF-16. The window is boxed, and the loop is a call of its own: kept inline, the program's other fields moved and the shapes' loops took 1.05 to 1.15 times their time. |
 
 ## The search layer, step by step
 

@@ -1687,6 +1687,15 @@ fn the_searches_find_what_every_position_finds() {
         (r"(|([^a]|[^a][^a]){2,4}){2}(\3){3,5}?x", ""),
         (r"[^a]{0,3}(?:xx|x)", ""),
         (r"\s[a-zA-Z]{0,12}ing\s", ""),
+        // A window of positions read one unit at a time (`adfa::Skip`).
+        (r"\d{3}-\d{4}", ""),
+        (r"[0-9]+\.[0-9]+", ""),
+        (r"(?:\d+\.){3}\d+", ""),
+        (r"\b\d\d:\d\d\b", ""),
+        (r"[A-Z]{2}\d{2}", ""),
+        (r"(?:1|22|333)\.5\.\d", ""),
+        (r"\d{2}[é5]\d", "u"),
+        (r"\d{3}[éèêë5]", "u"),
     ];
     let alphabet = [
         "a",
@@ -1740,6 +1749,15 @@ fn the_searches_find_what_every_position_finds() {
         "夏洛克",
         "abc",
         "de",
+        "0",
+        "25",
+        "255.",
+        "192.168.",
+        "333.5.",
+        "12:34",
+        "555-1234",
+        "AB12",
+        "123é",
     ];
     let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
     let mut next = move || {

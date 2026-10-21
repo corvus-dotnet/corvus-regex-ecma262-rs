@@ -181,6 +181,9 @@ pub(crate) struct Program {
     /// (see `adfa::build_forward`) is built on the first search that wants it.
     pub forward_root: Option<Box<Node>>,
     pub forward: std::sync::OnceLock<Option<Box<super::adfa::Anchored>>>,
+    /// For the same patterns, the window of positions read one unit at a time before the first set is searched for
+    /// (see `adfa::Skip`), boxed so that the program's fields keep their places.
+    pub skip: Option<Box<super::adfa::Skip>>,
 }
 
 struct Compiler {
@@ -255,6 +258,7 @@ pub(crate) fn compile_program(root: Node, unicode: bool, groups: Option<usize>) 
         search: super::search::Search::default(),
         anchored_dfa: None,
         forward_root: None,
+        skip: None,
         forward: std::sync::OnceLock::new(),
     };
     if p.groups == 0 && !backrefs {
@@ -283,6 +287,7 @@ pub(crate) fn compile_program(root: Node, unicode: bool, groups: Option<usize>) 
             && matches!(p.search.shape, super::search::Shape::None)
         {
             p.forward_root = Some(Box::new(root.clone()));
+            p.skip = super::adfa::skip_window(&root).map(Box::new);
         }
     }
     p
