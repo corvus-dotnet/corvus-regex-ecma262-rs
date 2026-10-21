@@ -6,7 +6,9 @@
 # - A published release attaches them to itself, built from the release's commit.
 # - A manual run (workflow_dispatch) attaches them to the existing release named by its tag input, built from main,
 #   for a release made before this workflow existed. It refuses when the engine's sources on main differ from the
-#   tag's, so the archives always carry that release's engine. Uploading replaces archives of the same names.
+#   tag's, so the archives always carry that release's engine. An archive the release already has is kept, since the
+#   packages that download it record its hash; only those it lacks (such as the XCFramework, added after 0.1.1) are
+#   uploaded.
 name: capi-publish
 on:
   release:
@@ -84,18 +86,29 @@ jobs:
           path: archives
           merge-multiple: true
       - name: Check the archives
-        # One per platform: Linux x64 and arm64 with glibc and musl, macOS arm64 and x64, Windows x64 and arm64.
+        # One per platform (Linux x64 and arm64 with glibc and musl, macOS arm64 and x64, Windows x64 and arm64), and
+        # the XCFramework for Swift packages with its SwiftPM checksum.
         run: |
           ls -l archives
-          [ "$(ls archives | wc -l)" -eq 8 ]
+          [ "$(ls archives | wc -l)" -eq 10 ]
       - name: Attach
+        # Only what the release does not have yet: an archive already attached keeps its bytes, since packages that
+        # download it (the C++ library's, vcpkg's, Conan's, Swift's) record its hash.
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.version.outputs.tag }}
         run: |
-          gh release upload "$TAG" archives/* --repo "$GITHUB_REPOSITORY" --clobber
+          have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
           {
-            echo "### The C archives are attached to $TAG"
+            echo "### The C archives of $TAG"
             echo
-            ls archives | sed 's/^/- /'
           } >> "$GITHUB_STEP_SUMMARY"
+          for f in archives/*; do
+            name=$(basename "$f")
+            if printf '%s\n' "$have" | grep -qxF "$name"; then
+              echo "- $name (already attached, kept)" >> "$GITHUB_STEP_SUMMARY"
+            else
+              gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"
+              echo "- $name (attached)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
