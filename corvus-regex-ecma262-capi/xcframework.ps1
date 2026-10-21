@@ -51,7 +51,9 @@ try {
         "ios"           = @("aarch64-apple-ios")
         "ios-simulator" = @("aarch64-apple-ios-sim", "x86_64-apple-ios")
     }
-    $work = Join-Path "target" "xcframework"
+    # Cargo's target directory: the workspace's, not this crate's.
+    $target = (Invoke-Native "cargo" @("metadata", "--format-version", "1", "--no-deps") | Out-String | ConvertFrom-Json).target_directory
+    $work = Join-Path $target "xcframework"
     if (Test-Path $work) { Remove-Item $work -Recurse -Force }
     $headers = Join-Path $work "include"
     New-Item -ItemType Directory -Force $headers | Out-Null
@@ -68,7 +70,7 @@ try {
         $libraries = foreach ($t in $slices[$slice]) {
             Write-Host "Building the static library for $t"
             Invoke-Native "cargo" @("rustc", "--lib", "--crate-type", "staticlib", "--release", "--locked", "--target", $t) | Out-Null
-            Join-Path "target" $t "release" "libcorvus_regex_ecma262.a"
+            Join-Path $target $t "release" "libcorvus_regex_ecma262.a"
         }
         $library = Join-Path $work $slice "libcorvus_regex_ecma262.a"
         New-Item -ItemType Directory -Force (Split-Path $library) | Out-Null
