@@ -184,6 +184,10 @@ pub(crate) struct Program {
     /// For the same patterns, the window of positions read one unit at a time before the first set is searched for
     /// (see `adfa::Skip`), boxed so that the program's fields keep their places.
     pub skip: Option<Box<super::adfa::Skip>>,
+    /// For a pattern every match of which starts with one literal (a window at distance 0 of one literal over UTF-8),
+    /// the anchored automaton's states after it (see `adfa::Anchored::after`) and its length: an occurrence goes on
+    /// from there, its units not read again.
+    pub after_literal: Option<Box<([u32; 4], usize)>>,
 }
 
 struct Compiler {
@@ -259,6 +263,7 @@ pub(crate) fn compile_program(root: Node, unicode: bool, groups: Option<usize>) 
         anchored_dfa: None,
         forward_root: None,
         skip: None,
+        after_literal: None,
         forward: std::sync::OnceLock::new(),
     };
     if p.groups == 0 && !backrefs {
@@ -274,6 +279,11 @@ pub(crate) fn compile_program(root: Node, unicode: bool, groups: Option<usize>) 
             }
         }
         p.search = super::search::plan(&root, backrefs, p.first.as_ref(), !unicode);
+        if let (super::search::Plan::Windows { literals, hi: 0, .. }, Some(dfa)) = (&p.search.plan, &p.anchored_dfa)
+            && let Some(literal) = literals.single_utf8()
+        {
+            p.after_literal = dfa.after(literal).map(|rows| Box::new((rows, literal.len())));
+        }
         // The tree is kept, and later built from and dropped, on the thread that searches, whose stack may be small:
         // only a shallow one is kept.
         #[cfg(test)]

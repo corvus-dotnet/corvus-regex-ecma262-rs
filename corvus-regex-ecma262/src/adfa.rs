@@ -279,6 +279,79 @@ impl Anchored {
 }
 
 impl Anchored {
+    /// The state after `prefix` from each start state, premultiplied by the stride (0 where no match can start with
+    /// it), or `None` when a match can end inside it or it holds a byte beyond ASCII: what `find_after` goes on from
+    /// where a match is known to start with `prefix`.
+    pub(crate) fn after(&self, prefix: &[u8]) -> Option<[u32; 4]> {
+        let mut rows = [0u32; 4];
+        for (row, &s) in rows.iter_mut().zip(&self.starts) {
+            let mut at = (s as usize) << self.shift;
+            for &c in prefix {
+                if at == 0 {
+                    // No match from this start state begins with the prefix.
+                    break;
+                }
+                if c >= 0x80 {
+                    return None;
+                }
+                let t = self.fast[at + self.class[c as usize] as usize];
+                if t & FAST_MATCHED != 0 {
+                    return None;
+                }
+                at = t as usize;
+            }
+            *row = at as u32;
+        }
+        Some(rows)
+    }
+
+    /// [`Anchored::find`] from `start` where the units from `start` to `from` are a prefix whose states `after` gave.
+    #[inline]
+    pub(crate) fn find_after<U: Copy + Into<u32>>(
+        &self,
+        input: &[U],
+        start: usize,
+        from: usize,
+        rows: &[u32; 4],
+    ) -> Found {
+        let row = if self.context {
+            let word = start > 0 && {
+                let c: u32 = input[start - 1].into();
+                c < 0x80 && is_word_byte(c as u8)
+            };
+            rows[usize::from(word) << 1 | usize::from(start == 0)]
+        } else {
+            rows[0]
+        };
+        if row == 0 {
+            return Found::None;
+        }
+        let mut last = None;
+        let mut p = from;
+        let (trans, class) = (&self.fast[..], &self.class);
+        let mut at = row as usize;
+        while p < input.len() {
+            let c: u32 = input[p].into();
+            if c >= 0x80 {
+                return Found::Bail;
+            }
+            // SAFETY: as in `find_reach`.
+            let t = unsafe { *trans.get_unchecked(at + class[c as usize] as usize) };
+            if t & FAST_MATCHED != 0 {
+                last = Some(p);
+            }
+            at = (t & !FAST_MATCHED) as usize;
+            if at == 0 {
+                return last.map_or(Found::None, Found::End);
+            }
+            p += 1;
+        }
+        if self.at_end[at >> self.shift] {
+            return Found::End(p);
+        }
+        last.map_or(Found::None, Found::End)
+    }
+
     /// Whether any match starts at `start`, found at the first place one ends; `None` when a unit beyond ASCII is
     /// reached first.
     #[inline]

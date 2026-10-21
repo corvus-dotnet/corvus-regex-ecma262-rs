@@ -1696,6 +1696,11 @@ fn the_searches_find_what_every_position_finds() {
         (r"(?:1|22|333)\.5\.\d", ""),
         (r"\d{2}[é5]\d", "u"),
         (r"\d{3}[éèêë5]", "u"),
+        // An occurrence of the one literal every match starts with, which the automaton goes on after.
+        (r"^abc", "m"),
+        (r"x{0}^abc", ""),
+        (r"\babc\b", ""),
+        (r"abc\s+\w+", ""),
     ];
     let alphabet = [
         "a",

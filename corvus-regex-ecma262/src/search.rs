@@ -327,6 +327,15 @@ impl Literals {
         }
     }
 
+    /// The one literal searched for over UTF-8, when there is one with no other forms.
+    pub(crate) fn single_utf8(&self) -> Option<&[u8]> {
+        match &self.utf8 {
+            Finder::One(f) => Some(f.needle()),
+            Finder::Rare(_, _, literal) => Some(literal),
+            _ => None,
+        }
+    }
+
     /// The position (in units of the text) of the leftmost occurrence at or after `from`. `bytes` is the text's
     /// bytes and `utf8` says whether a unit is one of them.
     #[inline]

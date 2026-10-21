@@ -737,6 +737,16 @@ impl Program {
                 if len - q < need {
                     return None;
                 }
+                if T::UTF8
+                    && let (Some(after), Some(dfa)) = (&self.after_literal, &self.anchored_dfa)
+                {
+                    // The occurrence is the literal every match starts with: the automaton goes on after it.
+                    match dfa.find_after(input, q, q + after.1, &after.0) {
+                        Found::End(end) => return Some((q, end)),
+                        Found::None => continue,
+                        Found::Bail => {}
+                    }
+                }
                 if self.try_at::<T>(st, input, q) {
                     return Some((q, st.end));
                 }
