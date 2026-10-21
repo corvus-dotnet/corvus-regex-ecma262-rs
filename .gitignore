@@ -3,3 +3,4 @@ target/
 *.tsv
 /build/
 corvus-regex-ecma262-capi/dist/
+__pycache__/
