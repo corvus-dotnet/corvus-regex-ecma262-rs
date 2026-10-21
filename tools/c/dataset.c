@@ -641,9 +641,8 @@ static void check(judge *j, const char *what, bool ok) {
 
 /* The compiled forms of a record's pattern, by flags, as the Rust runner caches them. */
 typedef struct {
-    char flags[32];
+    char flags[48];
     engine_re *re;
-    bool tried;
 } cached;
 
 static engine_re *make(cached *cache, size_t *n, const json *pattern, const char *flags) {
