@@ -51,7 +51,7 @@ pub const CRE_PANIC: cre_status = 7;
 /// The header's version: compare with `cre_version()`, the library's.
 pub const CRE_VERSION_MAJOR: u32 = 0;
 pub const CRE_VERSION_MINOR: u32 = 1;
-pub const CRE_VERSION_PATCH: u32 = 0;
+pub const CRE_VERSION_PATCH: u32 = 1;
 
 /// The start and the end of a group that did not take part in a match.
 pub const CRE_UNSET: usize = usize::MAX;
