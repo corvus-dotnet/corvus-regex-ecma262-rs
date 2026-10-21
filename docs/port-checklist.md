@@ -8,12 +8,13 @@ here, and the plan leaves it out. Where this port does a thing another way, the 
 
 | Count | |
 |---|---|
-| Done | 46 |
+| Done | 48 |
 | Not applicable | 5 |
 | To do | 0 |
 
 Items 1 to 38 are the reference's; items 39 to 50 are what bringing the engine level with the `regex` crate added;
-item 51 is what brought the C library level with the crate.
+item 51 is what brought the C library level with the crate; items 52 and later are what PCRE2 and V8 do that this
+engine did not, where they were faster.
 
 ## Section 4.2: the program and the working memory
 
@@ -141,6 +142,19 @@ packed text to lower case beat both) and a separate kernel for one unit before t
 | # | Optimisation | State | In this port |
 |---|---|---|---|
 | 51 | The matches of a global search a batch at a time, in one loop, with the results of the search and the matcher in registers | done | `Matches::next_batch` and `CaptureMatches::next_batch` (the C library's `cre_matches_next_batch` and `cre_matches_next_captures_batch`) fill a slice the caller owns: a pattern of a simple shape by the search inlined into one loop over the batch (one class and one loop of a class each by a loop of its own, an empty match before an ASCII unit going on one unit later without a call), any other by the matcher with the thread's memory taken once for the batch, and the groups written from the matcher's memory with no allocation. `match_with` returns two words (a start of `NO_MATCH`, `STOPPED_TIME` or `STOPPED_MEMORY` for the rest): a `Result` or an `Option` of a pair merged from several arms came back through memory written as two words and read back as one, a failed store forward on every match. Over the Sherlock text the C library took twice the crate's time on the rows with most matches (`.*`, `[^\n]*`, `\p{L}`, `\p{Ll}`: 473, 324, 5,827 and 5,499 us against the crate's 239, 172, 2,686 and 2,752 us), which a call a match does not explain: the crate's loop had the search inlined, the library's called through three functions a match with the stalls between them. With the batch they take 259, 174, 2,387 and 2,457 us, 0.89 to 1.08 of the crate's time; the captures of `(\w+)` take 36 ns a match against 60 ns with `cre_matches_next_captures` and 42 ns with the crate's `captures_read_at`. |
+
+## Beyond the reference: what PCRE2 and V8 do
+
+The rows where PCRE2 (10.49, with its JIT) or V8 was clearly faster than this engine over UTF-8, on the central
+benchmark page's runner and on the reference machine, each looked at for what the faster engine does, and that
+brought over where it is not an ECMA-262 difference. Each change was measured A/B against the build before it with
+`regex` beside them, in the interleaved harness (Mann-Whitney p < 0.01, beyond both builds' spread), the data set at 0
+wrong after each.
+
+| # | Optimisation | State | In this port |
+|---|---|---|---|
+| 52 | A few literals found by two of their byte positions, each holding one or two values, compared over a vector of starts (PCRE2's `fast_forward_char_pair_simd`) | done | `pair8.rs`, `Finder::Pair`: the positions are the rarest pair (by `memchr`'s table of byte frequencies) whose values are apart, a position whose two values differ in one bit (the cases of an ASCII letter, the lead bytes of a Cyrillic letter's cases) compared once with that bit set; the kernel gives the block of the first candidates and they are compared out of its loop, which keeps it in registers, and a word's cases written out are known a literal once the bytes pass the sets of each position. Where the two positions hold common bytes the fingerprint search is kept (`Tom\|river` took 1.24 times its time, `[A-Za-z]awyer\|[A-Za-z]inn` 4.3 times). `Sherlock\|Holmes` 47 to 25 us (PCRE2 29), `Sher[a-z]+\|Hol[a-z]+` 46 to 34 (36), `Holmes.{0,25}Watson\|...` 67 to 39 (35), `Holmes` /i 51 to 27 (43), `the` /i 287 to 199 (247), `Twain` /i 1,247 to 925 (936), `Шерлок Холмс` /i 170 to 88 (82). |
+| 53 | One literal with a byte rare in text found by `memchr` for that byte, as V8 searches a literal pattern for its first character | done | `Finder::Rare`, for a literal holding one of `ZXQKVJzqjx` (one in a thousand bytes of English text or fewer), the rarest of them: `memchr` reads a block at twice the speed of `memmem`'s search for the two rarest bytes, which is kept for every other literal (a capital letter, one in five hundred, is found too often over the Leipzig text, read from memory: `Holmes` 777 us against 651). `zqj` 14.6 to 5.5 us (V8 5.3), `aqj` 14.6 to 6.8 (V8 204). |
 
 ## The search layer, step by step
 

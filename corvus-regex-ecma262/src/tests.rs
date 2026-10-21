@@ -1786,3 +1786,69 @@ fn the_searches_find_what_every_position_finds() {
         }
     }
 }
+
+/// The search by a pair of positions finds what comparing every literal at every start finds: the leftmost
+/// occurrence, the first literal in order of those that start there.
+#[test]
+fn the_pair_search_finds_the_leftmost_literal() {
+    use super::pair8::PairSearch;
+    let sets: [&[&str]; 7] = [
+        &["Sher", "Hol"],
+        &["Sherlock", "Holmes"],
+        &["the", "thE", "tHe", "tHE", "The", "ThE", "THe", "THE"],
+        &["ab", "abc", "ba"],
+        &["шер", "Шер", "шЕр", "ШЕР"],
+        &["aa", "ab"],
+        &["xyz", "x\u{e9}z"],
+    ];
+    let alphabet: Vec<&str> = vec![
+        "a", "b", "c", "e", "h", "r", "t", "H", "S", "T", "E", " ", "ш", "Ш", "е", "Е", "р", "é", "x", "y", "z", "o",
+        "l", "m", "s",
+    ];
+    let mut seed = Xorshift(0x51ed270b);
+    let mut searched = Vec::new();
+    for set in sets {
+        let literals: Vec<Vec<u8>> = set.iter().map(|l| l.as_bytes().to_vec()).collect();
+        let Some(pair) = PairSearch::new(&literals) else { continue };
+        searched.push(set[0]);
+        for _ in 0..200 {
+            let n = (seed.next() % 300) as usize;
+            let mut text = String::new();
+            while text.len() < n {
+                if seed.next().is_multiple_of(9) {
+                    text.push_str(set[(seed.next() as usize) % set.len()]);
+                } else {
+                    text.push_str(alphabet[(seed.next() as usize) % alphabet.len()]);
+                }
+            }
+            let h = text.as_bytes();
+            for from in 0..=h.len() + 1 {
+                let want = (from..h.len())
+                    .find_map(|i| literals.iter().find(|l| h[i..].starts_with(l)).map(|l| (i, i + l.len())));
+                assert_eq!(pair.find(h, from), want, "{set:?} in {text:?} from {from}");
+            }
+        }
+    }
+    // Only x86-64 has the search's kernels.
+    assert!(searched.len() >= 4 || cfg!(not(target_arch = "x86_64")), "{searched:?}");
+    // Two positions of common bytes are left to the fingerprint search, and one literal to `memmem`.
+    assert!(PairSearch::new(&[b"awyer".to_vec(), b"inn".to_vec()]).is_none());
+    assert!(PairSearch::new(&[b"Sherlock".to_vec()]).is_none());
+}
+
+/// A literal with a byte rare in text is found by `memchr` for that byte, wherever in the literal it is.
+#[test]
+fn a_literal_with_a_rare_byte_is_found_as_any_other() {
+    let mut seed = Xorshift(0x2f6b1c3d);
+    for literal in ["zqj", "aqj", "qq", "Xa", "abZ", "jj j"] {
+        let re = Regex::new(literal, "g").unwrap();
+        for _ in 0..200 {
+            let n = (seed.next() % 200) as usize;
+            let text: String =
+                (0..n).map(|_| ['a', 'b', 'q', 'j', 'z', 'Z', 'X', ' '][(seed.next() % 8) as usize]).collect();
+            let want: Vec<usize> = text.match_indices(literal).map(|(i, _)| i).collect();
+            let got: Vec<usize> = re.find_iter(&text).map(|m| m.start()).collect();
+            assert_eq!(got, want, "/{literal}/ in {text:?}");
+        }
+    }
+}

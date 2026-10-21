@@ -76,6 +76,7 @@ mod charset;
 mod compile;
 mod dfa;
 mod fold;
+mod pair8;
 mod parse;
 mod re2;
 mod regex;

@@ -36,6 +36,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use aho_corasick::{AhoCorasick, MatchKind, packed};
 use memchr::memmem;
 
+use super::pair8::PairSearch;
+
 use super::Rune;
 use super::charset::{CharSet, is_word_byte};
 use super::compile::literal_rune;
@@ -57,6 +59,39 @@ enum Finder {
     Automaton(AhoCorasick),
     /// A few literals that all start with one rare byte: `memchr` for the byte, then each literal compared in order.
     Shared(u8, Vec<Vec<u8>>),
+    /// A few literals two of whose positions hold one or two values each: the vector search for both (PCRE2's).
+    Pair(Box<PairSearch>),
+    /// One literal with a byte rare enough in text (`very_rare`) to be searched for alone: `memchr` for it at its
+    /// offset, then the literal compared, as V8 searches a literal pattern for its first character.
+    Rare(u8, usize, Vec<u8>),
+}
+
+/// The bytes rare enough in text that `memchr` for one of them, and a compare where it is found, is faster than the
+/// search for a literal's two rarest bytes, from the rarest: measured over the Industry texts, one in a thousand bytes
+/// or fewer. `memchr` reads a block at twice the speed of that search over a text in cache (`zqj` over the Sherlock
+/// text, 5.1 us against 13.8 us), but a capital letter (one in five hundred) is found too often over the Leipzig text,
+/// read from memory, where `Holmes` took 777 us against 651 us.
+const VERY_RARE: &[u8] = b"ZXQKVJzqjx";
+
+/// The leftmost occurrence of `literal` at or after `from`, by `memchr` for its byte `b` at offset `k`. A call of its
+/// own, as the other searches are, so that `Finder::find` stays small where it is inlined.
+#[inline(never)]
+fn find_rare(haystack: &[u8], from: usize, b: u8, k: usize, literal: &[u8]) -> Option<(usize, usize)> {
+    let mut at = from + k;
+    loop {
+        let p = at + memchr::memchr(b, haystack.get(at..)?)?;
+        let start = p - k;
+        if haystack[start..].starts_with(literal) {
+            return Some((start, start + literal.len()));
+        }
+        at = p + 1;
+    }
+}
+
+/// The rarest byte of a literal that `VERY_RARE` holds, and its offset.
+fn very_rare(literal: &[u8]) -> Option<(u8, usize)> {
+    let order = |b: u8| VERY_RARE.iter().position(|&r| r == b);
+    literal.iter().enumerate().filter_map(|(k, &b)| order(b).map(|o| (o, b, k))).min().map(|(_, b, k)| (b, k))
 }
 
 /// Whether a byte is rare enough in text for a search for it alone to pay: not a lower case letter (but the rarest
@@ -75,6 +110,9 @@ impl Finder {
                 let finder = memmem::FinderBuilder::new().build_forward_with_ranker(Utf16Rank, &literals[0]);
                 return Finder::One(finder.into_owned());
             }
+            if let Some((b, k)) = very_rare(&literals[0]) {
+                return Finder::Rare(b, k, literals[0].clone());
+            }
             return Finder::One(memmem::Finder::new(&literals[0]).into_owned());
         }
         // Up to four literals that start with the same rare byte are found by `memchr` for that byte and a compare of
@@ -87,6 +125,9 @@ impl Finder {
         let fingerprint = fingerprint || utf16 || !one_rare_first;
         if !fingerprint && literals.len() <= 4 {
             return Finder::Shared(first.expect("a literal"), literals.to_vec());
+        }
+        if !utf16 && let Some(pair) = PairSearch::new(literals) {
+            return Finder::Pair(Box::new(pair));
         }
         if fingerprint
             && literals.len() <= MAX_FORMS
@@ -116,6 +157,8 @@ impl Finder {
             Finder::Automaton(a) => {
                 a.find(aho_corasick::Input::new(haystack).span(from..haystack.len())).map(|m| (m.start(), m.end()))
             }
+            Finder::Pair(p) => p.find(haystack, from),
+            Finder::Rare(b, k, literal) => find_rare(haystack, from, *b, *k, literal),
             Finder::Shared(first, literals) => {
                 let mut at = from;
                 loop {
@@ -307,8 +350,12 @@ impl Literals {
         if from > last {
             return None;
         }
-        if let Finder::One(f) = &self.utf8 {
-            let needle = f.needle();
+        let one = match &self.utf8 {
+            Finder::One(f) => Some(f.needle()),
+            Finder::Rare(_, _, literal) => Some(&literal[..]),
+            _ => None,
+        };
+        if let Some(needle) = one {
             return (from..=last).find(|&p| bytes[p] == needle[0] && bytes[p..].starts_with(needle));
         }
         let p = (from..=last).find(|&p| self.firsts[bytes[p] as usize])?;

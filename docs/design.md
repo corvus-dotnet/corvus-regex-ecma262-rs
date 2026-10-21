@@ -45,7 +45,10 @@ reference keeps a timeout on the instance). A pattern without a backreference ne
 The reference has a hand-written vectorised search for each kind of literal (`Needle`, `MultiNeedle`, `Teddy`). Rust
 has these searches in crates every Rust program already depends on, so this port uses them:
 
-- one literal: `memchr::memmem`, whose prefilter is the rarest-position needle;
+- one literal: `memchr::memmem`, whose prefilter is the rarest-position needle, or `memchr` for a byte of the literal
+  rare in text (`j`, `q`, `x`, `z` and a few capitals), as V8 searches for a literal's first character;
+- a few literals two of whose byte positions hold one or two values each (`Sherlock|Holmes`, a word's cases): the
+  vector search for both positions (`pair8.rs`), PCRE2's search before a match;
 - two literals with rare first bytes: `aho-corasick`'s automaton, whose prefilter looks for those bytes with `memchr`;
 - three literals or more, and the forms of a case-insensitive literal: `aho-corasick`'s packed searcher, Teddy;
 - the first set over UTF-8: `memchr` for up to three bytes, Teddy over one-byte literals for up to sixty-four.
