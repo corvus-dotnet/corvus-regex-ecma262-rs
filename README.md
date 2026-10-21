@@ -72,13 +72,30 @@ return `MatchError` when it is reached.
 ### From C
 
 The `corvus-regex-ecma262-capi` crate builds `libcorvus_regex_ecma262` (shared and static), with the header
-`corvus-regex-ecma262-capi/include/corvus_regex_ecma262.h`:
+`corvus-regex-ecma262-capi/include/corvus_regex_ecma262.h`, which documents every function. Each member of `Regex`
+has its C function, over UTF-8 and (with the suffix `_utf16`) over UTF-16: `is_match`, `find`, the groups by number
+(into a buffer the caller owns) and by name (into a reusable `cre_captures`), the global search (`cre_matches`),
+`replace` and `replace_all` with every `$` form, and `split`, each matching function with a `_limit` form that takes
+a limit of time. Every fallible function returns a `cre_status` with a message for the thread, owned results have a
+free function each, and no panic crosses into the caller.
 
 ```c
 cre_regex *re = NULL;
-if (cre_regex_new("\\p{Lu}\\w+", 9, "u", 1, &re) == CRE_OK) {
-    bool matched = false;
-    cre_regex_is_match(re, text, text_len, &matched);
+if (cre_regex_new("(?<word>\\p{Lu}\\w+)", 18, "gu", 2, &re) == CRE_OK) {
+    cre_matches *it = NULL;
+    cre_match m;
+    bool found;
+    if (cre_regex_find_iter(re, text, text_len, &it) == CRE_OK) {
+        while (cre_matches_next(it, &m, &found) == CRE_OK && found) {
+            printf("%.*s\n", (int)(m.end - m.start), text + m.start);
+        }
+        cre_matches_free(it);
+    }
+    cre_string out;
+    if (cre_regex_replace(re, text, text_len, "<$<word>>", 9, &out) == CRE_OK) {
+        puts(out.ptr);
+        cre_string_free(&out);
+    }
     cre_regex_free(re);
 }
 ```
