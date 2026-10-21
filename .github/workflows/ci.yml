@@ -49,7 +49,7 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         repository: corvus-dotnet/ecma262-regex-test-data
-        ref: 41ed6db477c0d57192673a3a1a76a3b7a194603b
+        ref: 77ca768ec8e711c67241416ba66931ae89a95e2d
         path: ecma262-regex-test-data
         persist-credentials: false
     - name: Run the ECMA-262 test data

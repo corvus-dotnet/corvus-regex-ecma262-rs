@@ -10,7 +10,10 @@
  * Each record is asked about under each grammar V8 found it valid in: the record's flags with u added (the unicode
  * answers), the record's flags alone (the legacy answers) and, in the file that has them, the flags with v added (the
  * unicode_sets answers). A text is matched as UTF-16 and as UTF-8; a text with a lone surrogate has no UTF-8 form and
- * is matched as UTF-16 alone. Records marked v8_deviation are left out. Any difference from V8 is a wrong answer; a
+ * is matched as UTF-16 alone. Records and tests marked v8_deviation are left out, but for those marked
+ * unicode-version, where V8 has the Unicode of 16 and test262 that of 17: the C library has Unicode 17, so they are
+ * judged by test262's verdicts (test262_valid) and answers (test262_answer) in the grammars those name, and left out
+ * in the others. libregexp is not judged on them. Any difference from V8 is a wrong answer; a
  * refusal of a valid pattern, an acceptance of an invalid one, and a match that reaches its limit are counted apart
  * and listed too. captures.jsonl is judged on exec, the global search, the sticky flag, replace and split.
  *
@@ -526,6 +529,28 @@ static size_t modes_of(const json *r, mode out[3]) {
     return n;
 }
 
+/* Whether a deviation is judged by test262's answers: one of the Unicode version, by the C library, which has the
+ * Unicode of test262. */
+static bool by_test262(const json *marked) {
+#ifdef DATASET_QUICKJS
+    (void)marked;
+    return false;
+#else
+    static const char want[] = "unicode-version";
+    const json *d = json_string(json_get(marked, "deviation"));
+    if (!d || d->len != sizeof want - 1) return false;
+    for (size_t k = 0; k < d->len; k++) {
+        if (d->units[k] != (uint16_t)want[k]) return false;
+    }
+    return true;
+#endif
+}
+
+/* Whether a record is left out: one marked v8_deviation that is not judged by test262's answers. */
+static bool skipped_record(const json *r) {
+    return json_is_true(json_get(r, "v8_deviation")) && !by_test262(r);
+}
+
 /* The pattern as the Rust runner shows it: through UTF-8 (a lone surrogate as U+FFFD) and back, escaped. */
 static void sb_shown(sbuf *b, const json *pattern) {
     size_t len, len16;
@@ -545,7 +570,12 @@ static void judge_tests(const char *name, const json *r, const json *pattern, co
     mode modes[3];
     size_t mode_count = modes_of(r, modes);
     const json *tests = json_get(r, "tests");
+    /* A record marked for the Unicode version is judged in the grammars test262 gives a verdict for, by it. */
+    bool record_by_test262 = json_is_true(json_get(r, "v8_deviation")) && by_test262(r);
     for (size_t m = 0; m < mode_count; m++) {
+        if (record_by_test262 && !json_as_bool(json_get(json_get(r, "test262_valid"), modes[m].answer), &modes[m].valid)) {
+            continue;
+        }
         char mode_flags[32];
         snprintf(mode_flags, sizeof mode_flags, "%s%s", flags, modes[m].suffix);
         bool is_error;
@@ -572,8 +602,13 @@ static void judge_tests(const char *name, const json *r, const json *pattern, co
         }
         for (size_t t = 0; tests && tests->kind == JSON_ARRAY && t < tests->len; t++) {
             const json *test = &tests->items[t];
+            /* A test marked for the Unicode version, or any test of a record so marked, is judged by test262's answer
+             * in this grammar, and left out where it has none. A test marked otherwise is left out. */
+            bool marked = json_is_true(json_get(test, "v8_deviation"));
+            if (marked && !by_test262(test)) continue;
+            const json *answers = marked || record_by_test262 ? json_get(test, "test262_answer") : test;
             bool expected;
-            if (!json_as_bool(json_get(test, modes[m].answer), &expected)) continue;
+            if (!json_as_bool(json_get(answers, modes[m].answer), &expected)) continue;
             const json *text = json_string(json_get(test, "text"));
             if (!text) continue;
             for (int encoding = 0; encoding < 2; encoding++) {
@@ -1198,7 +1233,7 @@ static void *worker(void *p) {
             fprintf(stderr, "%s:%zu: %s\n", f->name, k + 1, error);
             exit(2);
         }
-        if (json_is_true(json_get(r, "v8_deviation"))) {
+        if (skipped_record(r)) {
             skipped++;
         } else {
             records++;

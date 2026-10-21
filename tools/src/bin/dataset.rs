@@ -5,7 +5,10 @@
 //! Each record is asked about under each grammar V8 found it valid in: the record's flags with u added (the
 //! `unicode` answers), the record's flags alone (the `legacy` answers) and, in the file that has them, the flags with
 //! v added (the `unicode_sets` answers). A text is matched as UTF-16 and as UTF-8; a text with a lone surrogate has no
-//! UTF-8 form and is matched as UTF-16 alone. Records marked v8_deviation are left out. Any difference from V8 is a
+//! UTF-8 form and is matched as UTF-16 alone. Records and tests marked v8_deviation are left out, but for those
+//! marked `unicode-version`, where V8 has the Unicode of 16 and test262 that of 17: the engine has Unicode 17, so
+//! they are judged by test262's verdicts (`test262_valid`) and answers (`test262_answer`) in the grammars those
+//! name, and left out in the others. regress is not judged on them. Any difference from V8 is a
 //! wrong answer; a refusal of a valid pattern, an acceptance of an invalid one, and a match that reaches its limit are
 //! counted apart and listed too. `captures.jsonl` is judged on exec, the global search, the sticky flag, replace and
 //! split, as the .NET runner of the reference engine judges it.
@@ -123,7 +126,7 @@ fn main() {
                             let k = next.fetch_add(1, Ordering::Relaxed);
                             let Some(line) = lines.get(k) else { break };
                             let r = json::parse(line).unwrap_or_else(|e| panic!("{name}:{}: {e}", k + 1));
-                            if r.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
+                            if skipped_record(&r, &options) {
                                 skipped.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
@@ -194,6 +197,18 @@ fn has_lone_surrogate(s: &[u16]) -> bool {
         k += 1;
     }
     false
+}
+
+/// Whether a deviation is judged by test262's answers: one of the Unicode version, by the Corvus engine, which has
+/// the Unicode of test262.
+fn by_test262(marked: &Json, options: &Options) -> bool {
+    options.engine == EngineKind::Corvus
+        && marked.get("deviation").and_then(Json::as_string).as_deref() == Some("unicode-version")
+}
+
+/// Whether a record is left out: one marked v8_deviation that is not judged by test262's answers.
+fn skipped_record(r: &Json, options: &Options) -> bool {
+    r.get("v8_deviation").and_then(Json::as_bool) == Some(true) && !by_test262(r, options)
 }
 
 /// The modes a record is asked about: the flags to add, the name of the answers, and whether V8 found it valid.
@@ -304,7 +319,17 @@ fn judge_tests<E: Engine>(
 ) {
     let flags = r.get("flags").and_then(Json::as_string).unwrap();
     let shown = escape(&pattern.encode_utf16().collect::<Vec<u16>>());
-    for (suffix, answer_name, expected_valid) in modes(r) {
+    // A record marked for the Unicode version is judged in the grammars test262 gives a verdict for, by it.
+    let record_by_test262 = r.get("v8_deviation").and_then(Json::as_bool) == Some(true) && by_test262(r, options);
+    for (suffix, answer_name, v8_valid) in modes(r) {
+        let expected_valid = if record_by_test262 {
+            match r.get("test262_valid").and_then(|v| v.get(answer_name)).and_then(Json::as_bool) {
+                Some(valid) => valid,
+                None => continue,
+            }
+        } else {
+            v8_valid
+        };
         let mode_flags = format!("{flags}{suffix}");
         let re = match std::panic::catch_unwind(|| E::compile(pattern, &mode_flags)) {
             Ok(Ok(re)) => re,
@@ -334,7 +359,18 @@ fn judge_tests<E: Engine>(
         }
         let Some(tests) = r.get("tests").and_then(Json::as_array) else { continue };
         for t in tests {
-            let Some(expected) = t.get(answer_name).and_then(Json::as_bool) else { continue };
+            // A test marked for the Unicode version, or any test of a record so marked, is judged by test262's
+            // answer in this grammar, and left out where it has none. A test marked otherwise is left out.
+            let marked = t.get("v8_deviation").and_then(Json::as_bool) == Some(true);
+            if marked && !by_test262(t, options) {
+                continue;
+            }
+            let answer = if marked || record_by_test262 {
+                t.get("test262_answer").and_then(|a| a.get(answer_name))
+            } else {
+                t.get(answer_name)
+            };
+            let Some(expected) = answer.and_then(Json::as_bool) else { continue };
             let text = t.get("text").and_then(Json::as_units).unwrap();
             let mut check = |encoding: &str, result: Result<bool, String>| match result {
                 Ok(actual) if actual == expected => {
@@ -588,7 +624,7 @@ fn worker(file: &str, first: usize, encodings: &str) {
         writeln!(out, "R {k}").unwrap();
         out.flush().unwrap();
         let r = json::parse(line).unwrap();
-        if r.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
+        if skipped_record(&r, &options) {
             writeln!(out, "S").unwrap();
             continue;
         }

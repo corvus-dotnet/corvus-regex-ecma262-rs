@@ -19,9 +19,10 @@ its C library, for any language that calls C.
   program hang.
 
 **Compliance.** Over the [ECMA-262 test data](https://github.com/corvus-dotnet/ecma262-regex-test-data) (what V8
-says about 109,547 patterns and 5,325,026 texts, `exec`, the global search, `replace` and `split` among them), the
-crate gives 23,647,077 right answers and none wrong, refuses no valid pattern, accepts no invalid one and reaches no
-limit, over UTF-8 and over UTF-16. CI runs the whole data on every change.
+says about 117,889 patterns and 5,883,170 texts, `exec`, the global search, `replace` and `split` among them, and the
+patterns and texts of test262, judged by test262's Unicode 17 answers where V8 has Unicode 16), the crate gives
+26,913,813 right answers and none wrong, refuses no valid pattern, accepts no invalid one and reaches no limit, over
+UTF-8 and over UTF-16. CI runs the whole data on every change.
 
 It is the engine of the [Corvus JSON Schema](https://github.com/corvus-dotnet/Corvus.JsonSchema) evaluators, moved
 out with its history and brought to the design of the .NET engine
