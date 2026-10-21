@@ -120,6 +120,14 @@ beside its figures: see [docs/benchmarks](docs/benchmarks/README.md), and the re
 - `docs/design.md`: what differs from the .NET reference engine and why; `docs/port-checklist.md`: each optimisation
   of the reference, done, not applicable or to do.
 
+## Releasing
+
+Bump `version` in `corvus-regex-ecma262/Cargo.toml`, push it, and publish a GitHub release tagged `v<version>` on that
+commit. The release runs two workflows: `crates-publish.yml` tests the crate, runs the ECMA-262 test data and publishes
+it to crates.io by trusted publishing (no token is stored), and `harness-image.yml` publishes the benchmark image under
+the release's tag, which the central benchmark page runs from that night. A tag that does not match the version fails
+the publish.
+
 ## Licence
 
 Apache-2.0. See [LICENSE](LICENSE).

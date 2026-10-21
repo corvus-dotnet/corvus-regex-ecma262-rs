@@ -1,0 +1,96 @@
+# Publishes the corvus-regex-ecma262 crate to crates.io when a GitHub release is published. The release's tag must be
+# v<version> for the version in corvus-regex-ecma262/Cargo.toml; a version already on crates.io publishes nothing, so
+# re-running a release's job is safe. To release: bump the version, push, and publish a release tagged v<version>.
+#
+# It authenticates with crates.io trusted publishing (OIDC): no token is stored, and the crate's trusted publisher on
+# crates.io names this repository and this workflow file, so keep the file name.
+#
+# crates.io has no staged approval: the publish step makes the version live, and a published version can be yanked
+# but never replaced or deleted. The C library (corvus-regex-ecma262-capi) is not published.
+name: crates-publish
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write  # crates.io trusted publishing
+
+concurrency:
+  group: crates-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish corvus-regex-ecma262
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
+    - name: Check the tag names this version and whether crates.io has it
+      id: version
+      env:
+        TAG: ${{ github.event.release.tag_name }}
+      run: |
+        version=$(sed -n 's/^version = "\(.*\)"$/\1/p' corvus-regex-ecma262/Cargo.toml | head -n 1)
+        if [ "$TAG" != "v$version" ]; then
+          echo "::error::The release's tag is $TAG but corvus-regex-ecma262/Cargo.toml says $version (the tag must be v$version)."
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        # crates.io answers 404 for a version it does not have; it asks callers for a user agent.
+        status=$(curl -s -o /dev/null -w '%{http_code}' -A 'corvus-dotnet/corvus-regex-ecma262-rs crates-publish' \
+          "https://crates.io/api/v1/crates/corvus-regex-ecma262/$version")
+        case "$status" in
+          200)
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::corvus-regex-ecma262 $version is already on crates.io; nothing to publish." ;;
+          404)
+            echo "published=false" >> "$GITHUB_OUTPUT" ;;
+          *)
+            echo "::error::crates.io answered $status for corvus-regex-ecma262 $version."
+            exit 1 ;;
+        esac
+    - name: Install the toolchain of rust-toolchain.toml
+      if: steps.version.outputs.published == 'false'
+      run: rustup show
+    - name: Format, clippy and the tests
+      if: steps.version.outputs.published == 'false'
+      run: |
+        cargo fmt --all --check
+        cargo clippy -j 4 --workspace --all-targets --locked -- -D warnings
+        cargo test -j 4 --workspace --locked
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      if: steps.version.outputs.published == 'false'
+      with:
+        repository: corvus-dotnet/ecma262-regex-test-data
+        ref: 41ed6db477c0d57192673a3a1a76a3b7a194603b
+        path: ecma262-regex-test-data
+        persist-credentials: false
+    - name: Run the ECMA-262 test data
+      if: steps.version.outputs.published == 'false'
+      run: cargo run -j 4 --release --locked --bin dataset -- ecma262-regex-test-data/data wrong-cases.tsv
+    - name: Package
+      # Builds the crate from its packaged sources, as crates.io will.
+      if: steps.version.outputs.published == 'false'
+      run: cargo publish -p corvus-regex-ecma262 --locked --dry-run
+    - name: Authenticate with crates.io
+      if: steps.version.outputs.published == 'false'
+      id: auth
+      uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+    - name: Publish
+      if: steps.version.outputs.published == 'false'
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        cargo publish -p corvus-regex-ecma262 --locked
+        {
+          echo "### corvus-regex-ecma262 $VERSION is published"
+          echo
+          echo "https://crates.io/crates/corvus-regex-ecma262/$VERSION"
+        } >> "$GITHUB_STEP_SUMMARY"
