@@ -2,3 +2,4 @@ target/
 /artifacts/
 *.tsv
 /build/
+corvus-regex-ecma262-capi/dist/

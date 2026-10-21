@@ -1,0 +1,101 @@
+# Attaches the C library's archives to a GitHub release of this repository: one release, v<version>, carries the
+# crate (crates-publish.yml), the harness images (harness-image.yml, c-harness-image.yml) and the C archives. The
+# archives for every platform are built and tested by capi.yml, then uploaded to the release. The C library's version
+# is the engine's, and the tag must name it.
+#
+# - A published release attaches them to itself, built from the release's commit.
+# - A manual run (workflow_dispatch) attaches them to the existing release named by its tag input, built from main,
+#   for a release made before this workflow existed. It refuses when the engine's sources on main differ from the
+#   tag's, so the archives always carry that release's engine. Uploading replaces archives of the same names.
+name: capi-publish
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The existing release (v<version>) to attach the archives to
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capi-publish
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: The release to attach to
+    # A manual run from another branch must not publish that branch.
+    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the tag names the version, and the release exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' corvus-regex-ecma262-capi/Cargo.toml | head -n 1)
+          engine=$(sed -n 's/^version = "\(.*\)"$/\1/p' corvus-regex-ecma262/Cargo.toml | head -n 1)
+          if [ "$version" != "$engine" ]; then
+            echo "::error::The C library's version ($version) is not the engine's ($engine)."
+            exit 1
+          fi
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::The tag is $TAG but corvus-regex-ecma262-capi/Cargo.toml says $version (the tag must be v$version)."
+            exit 1
+          fi
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null; then
+            echo "::error::There is no release $TAG."
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && ! git diff --quiet "$TAG" HEAD -- corvus-regex-ecma262; then
+            echo "::error::The engine's sources on main differ from $TAG's; the archives would not carry that release's engine."
+            git diff --stat "$TAG" HEAD -- corvus-regex-ecma262
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  packages:
+    name: Build and test
+    needs: version
+    uses: ./.github/workflows/capi.yml
+
+  attach:
+    name: Attach to ${{ needs.version.outputs.tag }}
+    needs: [version, packages]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # upload the release's assets
+    steps:
+      - name: Download the archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: capi-*
+          path: archives
+          merge-multiple: true
+      - name: Check the archives
+        # One per platform: Linux x64 and arm64 with glibc and musl, macOS arm64 and x64, Windows x64 and arm64.
+        run: |
+          ls -l archives
+          [ "$(ls archives | wc -l)" -eq 8 ]
+      - name: Attach
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          gh release upload "$TAG" archives/* --repo "$GITHUB_REPOSITORY" --clobber
+          {
+            echo "### The C archives are attached to $TAG"
+            echo
+            ls archives | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"

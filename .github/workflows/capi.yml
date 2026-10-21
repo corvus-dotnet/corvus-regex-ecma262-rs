@@ -1,0 +1,159 @@
+# The C library's release archives (corvus-regex-ecma262-capi): on every release platform the package (package.ps1:
+# the header, the shared and the static library, a CMake package and a pkg-config file), archived, and the archive
+# unpacked and the C smoke test built against it and run, shared and static, as a consumer builds it. Each platform's archive is uploaded as an artifact
+# (capi-<target>); capi-publish.yml calls this workflow to attach them to a release.
+name: capi
+on:
+  push:
+    branches:
+    - main
+    paths:
+    - 'corvus-regex-ecma262/**'
+    - 'corvus-regex-ecma262-capi/**'
+    - 'Cargo.lock'
+    - 'rust-toolchain.toml'
+    - '.github/workflows/capi.yml'
+    - '.github/workflows/capi-publish.yml'
+  pull_request:
+    paths:
+    - 'corvus-regex-ecma262/**'
+    - 'corvus-regex-ecma262-capi/**'
+    - 'Cargo.lock'
+    - 'rust-toolchain.toml'
+    - '.github/workflows/capi.yml'
+    - '.github/workflows/capi-publish.yml'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package and test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The glibc packages link against glibc 2.17's symbols (cargo-zigbuild), so they load on any distribution
+          # from the manylinux2014 baseline on, not only on the runner's newer glibc.
+          - { name: linux x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, zig: true, glibc: '2.17', sanitize: true, pkgconfig: true }
+          - { name: linux aarch64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, zig: true, glibc: '2.17', pkgconfig: true }
+          - { name: linux x86_64 musl, os: ubuntu-latest, target: x86_64-unknown-linux-musl, zig: true, container: 'alpine:3.22' }
+          - { name: linux aarch64 musl, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, zig: true, container: 'alpine:3.22' }
+          - { name: macos arm64, os: macos-latest, target: aarch64-apple-darwin, pkgconfig: true }
+          - { name: macos x86_64, os: macos-15-intel, target: x86_64-apple-darwin, pkgconfig: true }
+          - { name: windows x64, os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { name: windows arm64, os: windows-11-arm, target: aarch64-pc-windows-msvc }
+    defaults:
+      run:
+        working-directory: corvus-regex-ecma262-capi
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        # rustup where the runner image has none, then the version pinned in rust-toolchain.toml.
+        env:
+          RUST_TARGET: ${{ matrix.target }}
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            if ($IsWindows) {
+              $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }
+              Invoke-WebRequest "https://static.rust-lang.org/rustup/dist/$arch-pc-windows-msvc/rustup-init.exe" -OutFile rustup-init.exe
+              ./rustup-init.exe -y --profile minimal --default-toolchain none
+            } else {
+              bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none"
+            }
+            $bin = Join-Path $HOME ".cargo" "bin"
+            Add-Content $env:GITHUB_PATH $bin
+            $env:PATH = "$bin$([IO.Path]::PathSeparator)$env:PATH"
+          }
+          rustup toolchain install
+          rustup target add $env:RUST_TARGET
+          rustc --version
+      - name: Zig (cross-linking the musl targets and the glibc baseline)
+        if: matrix.zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - name: cargo-zigbuild
+        if: matrix.zig
+        run: cargo install --locked cargo-zigbuild@0.23.4
+      - name: Package
+        run: |
+          $options = @{ Target = "${{ matrix.target }}" }
+          if ("${{ matrix.zig }}" -eq "true") { $options.Zig = $true }
+          if ("${{ matrix.glibc }}") { $options.Glibc = "${{ matrix.glibc }}" }
+          $package = ./package.ps1 @options
+          $package = @($package)[-1]
+          Add-Content $env:GITHUB_ENV "CRE_PACKAGE=$package"
+          Add-Content $env:GITHUB_ENV "CRE_PACKAGE_NAME=$(Split-Path $package -Leaf)"
+          Get-ChildItem -Recurse $package | Select-Object -ExpandProperty FullName
+      - name: Archive
+        run: |
+          Push-Location (Split-Path $env:CRE_PACKAGE -Parent)
+          if ($IsWindows) {
+            Compress-Archive -Path $env:CRE_PACKAGE_NAME -DestinationPath "$env:CRE_PACKAGE_NAME.zip"
+            Add-Content $env:GITHUB_ENV "CRE_ARCHIVE=$((Resolve-Path "$env:CRE_PACKAGE_NAME.zip").Path)"
+          } else {
+            tar -czf "$env:CRE_PACKAGE_NAME.tar.gz" $env:CRE_PACKAGE_NAME
+            Add-Content $env:GITHUB_ENV "CRE_ARCHIVE=$((Resolve-Path "$env:CRE_PACKAGE_NAME.tar.gz").Path)"
+          }
+          Pop-Location
+      - name: Unpack the archive
+        # The tests below run against the archive as a consumer receives it, unpacked into a directory of its own.
+        run: |
+          $unpacked = Join-Path (Resolve-Path ..).Path "unpacked"
+          New-Item -ItemType Directory -Force $unpacked | Out-Null
+          if ($IsWindows) { Expand-Archive -Path $env:CRE_ARCHIVE -DestinationPath $unpacked } else { tar -xzf $env:CRE_ARCHIVE -C $unpacked }
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Add-Content $env:GITHUB_ENV "CRE_UNPACKED=$(Join-Path $unpacked $env:CRE_PACKAGE_NAME)"
+      - name: The smoke test against the archive
+        if: ${{ !matrix.container }}
+        run: |
+          $sanitize = if ("${{ matrix.sanitize }}" -eq "true") { "ON" } else { "OFF" }
+          cmake -S tests/native -B build "-DCMAKE_PREFIX_PATH=$env:CRE_UNPACKED" "-DCRE_SANITIZE=$sanitize" -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake --build build --config Release -j 4
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ctest --test-dir build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: The smoke test against the archive (in ${{ matrix.container }})
+        if: matrix.container
+        run: |
+          $work = (Resolve-Path ..).Path
+          $package = "/w/" + [IO.Path]::GetRelativePath($work, $env:CRE_UNPACKED).Replace("\", "/")
+          docker run --rm -v "${work}:/w" -w /w/corvus-regex-ecma262-capi ${{ matrix.container }} sh -c "apk add -q cmake gcc musl-dev samurai && cmake -S tests/native -B /tmp/build -G Ninja -DCMAKE_PREFIX_PATH=$package -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/build -j 4 && ctest --test-dir /tmp/build --output-on-failure"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: The glibc baseline
+        if: matrix.glibc
+        run: |
+          # The newest glibc symbol version the shared library needs.
+          # An array (@(...)): with one version (all of aarch64's are 2.17) it would be a string, and [-1] its last character.
+          $versions = @(objdump -T (Join-Path $env:CRE_UNPACKED "lib" "libcorvus_regex_ecma262.so") | Select-String -AllMatches "GLIBC_([0-9.]+)" | ForEach-Object { $_.Matches.Groups[1].Value } | Sort-Object { [version]$_ } -Unique)
+          $newest = $versions[-1]
+          "newest: GLIBC_$newest"
+          if ([version]$newest -gt [version]"${{ matrix.glibc }}") { Write-Error "needs GLIBC_$newest, above ${{ matrix.glibc }}"; exit 1 }
+      - name: pkg-config
+        if: matrix.pkgconfig
+        run: |
+          if (-not (Get-Command pkg-config -ErrorAction SilentlyContinue)) { brew install pkgconf }
+          $env:PKG_CONFIG_PATH = Join-Path $env:CRE_UNPACKED "lib" "pkgconfig"
+          # pkg-config's output ends with a space: split on whitespace, without empty arguments.
+          # Arrays (@(...)): a single flag would otherwise be a string, which splatting passes character by character.
+          $cflags = @("$(pkg-config --cflags corvus-regex-ecma262)" -split "\s+" | Where-Object { $_ })
+          $libs = @("$(pkg-config --libs corvus-regex-ecma262)" -split "\s+" | Where-Object { $_ })
+          cc -std=c99 -Wall -Werror tests/native/smoke.c @cflags @libs "-Wl,-rpath,$env:CRE_UNPACKED/lib" -o smoke-pkgconfig
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ./smoke-pkgconfig
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: capi-${{ matrix.target }}
+          path: ${{ env.CRE_ARCHIVE }}
+          if-no-files-found: error

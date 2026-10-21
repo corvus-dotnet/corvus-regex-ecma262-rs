@@ -1,0 +1,12 @@
+# Written by package.ps1 for @PLATFORM@; paths are relative to this file, so the package can be moved.
+prefix=${pcfiledir}/../..
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: corvus-regex-ecma262
+Description: ECMA-262 (JavaScript) regular expressions: the grammar and the answers of RegExp, over UTF-8 and UTF-16
+URL: https://github.com/corvus-dotnet/corvus-regex-ecma262-rs
+Version: @VERSION@
+Cflags: -I${includedir}
+Libs: -L${libdir} -lcorvus_regex_ecma262
+Libs.private: @STATIC_LINK_FLAGS@
