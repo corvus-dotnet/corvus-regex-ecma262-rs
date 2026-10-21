@@ -1574,6 +1574,26 @@ fn the_deepest_nesting_of_classes_does_not_overflow_a_small_stack() {
     test.unwrap().join().unwrap();
 }
 
+/// Without the v flag a class holds no class, so a pattern of many classes nests no deeper than one of none: it is
+/// read where it is asked, not on a thread of its own (which costs some times the compiling of such a pattern, and
+/// refuses it where no thread can be started), and it compiles and matches on a small stack all the same.
+#[test]
+fn many_classes_without_the_v_flag_are_read_where_they_are_asked() {
+    let classes: String = (0..400).map(|i| format!("[a-{}]", char::from(b'b' + (i % 20) as u8))).collect();
+    assert!(super::shallow(&classes, false));
+    assert!(!super::shallow(&classes, true));
+    let small = std::thread::Builder::new().stack_size(128 << 10);
+    let test = small.spawn(move || {
+        for flags in ["", "u", "i", "iu"] {
+            let re = Regex::new(&classes, flags).unwrap_or_else(|e| panic!("{flags}: {e}"));
+            assert!(re.is_match(&"a".repeat(400)), "{flags}");
+            assert!(!re.is_match(&"a".repeat(399)), "{flags}");
+            assert!(Regex::is_valid(&classes, flags), "{flags}");
+        }
+    });
+    test.unwrap().join().unwrap();
+}
+
 #[test]
 fn a_pattern_over_a_limit_of_size_is_too_large() {
     let nest = |depth: usize| "(?:".repeat(depth) + "a" + &")".repeat(depth);

@@ -168,7 +168,8 @@ fn read(pattern: &str) -> Result<(parse::Node, Facts, parse::Parser), Error> {
     Ok((root, facts, ps))
 }
 
-/// The number of groups and classes a pattern may open and still be read on the stack of the thread that asks.
+/// The number of groups (and with the v flag, classes) a pattern may open and still be read on the stack of the
+/// thread that asks.
 const SHALLOW: usize = 32;
 
 /// The stack of the thread that reads a pattern with more groups than that. The parser, the compiler and the
@@ -181,8 +182,12 @@ const DEEP_STACK: usize = 64 << 20;
 /// overflow the stack. A pattern that opens few groups is shallow, and is read where it is. Any other is read on a
 /// thread of its own with a stack for the deepest nesting the limits allow. (Go grows the stack of a goroutine as
 /// it is needed, so the Go engine has no such step.) `None` when that thread could not be started.
-pub(crate) fn on_a_deep_stack<T: Send>(pattern: &str, work: impl FnOnce() -> T + Send) -> Option<T> {
-    if shallow(pattern) {
+pub(crate) fn on_a_deep_stack<T: Send>(
+    pattern: &str,
+    unicode_sets: bool,
+    work: impl FnOnce() -> T + Send,
+) -> Option<T> {
+    if shallow(pattern, unicode_sets) {
         return Some(work());
     }
     deep(work)
@@ -200,12 +205,13 @@ pub(crate) fn deep<T: Send>(work: impl FnOnce() -> T + Send) -> Option<T> {
     })
 }
 
-/// Whether a pattern opens few enough groups and classes to be read on the stack of the thread that asks. A class of
-/// the v flag's grammar may hold a class, and the parser goes a level deeper for each, as it does for a group, so a
-/// `[` counts as a `(` does. In the other grammars a `[` opens no level, and counting it only sends a pattern with
-/// many of them to the deep stack, which is safe.
-pub(crate) fn shallow(pattern: &str) -> bool {
-    pattern.bytes().filter(|&b| b == b'(' || b == b'[').count() <= SHALLOW
+/// Whether a pattern opens few enough groups to be read on the stack of the thread that asks. With the v flag a class
+/// may hold a class, and the parser goes a level deeper for each, as it does for a group, so there a `[` counts as a
+/// `(` does. In the other grammars a class holds no class and a `[` opens no level: counting it would send a pattern
+/// of many classes to a thread of its own for nothing, at some times the cost of compiling it, and refuse it where no
+/// thread can be started.
+pub(crate) fn shallow(pattern: &str, unicode_sets: bool) -> bool {
+    pattern.bytes().filter(|&b| b == b'(' || (unicode_sets && b == b'[')).count() <= SHALLOW
 }
 
 /// The error of a pattern that nests deeply when no thread could be started to read it: the pattern is refused as
@@ -312,7 +318,7 @@ pub(crate) fn read_with(pattern: &str, syntax: parse::Syntax) -> Result<(parse::
 /// the u flag grammar, and when that refuses it, with the Annex B grammar.
 #[cfg(test)]
 pub(crate) fn compile(pattern: &str) -> Result<Regex, Error> {
-    on_a_deep_stack(pattern, || {
+    on_a_deep_stack(pattern, false, || {
         let (root, facts, ps) = read(pattern)?;
         let flags = Flags { unicode: facts.unicode, ..Flags::default() };
         Ok(Regex::from_tree(pattern, flags, root, facts, &ps))
@@ -324,13 +330,13 @@ pub(crate) fn compile(pattern: &str) -> Result<Regex, Error> {
 /// read to its end and is reported as not valid.
 #[cfg(test)]
 pub(crate) fn valid(pattern: &str) -> bool {
-    on_a_deep_stack(pattern, || parse::parse(pattern, true).is_ok()).unwrap_or(false)
+    on_a_deep_stack(pattern, false, || parse::parse(pattern, true).is_ok()).unwrap_or(false)
 }
 
 /// Reads the pattern without compiling it, as [`compile`] reads it.
 #[cfg(test)]
 pub(crate) fn check(pattern: &str) -> Result<Facts, Error> {
-    on_a_deep_stack(pattern, || read(pattern).map(|(_, facts, _)| facts)).unwrap_or(Err(NO_DEEP_STACK))
+    on_a_deep_stack(pattern, false, || read(pattern).map(|(_, facts, _)| facts)).unwrap_or(Err(NO_DEEP_STACK))
 }
 
 /// The examples of the README, run as tests.
