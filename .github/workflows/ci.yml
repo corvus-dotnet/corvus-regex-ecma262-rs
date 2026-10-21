@@ -1,6 +1,7 @@
-# Build, clippy (warnings denied), the tests, the ECMA-262 test data and the C smoke test, on Linux and Windows. The
-# data (github.com/corvus-dotnet/ecma262-regex-test-data) is pinned to a commit; the pass is 0 wrong answers, 0
-# refusals of a valid pattern, 0 acceptances of an invalid one and 0 matches at their limit, in both encodings.
+# Build, clippy (warnings denied), the tests, the ECMA-262 test data, the C smoke test and the test data through the C
+# library, on Linux and Windows. The data (github.com/corvus-dotnet/ecma262-regex-test-data) is pinned to a commit;
+# the pass is 0 wrong answers, 0 refusals of a valid pattern, 0 acceptances of an invalid one and 0 matches at their
+# limit, in both encodings, through the crate and through the C library.
 name: ci
 on:
   push:
@@ -59,12 +60,6 @@ jobs:
       env:
         RUSTFLAGS: --cfg corvus_memo_from_the_start
         CARGO_TARGET_DIR: target/memo
-    - name: Keep the wrong cases
-      if: failure()
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-      with:
-        name: wrong-cases-${{ matrix.os }}
-        path: wrong-cases*.tsv
     - name: Build the C library
       run: cargo build -j 4 --release -p corvus-regex-ecma262-capi
     - name: The C smoke test
@@ -73,3 +68,20 @@ jobs:
         cmake -S corvus-regex-ecma262-capi/tests/native -B build/native -DCRE_LIB_DIR="$PWD/target/release"
         cmake --build build/native --config Release
         ctest --test-dir build/native -C Release --output-on-failure
+    - name: The ECMA-262 test data through the C library
+      # A C program (tools/c/dataset.c) linking the library through its header, judged as the Rust runner judges the
+      # crate: 0 wrong, and every file's counts the crate's.
+      shell: bash
+      run: |
+        cmake -S tools/c -B build/tools -DCRE_LIB_DIR="$PWD/target/release"
+        cmake --build build/tools --config Release -j 4
+        build/tools/bin/dataset ecma262-regex-test-data/data wrong-cases-c.tsv | tee dataset-c.txt
+        target/release/dataset ecma262-regex-test-data/data wrong-cases.tsv > dataset-rust.txt
+        counts() { sed -E 's/ +[0-9.]+s\r?$//; s/  in [0-9.]+s\r?$//' "$1"; }
+        diff <(counts dataset-rust.txt) <(counts dataset-c.txt)
+    - name: Keep the wrong cases
+      if: failure()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: wrong-cases-${{ matrix.os }}
+        path: wrong-cases*.tsv
