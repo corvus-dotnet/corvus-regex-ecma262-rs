@@ -285,12 +285,18 @@ static test_result test_status(cre_status status, bool matched, const char **why
 
 static test_result engine_test16(engine_re *re, const uint16_t *text, size_t len, const char **why) {
     bool matched = false;
-    return test_status(cre_regex_is_match_limit_utf16(re, text, len, LIMIT_MS, &matched), matched, why);
+    /* The call first: the order in which a function's arguments are evaluated is unspecified (MSVC goes from the
+     * right). */
+    cre_status status = cre_regex_is_match_limit_utf16(re, text, len, LIMIT_MS, &matched);
+    return test_status(status, matched, why);
 }
 
 static test_result engine_test8(engine_re *re, const char *text, size_t len, const char **why) {
     bool matched = false;
-    return test_status(cre_regex_is_match_limit(re, text, len, LIMIT_MS, &matched), matched, why);
+    /* The call first: the order in which a function's arguments are evaluated is unspecified (MSVC goes from the
+     * right). */
+    cre_status status = cre_regex_is_match_limit(re, text, len, LIMIT_MS, &matched);
+    return test_status(status, matched, why);
 }
 
 #else /* DATASET_QUICKJS */
@@ -1120,7 +1126,7 @@ static void judge_captures(const json *r, const json *pattern, counts *c, lines 
             if (!json_is_true(json_get(valid, mode))) continue;
             const json *a = json_get(test, mode);
             if (!a) continue;
-            char mode_flags[32], gflags[32], yflags[32];
+            char mode_flags[32], gflags[40], yflags[40];
             snprintf(mode_flags, sizeof mode_flags, "%s%s", flags, m == 0 ? "u" : "");
             snprintf(gflags, sizeof gflags, "%sg", mode_flags);
             snprintf(yflags, sizeof yflags, "%sy", mode_flags);
