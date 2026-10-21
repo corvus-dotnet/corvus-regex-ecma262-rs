@@ -14,7 +14,7 @@
 # - test data directory: the data/ directory of github.com/corvus-dotnet/ecma262-regex-test-data; without it the
 #   repository is cloned at depth 1.
 #
-# Optional settings: ROUNDS (7), SECONDS_EACH (0.3) and PASSES (3) of the interleaved protocol and SPREAD (0.05),
+# Optional settings: ROUNDS (3), SECONDS_EACH (0.7) and PASSES (7) of the interleaved protocol and SPREAD (0.05),
 # the spread over which a figure is listed, or JOB=short for a quick look (3 rounds of 0.1 s, one pass); CORES, a
 # taskset core list to run the timed parts on; SETTLE, seconds to wait between the builds and the timed parts (0; 180 for a measured run on a quiet machine);
 # SKIP_BUILD=1 when the binaries are built (the image); REGRESS_COMPLIANCE=1 to work out regress's compliance again (over an hour) rather than take

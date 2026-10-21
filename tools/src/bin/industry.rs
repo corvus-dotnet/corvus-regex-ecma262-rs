@@ -2,12 +2,14 @@
 //! (`tools/benchmarks/v8/industry.mjs`) counts it, in nanoseconds per count.
 //!
 //!   industry <workloads.json> [--engines corvus-utf8,corvus-utf16,regex,regress,v8] [--v8 <industry.mjs>]
-//!            [--rounds 7] [--seconds 0.3] [--passes 3] [--spread 0.05] [--filter <substring of the id>]
+//!            [--rounds 3] [--seconds 0.7] [--passes 7] [--spread 0.05] [--filter <substring of the id>]
 //!            [--out <results.json>]
 //!
 //! The protocol is interleaved, so that what changes on the host over a run (its clock, its heat, its other work)
-//! falls on every engine alike rather than on whichever engine was running then: rounds are the outer loop, the
-//! workloads next and the engines innermost, their order turned by one each round. Each figure is a child process of
+//! falls on every engine alike rather than on whichever engine was running then: the workloads are the outer loop,
+//! each workload's rounds next and the engines innermost, their order turned by one each round. A workload's rounds
+//! are therefore seconds apart, as its engines are: on an unpinned host, whose speed drifts over minutes, rounds
+//! minutes apart spread a figure by more than the engines differ. Each figure is a child process of
 //! its own (as BenchmarkDotNet runs out of process), so that one engine's caches and allocations do not reach
 //! another's figures; it warms for two fifths of its seconds, then times `passes` passes of as many counts as fit
 //! the rest and reports their median. A workload's figure for an engine is the median of its rounds, with the
@@ -336,9 +338,9 @@ fn main() {
             }
             e
         });
-    let rounds: usize = opt("--rounds").map_or(7, |r| r.parse().unwrap());
-    let seconds = opt("--seconds").unwrap_or_else(|| "0.3".into());
-    let passes = opt("--passes").unwrap_or_else(|| "3".into());
+    let rounds: usize = opt("--rounds").map_or(3, |r| r.parse().unwrap());
+    let seconds = opt("--seconds").unwrap_or_else(|| "0.7".into());
+    let passes = opt("--passes").unwrap_or_else(|| "7".into());
     let limit: f64 = opt("--spread").map_or(0.05, |s| s.parse().unwrap());
     let filter = opt("--filter");
     let all = workloads(path);
@@ -354,8 +356,8 @@ fn main() {
     let mut figures: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); all.len()]; engines.len()];
     let mut lines: Vec<Vec<Option<String>>> = vec![vec![None; all.len()]; engines.len()];
     let mut v8_engine = String::new();
-    for round in 0..rounds {
-        for &k in &chosen {
+    for (done, &k) in chosen.iter().enumerate() {
+        for round in 0..rounds {
             for turn in 0..engines.len() {
                 let e = (turn + round) % engines.len();
                 let line = figure(&exe, v8.as_deref(), path, k, &engines[e], &seconds, &passes);
@@ -372,7 +374,7 @@ fn main() {
                 lines[e][k] = Some(line);
             }
         }
-        eprintln!("round {} of {rounds} done", round + 1);
+        eprintln!("workload {} of {} done", done + 1, chosen.len());
     }
     let _ = std::fs::remove_dir_all(&plain);
     let mut over: Vec<String> = Vec::new();

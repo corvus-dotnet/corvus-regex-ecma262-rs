@@ -2,10 +2,11 @@
  * the Rust harness (tools/src/bin/industry.rs, docs/benchmarks/README.md), of which this is a port:
  *
  *   industry <workloads.json> [--engines corvus-utf8,corvus-utf16,quickjs,pcre2,v8] [--v8 <industry.mjs>]
- *            [--rounds R] [--seconds S] [--passes P] [--spread 0.05] [--filter <substring of the id>]
+ *            [--rounds 3] [--seconds 0.7] [--passes 7] [--spread 0.05] [--filter <substring of the id>]
  *            [--out <results.json>]
  *
- * Rounds are the outer loop, the workloads next and the engines innermost, their order turned by one each round. Each
+ * The workloads are the outer loop, each workload's rounds next and the engines innermost, their order turned by one
+ * each round, so that a workload's rounds are seconds apart, as its engines are. Each
  * figure is a child process of its own (`industry --one`, or `node industry.mjs --one` for V8), which warms for two
  * fifths of its seconds, then times `passes` passes of as many counts as fit the rest and reports their median. A
  * workload's figure for an engine is the median of its rounds, with the fastest and the slowest round as its spread;
@@ -652,9 +653,9 @@ int main(int argc, char **argv) {
         }
         if (v8) engines[engine_count++] = "v8";
     }
-    int rounds = opt(argc, argv, "--rounds") ? atoi(opt(argc, argv, "--rounds")) : 7;
-    const char *seconds = opt(argc, argv, "--seconds") ? opt(argc, argv, "--seconds") : "0.3";
-    const char *passes = opt(argc, argv, "--passes") ? opt(argc, argv, "--passes") : "3";
+    int rounds = opt(argc, argv, "--rounds") ? atoi(opt(argc, argv, "--rounds")) : 3;
+    const char *seconds = opt(argc, argv, "--seconds") ? opt(argc, argv, "--seconds") : "0.7";
+    const char *passes = opt(argc, argv, "--passes") ? opt(argc, argv, "--passes") : "7";
     double limit = opt(argc, argv, "--spread") ? atof(opt(argc, argv, "--spread")) : 0.05;
     const char *filter = opt(argc, argv, "--filter");
     size_t count;
@@ -695,9 +696,9 @@ int main(int argc, char **argv) {
 
     figures *f = calloc(engine_count * count, sizeof *f);
     char *v8_engine = strdup("");
-    for (int round = 0; round < rounds; round++) {
-        for (size_t c = 0; c < chosen_n; c++) {
-            size_t k = chosen[c];
+    for (size_t c = 0; c < chosen_n; c++) {
+        size_t k = chosen[c];
+        for (int round = 0; round < rounds; round++) {
             for (size_t turn = 0; turn < engine_count; turn++) {
                 size_t e = (turn + (size_t)round) % engine_count;
                 char *line = figure(exe, v8, path, k, engines[e], seconds, passes);
@@ -721,7 +722,7 @@ int main(int argc, char **argv) {
                 fig->line = line;
             }
         }
-        fprintf(stderr, "round %d of %d done\n", round + 1, rounds);
+        fprintf(stderr, "workload %zu of %zu done\n", c + 1, chosen_n);
     }
     char rm[512];
     snprintf(rm, sizeof rm, "rm -rf '%s'", plain);

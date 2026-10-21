@@ -88,7 +88,7 @@ TEXTS = {"sherlock": "Sherlock Holmes (0.6 M chars)", "leipzig": "Leipzig corpus
 runner = " ".join(x for x in (facts.get("runner", ""), facts.get("runner_os", ""), facts.get("image", "")) if x)
 host = f"{facts.get('cpu', '')}, {facts.get('os', '')}, {facts.get('cores', '')} cores (affinity {facts.get('affinity', '')}), load {facts.get('load', '')} at the start"
 if facts.get("protocol") == "interleaved":
-    job = (f"interleaved: {facts.get('rounds')} rounds, each over every workload with the engines in turn (their order "
+    job = (f"interleaved: every workload in turn, each in {facts.get('rounds')} rounds of the engines in turn (their order "
            f"turned each round), each figure a process of its own warmed and timed for {facts.get('seconds')} s "
            f"({facts.get('passes')} passes); a workload's figure is the median of its rounds, the spread its fastest "
            f"and slowest round")

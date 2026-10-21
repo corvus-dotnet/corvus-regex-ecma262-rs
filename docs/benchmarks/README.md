@@ -15,13 +15,14 @@ with `gu` added.
 The harness (`tools/src/bin/industry.rs`, driven by `tools/benchmarks/run.sh`) interleaves the engines, so that what
 changes on the host during a run (its clock, its heat, its other work) falls on every engine alike:
 
-- **Rounds outside, workloads next, engines inside.** The run is 7 rounds; each round goes over every workload, and for
-  each workload runs every engine in turn, the order of the engines turned by one each round. A workload's figures for
-  two engines are therefore seconds apart, not minutes.
+- **Workloads outside, rounds next, engines inside.** The run goes over every workload in turn; each workload has 3
+  rounds, and each round runs every engine in turn, the order of the engines turned by one each round. A workload's
+  figures for two engines are therefore seconds apart, and so are its rounds: on an unpinned host, whose speed drifts
+  over minutes, rounds minutes apart spread a figure by more than the engines differ.
 - **One process per figure.** Each turn is a process of its own (`industry --one`, or `node industry.mjs --one` for
-  V8), which warms for two fifths of 0.3 seconds and times 3 passes of as many counts as fit the rest, and reports
+  V8), which warms for two fifths of 0.7 seconds and times 7 passes of as many counts as fit the rest, and reports
   their median. The texts are unzipped once by the run and read by every process.
-- **The figure and its spread.** A workload's figure for an engine is the median of its 7 rounds; the fastest and the
+- **The figure and its spread.** A workload's figure for an engine is the median of its 3 rounds; the fastest and the
   slowest round are kept as its spread. Where (slowest - fastest) / median is over 5%, the run says so on its output
   (`SPREAD` lines) and lists the figure in the data's facts (`spread_over`, and the page's Spread fact): such a figure
   is not a clean one.
@@ -30,16 +31,19 @@ changes on the host during a run (its clock, its heat, its other work) falls on 
   workload carries "counts differ" with both counts.
 
 `ROUNDS`, `SECONDS_EACH`, `PASSES` and `SPREAD` change the protocol's numbers; `JOB=short` is 3 rounds of 0.1 s for a
-look. Measured on the reference machine (an unpinned i7-13800H laptop under WSL), two runs back to back on one build
-differ by a median of 2.3% a figure (90% within 5.1%), every figure within its spread; the spread itself is a median
-of 10% there, and more on the Leipzig text, whose 16 MB fills that machine's last-level cache. On that host most
-figures are therefore listed as over 5%; a pinned host is needed for clean figures.
+look. The numbers were chosen on the reference machine (an unpinned i7-13800H laptop under WSL, cores 0-11): there the
+earlier protocol, 7 rounds of 0.3 s and 3 passes with the rounds outermost, gave a median spread of 12.5% a figure; 3
+rounds of 0.7 s and 7 passes, in about the same time, gave 6.7%; and with each workload's rounds back to back, as now,
+the full run gives 6.0% (Rust) and 7.0% (C) in 497 s and 623 s. The same figure timed again and again back to back
+moves by about 2%, so what is left is the host's own drift between processes, which neither longer turns (3 rounds
+of 1.4 s gave 8.6% in twice the time) nor more passes remove. On that host most figures are still listed as over 5%;
+a pinned host is needed for clean figures.
 
 For the central results contract, every port's image follows the same protocol:
 
-> A run measures every engine on every workload in rounds: rounds are the outer loop, workloads the next and engines
-> the innermost, with the engine order turned by one each round, and each figure timed in a process of its own after
-> a warm-up. A workload's figure is the median over the rounds, and its spread is the fastest and the slowest round.
+> A run measures every engine on every workload in rounds: workloads are the outer loop, each workload's rounds the
+> next and engines the innermost, with the engine order turned by one each round, and each figure timed in a process
+> of its own after a warm-up. A workload's figure is the median over the rounds, and its spread is the fastest and the slowest round.
 > A figure whose spread, (slowest - fastest) / median, is over the run's limit (5% unless the run says otherwise) is
 > listed in the run's facts and is never presented as a clean figure. Every engine's match count is compared with
 > V8's: an ECMA-262 engine whose count differs is an error on that workload, and any other engine's differing count
