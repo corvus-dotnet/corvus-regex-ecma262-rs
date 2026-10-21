@@ -169,7 +169,7 @@ impl Regex {
     /// [`Regex::new`] with the flags already read.
     pub fn with_flags(pattern: &str, flags: Flags) -> Result<Regex, Error> {
         let syntax = flags.syntax();
-        on_a_deep_stack(pattern, || {
+        on_a_deep_stack(pattern, flags.unicode_sets, || {
             let (root, facts, ps) = read_with(pattern, syntax)?;
             Ok(Regex::from_tree(pattern, flags, root, facts, &ps))
         })
@@ -179,13 +179,14 @@ impl Regex {
     /// Whether the pattern is valid with the flags, without compiling it.
     pub fn is_valid(pattern: &str, flags: &str) -> bool {
         let Ok(flags) = Flags::parse(flags) else { return false };
-        on_a_deep_stack(pattern, || parse::parse_with(pattern, flags.syntax()).is_ok()).unwrap_or(false)
+        on_a_deep_stack(pattern, flags.unicode_sets, || parse::parse_with(pattern, flags.syntax()).is_ok())
+            .unwrap_or(false)
     }
 
     pub(crate) fn from_tree(pattern: &str, flags: Flags, root: Node, facts: Facts, ps: &parse::Parser) -> Regex {
         let regular = !facts.needs_backtracking && facts.re2_cost <= MAX_RE2_COST;
         let dfa = OnceLock::new();
-        if regular && !shallow(pattern) {
+        if regular && !shallow(pattern, flags.unicode_sets) {
             // The automaton is built from the syntax tree, so that of a pattern that nests deeply is built here
             // and not on the stack of the thread that first matches.
             let _ = dfa.set(dfa::build_dfa(&root));
@@ -248,7 +249,11 @@ impl Regex {
                 let (root, _) = parse::parse_with(&self.pattern, self.flags.syntax()).expect("the pattern was read");
                 compile::compile_program(root, self.unicode(), Some(self.info.groups))
             };
-            if shallow(&self.pattern) { build() } else { deep(build).expect("a thread to read a deep pattern") }
+            if shallow(&self.pattern, self.flags.unicode_sets) {
+                build()
+            } else {
+                deep(build).expect("a thread to read a deep pattern")
+            }
         })
     }
 

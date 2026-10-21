@@ -147,8 +147,10 @@ beside its figures: see [docs/benchmarks](docs/benchmarks/README.md), and the re
   archive (the header, the shared and the static library, a CMake package and a pkg-config file).
 - `tools/c`: the C tools over the C library, each a C program that links it through its header: the data-set runner
   (`dataset`, and `dataset-quickjs` over QuickJS's libregexp) and the benchmark harness (`tools/c/run.sh`).
-- `tools`: the data-set runner (`cargo run --release --bin dataset -- <data dir> <wrong.tsv> [--engine regress]`) and
-  the benchmark harness (`tools/benchmarks/run.sh`, over `cargo run --release --bin industry`).
+- `tools`: the data-set runner (`cargo run --release --bin dataset -- <data dir> <wrong.tsv> [--engine regress]`),
+  the stack probe (`cargo run --release --bin stack-probe`: deep, wide and long patterns, each in a process of its
+  own on small stacks, none of which may end the process) and the benchmark harness (`tools/benchmarks/run.sh`, over
+  `cargo run --release --bin industry`).
 - `docs/design.md`: what differs from the .NET reference engine and why; `docs/port-checklist.md`: each optimisation
   of the reference, done, not applicable or to do.
 

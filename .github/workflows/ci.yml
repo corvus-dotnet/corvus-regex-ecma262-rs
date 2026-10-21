@@ -52,6 +52,10 @@ jobs:
         ref: 41ed6db477c0d57192673a3a1a76a3b7a194603b
         path: ecma262-regex-test-data
         persist-credentials: false
+    - name: Probe for stack overflows
+      # Deep, wide and long patterns in every grammar through every member, each in a process of its own on stacks
+      # of 8 MB, 1 MB and 256 KB: none may end the process (tools/src/bin/stack-probe.rs).
+      run: cargo run -j 4 --release --bin stack-probe
     - name: Run the ECMA-262 test data
       run: cargo run -j 4 --release --bin dataset -- ecma262-regex-test-data/data wrong-cases.tsv
     - name: Run the ECMA-262 test data with the memory of failed places from the first step

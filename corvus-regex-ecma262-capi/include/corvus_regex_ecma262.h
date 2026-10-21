@@ -46,7 +46,7 @@ extern "C" {
 /* The header's version: compare with cre_version(), the library's. */
 #define CRE_VERSION_MAJOR 0
 #define CRE_VERSION_MINOR 1
-#define CRE_VERSION_PATCH 1
+#define CRE_VERSION_PATCH 2
 
 /* The limits of size of a pattern: its length in bytes, the depth its groups nest to, and the size counted for it as
  * it is read. A pattern over any of them is CRE_PATTERN_TOO_LARGE. */
