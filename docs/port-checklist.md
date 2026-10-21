@@ -8,11 +8,12 @@ here, and the plan leaves it out. Where this port does a thing another way, the 
 
 | Count | |
 |---|---|
-| Done | 45 |
+| Done | 46 |
 | Not applicable | 5 |
 | To do | 0 |
 
-Items 1 to 38 are the reference's; items 39 to 50 are what bringing the engine level with the `regex` crate added.
+Items 1 to 38 are the reference's; items 39 to 50 are what bringing the engine level with the `regex` crate added;
+item 51 is what brought the C library level with the crate.
 
 ## Section 4.2: the program and the working memory
 
@@ -134,6 +135,12 @@ character (the Cyrillic letters with a three-byte form, 1.2 times slower); the a
 literal (`the` /i, 1.1 times slower than comparing them); over UTF-16, the case forms of a set packed as their own bytes
 (Teddy with 32 literals in eight buckets took 24 ms on the Leipzig text against 3.8 ms in sixteen, and folding the
 packed text to lower case beat both) and a separate kernel for one unit before the loads were aligned.
+
+## Beyond the reference: the C library level with the crate
+
+| # | Optimisation | State | In this port |
+|---|---|---|---|
+| 51 | The matches of a global search a batch at a time, in one loop, with the results of the search and the matcher in registers | done | `Matches::next_batch` and `CaptureMatches::next_batch` (the C library's `cre_matches_next_batch` and `cre_matches_next_captures_batch`) fill a slice the caller owns: a pattern of a simple shape by the search inlined into one loop over the batch (one class and one loop of a class each by a loop of its own, an empty match before an ASCII unit going on one unit later without a call), any other by the matcher with the thread's memory taken once for the batch, and the groups written from the matcher's memory with no allocation. `match_with` returns two words (a start of `NO_MATCH`, `STOPPED_TIME` or `STOPPED_MEMORY` for the rest): a `Result` or an `Option` of a pair merged from several arms came back through memory written as two words and read back as one, a failed store forward on every match. Over the Sherlock text the C library took twice the crate's time on the rows with most matches (`.*`, `[^\n]*`, `\p{L}`, `\p{Ll}`: 473, 324, 5,827 and 5,499 us against the crate's 239, 172, 2,686 and 2,752 us), which a call a match does not explain: the crate's loop had the search inlined, the library's called through three functions a match with the stalls between them. With the batch they take 259, 174, 2,387 and 2,457 us, 0.89 to 1.08 of the crate's time; the captures of `(\w+)` take 36 ns a match against 60 ns with `cre_matches_next_captures` and 42 ns with the crate's `captures_read_at`. |
 
 ## The search layer, step by step
 

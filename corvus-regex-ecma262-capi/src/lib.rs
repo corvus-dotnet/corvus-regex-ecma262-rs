@@ -126,6 +126,18 @@ pub struct cre_match {
     pub end: usize,
 }
 
+impl From<Option<(usize, usize)>> for cre_match {
+    fn from(span: Option<(usize, usize)>) -> cre_match {
+        cre_match::of(span)
+    }
+}
+
+impl From<(usize, usize)> for cre_match {
+    fn from((start, end): (usize, usize)) -> cre_match {
+        cre_match { start, end }
+    }
+}
+
 impl cre_match {
     const UNSET: cre_match = cre_match { start: CRE_UNSET, end: CRE_UNSET };
 
@@ -1361,6 +1373,91 @@ pub unsafe extern "C" fn cre_matches_next(
         }
         Ok(())
     })
+}
+
+/// The next matches of a global search, up to `capacity` of them, written in order to `out_matches[0]` to
+/// `out_matches[*out_count - 1]`: the matches `cre_matches_next` would give one call each, with one call for many.
+/// `*out_count` is less than `capacity` only when the search has found every match, so a call that writes 0 ends it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_matches_next_batch(
+    matches: *mut cre_matches,
+    out_matches: *mut cre_match,
+    capacity: usize,
+    out_count: *mut usize,
+) -> cre_status {
+    guard(|| {
+        let count = unsafe { out(out_count, "out_count") }?;
+        *count = 0;
+        let m = unsafe { handle_mut(matches, "matches") }?;
+        if capacity == 0 {
+            return Ok(());
+        }
+        if out_matches.is_null() {
+            return Err(Failure::argument(format!("out_matches is NULL with a capacity of {capacity}")));
+        }
+        // SAFETY: the caller passes `capacity` writable entries at `out_matches`.
+        let place = unsafe { std::slice::from_raw_parts_mut(out_matches, capacity) };
+        *count = match &mut m.iter {
+            Iter::Find8(it) => it.next_batch(place),
+            Iter::Find16(it) => it.next_batch(place),
+            Iter::Captures8(it) => fill(place, it.map(|c| (c.get_match().start(), c.get_match().end()))),
+            Iter::Captures16(it) => fill(place, it.map(|c| (c.get_match().start(), c.get_match().end()))),
+        };
+        Ok(())
+    })
+}
+
+/// The next matches of a global search made by `cre_regex_captures_iter` (or its UTF-16 form) with their groups,
+/// written in order to `out_groups`: each match as `cre_regex_group_count(regex) + 1` entries (the match, then each
+/// group, `CRE_UNSET` for one that did not take part), as many matches as `capacity` entries hold, and
+/// `*out_count` matches. `*out_count` is less than that only when the search has found every match. A capacity of 0
+/// writes nothing (`out_groups` may then be NULL); a capacity that holds no match, or a search made by
+/// `cre_regex_find_iter`, is `CRE_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_matches_next_captures_batch(
+    matches: *mut cre_matches,
+    out_groups: *mut cre_match,
+    capacity: usize,
+    out_count: *mut usize,
+) -> cre_status {
+    guard(|| {
+        let count = unsafe { out(out_count, "out_count") }?;
+        *count = 0;
+        let m = unsafe { handle_mut(matches, "matches") }?;
+        if !m.captures() {
+            return Err(Failure::argument("the search was made by cre_regex_find_iter, which keeps no groups"));
+        }
+        if capacity == 0 {
+            return Ok(());
+        }
+        // SAFETY: a handle this library created that the caller keeps alive while the search lives.
+        let width = unsafe { &*m.regex }.inner.captures_len();
+        if capacity < width {
+            return Err(Failure::argument(format!("a capacity of {capacity} holds no match of {width} groups")));
+        }
+        if out_groups.is_null() {
+            return Err(Failure::argument(format!("out_groups is NULL with a capacity of {capacity}")));
+        }
+        // SAFETY: the caller passes `capacity` writable entries at `out_groups`.
+        let place = unsafe { std::slice::from_raw_parts_mut(out_groups, capacity) };
+        *count = match &mut m.iter {
+            Iter::Captures8(it) => it.next_batch(place),
+            Iter::Captures16(it) => it.next_batch(place),
+            _ => unreachable!(),
+        };
+        Ok(())
+    })
+}
+
+/// Writes the spans `spans` gives into `place` in order, asking for no more than `place` holds: how many.
+fn fill(place: &mut [cre_match], spans: impl Iterator<Item = (usize, usize)>) -> usize {
+    let mut n = 0;
+    // `zip` asks `place` first, so no match is taken from the search once `place` is full.
+    for (slot, (start, end)) in place.iter_mut().zip(spans) {
+        *slot = cre_match { start, end };
+        n += 1;
+    }
+    n
 }
 
 /// The next match of a global search made by `cre_regex_captures_iter` (or its UTF-16 form), with its groups written

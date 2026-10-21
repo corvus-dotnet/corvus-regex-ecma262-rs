@@ -66,7 +66,8 @@ assert!(Regex::new(r"^a\ud800b$", "u").unwrap().is_match_utf16(&text));
 ```
 
 A loop over many matches that needs the groups reads them into a `CaptureLocations` with `captures_read_at`, which
-allocates nothing. `try_is_match`, `try_find_at` and `try_captures_at` take a limit on the time a match may take and
+allocates nothing; `next_batch` on `find_iter` and `captures_iter` writes the next matches (with their groups, for
+`captures_iter`) into a slice, a batch at a time, which allocates nothing either. `try_is_match`, `try_find_at` and `try_captures_at` take a limit on the time a match may take and
 return `MatchError` when it is reached.
 
 ### From C
@@ -76,7 +77,8 @@ The `corvus-regex-ecma262-capi` crate builds `libcorvus_regex_ecma262` (shared a
 an archive of them for each platform, with a CMake package (`find_package(corvus_regex_ecma262)`) and a pkg-config
 file. Each member of `Regex`
 has its C function, over UTF-8 and (with the suffix `_utf16`) over UTF-16: `is_match`, `find`, the groups by number
-(into a buffer the caller owns) and by name (into a reusable `cre_captures`), the global search (`cre_matches`),
+(into a buffer the caller owns) and by name (into a reusable `cre_captures`), the global search (`cre_matches`, a
+match a call or a batch of them into an array the caller owns, with or without the groups),
 `replace` and `replace_all` with every `$` form, and `split`, each matching function with a `_limit` form that takes
 a limit of time. Every fallible function returns a `cre_status` with a message for the thread, owned results have a
 free function each, and no panic crosses into the caller.
@@ -91,6 +93,14 @@ if (cre_regex_new("(?<word>\\p{Lu}\\w+)", 18, "gu", 2, &re) == CRE_OK) {
         while (cre_matches_next(it, &m, &found) == CRE_OK && found) {
             printf("%.*s\n", (int)(m.end - m.start), text + m.start);
         }
+        /* Or a batch at a time, which spares a call for each match: fewer than asked for ends the search. */
+        cre_match batch[256];
+        size_t n;
+        cre_matches_reset(it);
+        do {
+            if (cre_matches_next_batch(it, batch, 256, &n) != CRE_OK) break;
+            /* batch[0] to batch[n - 1] */
+        } while (n == 256);
         cre_matches_free(it);
     }
     cre_string out;

@@ -222,3 +222,133 @@ fn a_run_of_the_dot_with_the_s_flag_is_the_rest_of_the_text() {
         }
     }
 }
+
+#[test]
+fn a_batch_of_matches_is_what_find_iter_gives() {
+    // Each shape the batch has a loop for (one class, one loop of a class with each way of finding a run's end, the
+    // literals, the literals with forms), the matcher, the sticky flag and an anchored pattern, with empty matches
+    // between the halves of a pair and lone halves in the UTF-16 text.
+    let patterns: [(&str, &str); 22] = [
+        (r"\p{L}", ""),
+        (r"\p{L}", "u"),
+        (r"[^\n]*", ""),
+        (r".*", ""),
+        (r".*", "u"),
+        (r".*", "s"),
+        (r".+", "u"),
+        (r"[a-z]*", ""),
+        (r"\w+", ""),
+        (r"x*", ""),
+        (r"x*", "u"),
+        (r"", "u"),
+        (r"", ""),
+        (r"ab", ""),
+        (r"ab|cd", ""),
+        (r"ab", "i"),
+        (r"the\s+\w+", ""),
+        (r"(a)\1", ""),
+        (r"a", "y"),
+        (r"^a", "m"),
+        (r"\b\w", ""),
+        (r"\ud83d", ""),
+    ];
+    let texts = ["", "a", "ab cd AB\nthe  cat x\u{1F600}x\r\naa a\u{2028}é\u{1F600}", "\n\n", "aaa ab"];
+    for (pattern, flags) in patterns {
+        let re = Regex::new(pattern, flags).unwrap();
+        for text in texts {
+            let want: Vec<(usize, usize)> = re.find_iter(text).map(|m| (m.start(), m.end())).collect();
+            let mut t16 = utf16(text);
+            t16.push(0xD800);
+            t16.insert(0, 0xDC00);
+            let want16: Vec<(usize, usize)> = re.find_iter_utf16(&t16).map(|m| (m.start(), m.end())).collect();
+            for size in [1, 2, 3, 7, 64] {
+                let mut it = re.find_iter(text);
+                let (mut got, mut spans) = (Vec::new(), vec![(0, 0); size]);
+                loop {
+                    let n = it.next_batch(&mut spans);
+                    got.extend_from_slice(&spans[..n]);
+                    if n < size {
+                        break;
+                    }
+                }
+                assert_eq!(got, want, "/{pattern}/{flags} over {text:?} in batches of {size}");
+                assert_eq!(it.next_batch(&mut spans), 0);
+                assert!(it.next().is_none());
+                let mut it = re.find_iter_utf16(&t16);
+                let mut got = Vec::new();
+                // Batches and single matches mixed.
+                loop {
+                    let n = it.next_batch(&mut spans);
+                    got.extend_from_slice(&spans[..n]);
+                    if n < size {
+                        break;
+                    }
+                    got.extend(it.next().map(|m| (m.start(), m.end())));
+                }
+                assert_eq!(got, want16, "/{pattern}/{flags} over UTF-16 {t16:?} in batches of {size}");
+            }
+            assert_eq!(re.find_iter(text).next_batch::<(usize, usize)>(&mut []), 0);
+        }
+    }
+}
+
+#[test]
+fn a_batch_of_captures_is_what_captures_iter_gives() {
+    let patterns: [(&str, &str); 9] = [
+        (r"(\d)(x)?", ""),
+        (r"(?<y>\d{4})-(?<m>\d{2})", "u"),
+        (r"(?:(?<a>x)|(?<a>y))(z)?", ""),
+        (r"(a)\1", ""),
+        (r"(?<=(a))b", ""),
+        (r"(x*)", "u"),
+        (r"(x*)", ""),
+        (r"\w+", ""),
+        (r"(\d)", "y"),
+    ];
+    let texts = ["", "1x 2 2026-10 x yz aab ab\u{1F600}", "12x"];
+    for (pattern, flags) in patterns {
+        let re = Regex::new(pattern, flags).unwrap();
+        let width = re.captures_len();
+        for text in texts {
+            let span = |m: Option<corvus_regex_ecma262::Match<'_, _>>| m.map(|m| (m.start(), m.end()));
+            let want: Vec<Option<(usize, usize)>> =
+                re.captures_iter(text).flat_map(|c| (0..width).map(|k| span(c.get(k))).collect::<Vec<_>>()).collect();
+            let mut t16 = utf16(text);
+            t16.push(0xDC00);
+            let span16 = |m: Option<corvus_regex_ecma262::Match<'_, [u16]>>| m.map(|m| (m.start(), m.end()));
+            let want16: Vec<Option<(usize, usize)>> = re
+                .captures_iter_utf16(&t16)
+                .flat_map(|c| (0..width).map(|k| span16(c.get(k))).collect::<Vec<_>>())
+                .collect();
+            for size in [1, 2, 5, 11] {
+                // Room for `size` entries: as many matches as that holds, and what is left over is left alone.
+                let mut groups = vec![Some((7, 7)); size.max(width)];
+                let matches = groups.len() / width;
+                let mut it = re.captures_iter(text);
+                let mut got = Vec::new();
+                loop {
+                    let n = it.next_batch(&mut groups);
+                    got.extend_from_slice(&groups[..n * width]);
+                    if n < matches {
+                        break;
+                    }
+                }
+                assert_eq!(got, want, "/{pattern}/{flags} over {text:?}, {matches} a batch");
+                assert!(groups[matches * width..].iter().all(|g| *g == Some((7, 7))));
+                let mut it = re.captures_iter_utf16(&t16);
+                let mut got = Vec::new();
+                loop {
+                    let n = it.next_batch(&mut groups);
+                    got.extend_from_slice(&groups[..n * width]);
+                    if n < matches {
+                        break;
+                    }
+                }
+                assert_eq!(got, want16, "/{pattern}/{flags} over UTF-16 {t16:?}, {matches} a batch");
+            }
+            // Too little room for one match.
+            let mut small = vec![None::<(usize, usize)>; width - 1];
+            assert_eq!(re.captures_iter(text).next_batch(&mut small), 0);
+        }
+    }
+}

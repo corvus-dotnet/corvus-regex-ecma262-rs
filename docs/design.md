@@ -22,7 +22,9 @@ the `v` flag, the search layer and the automaton's word boundaries.
 
 The reference has the shape of .NET's `System.Text.RegularExpressions`; this crate has the shape a Rust user knows
 from the `regex` crate: `Regex::new(pattern, flags)`, `is_match`, `find`, `find_iter`, `captures`, `captures_iter`,
-`captures_read_at` with `CaptureLocations`, `replace`, `replace_all`, `split`. The flags are ECMA-262's, as in the
+`captures_read_at` with `CaptureLocations`, `replace`, `replace_all`, `split`. A global search also gives its matches
+a batch at a time (`next_batch` on `find_iter` and `captures_iter`, into a slice the caller owns), which the C library
+needs: a call a match across the C boundary kept the search out of the loop around it. The flags are ECMA-262's, as in the
 reference. `replace` follows `String.prototype.replace` (every match with the g flag, the first without), and
 `replace_all` replaces every match whatever the flags, as `replaceAll` with the g flag does.
 

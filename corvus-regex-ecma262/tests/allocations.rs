@@ -76,5 +76,20 @@ fn a_warm_match_allocates_nothing() {
             }
         });
         assert_eq!(n, 0, "/{pattern}/{flags}: {n} allocations reading the groups");
+        // The global search a batch at a time, the groups too.
+        let (mut spans, mut groups) = ([(0, 0); 16], [None::<(usize, usize)>; 48]);
+        let n = allocations(|| {
+            for _ in 0..2 {
+                let mut it = re.find_iter(&text);
+                while it.next_batch(&mut spans) == spans.len() {}
+                let mut it = re.find_iter_utf16(&text16);
+                while it.next_batch(&mut spans) == spans.len() {}
+                let mut it = re.captures_iter(&text);
+                while it.next_batch(&mut groups) > 0 {}
+                let mut it = re.captures_iter_utf16(&text16);
+                while it.next_batch(&mut groups) > 0 {}
+            }
+        });
+        assert_eq!(n, 0, "/{pattern}/{flags}: {n} allocations in batches");
     }
 }

@@ -10,7 +10,7 @@ use super::adfa::{Found, Scan};
 use super::charset::CharSet;
 use super::compile::{Inst, MAX_MEMO_LOOPS, Op, Program};
 use super::fold::{canonicalize, is_fold_word_rune};
-use super::search::{Literals, Plan, Shape};
+use super::search::{Literals, Plan, RunEnd, Shape};
 use super::units::{Text, is_word_unit};
 
 /// Why a match was abandoned. Neither is an answer.
@@ -44,6 +44,12 @@ pub(crate) const CHECK_EVERY: i64 = 1 << 12;
 /// consuming, such as `(?:a?){2147483647}`, reaches it in a few milliseconds. It is looked at with the clock, so
 /// the stack can go past it by `CHECK_EVERY` entries.
 pub const MAX_STACK: usize = 1 << 20;
+
+/// The start `match_with` gives for no match, and for a match abandoned at its limit of time or of memory: no
+/// position of a text is any of them.
+const NO_MATCH: usize = usize::MAX;
+const STOPPED_TIME: usize = usize::MAX - 1;
+const STOPPED_MEMORY: usize = usize::MAX - 2;
 
 // Why a match was abandoned.
 const STOP_NONE: u8 = 0;
@@ -268,14 +274,23 @@ impl Program {
         {
             return Ok(found);
         }
-        STATE.with(|cell| match cell.try_borrow_mut() {
+        let (from, to) = STATE.with(|cell| match cell.try_borrow_mut() {
             Ok(mut st) => self.match_with::<T>(&mut st, input, start, sticky, limit, caps),
             // The thread is already inside a match, which nothing in the crate does. A match is then given a
             // memory of its own.
             Err(_) => self.match_with::<T>(&mut State::default(), input, start, sticky, limit, caps),
-        })
+        });
+        match from {
+            NO_MATCH => Ok(None),
+            STOPPED_TIME => Err(MatchError::Time),
+            STOPPED_MEMORY => Err(MatchError::Memory),
+            _ => Ok(Some((from, to))),
+        }
     }
 
+    /// The match from `start` with the memory `st`: where it starts and ends, or a start of `NO_MATCH`,
+    /// `STOPPED_TIME` or `STOPPED_MEMORY`. Two words rather than a `Result`, so that they come back in registers: a
+    /// `Result` came back through memory written as two words and read as one, which stalled every match.
     fn match_with<T: Text>(
         &self,
         st: &mut State,
@@ -284,7 +299,7 @@ impl Program {
         sticky: bool,
         limit: Option<Duration>,
         caps: Option<&mut [usize]>,
-    ) -> Result<Option<(usize, usize)>, MatchError> {
+    ) -> (usize, usize) {
         st.caps.clear();
         st.caps.resize(2 * self.groups, NONE);
         st.tmp.clear();
@@ -309,9 +324,9 @@ impl Program {
             st.memo = Vec::new();
         }
         match stop {
-            STOP_TIME => Err(MatchError::Time),
-            STOP_MEMORY => Err(MatchError::Memory),
-            _ => Ok(found),
+            STOP_TIME => (STOPPED_TIME, 0),
+            STOP_MEMORY => (STOPPED_MEMORY, 0),
+            _ => found.unwrap_or((NO_MATCH, 0)),
         }
     }
 
@@ -343,6 +358,200 @@ impl Program {
             }
             Plan::Scan => self.scan::<T>(st, input, start, need),
         }
+    }
+
+    /// The matches of a global search from `at` (with no limit), as many as `spans` holds, written to its start:
+    /// how many, where the search goes on, and whether it has found every match. The matches `exec` finds one call
+    /// at a time, in one loop over the batch: a pattern of a simple shape by the search inlined into the loop (one
+    /// class and one loop of a class each by a loop of its own), any other by the matcher with the thread's memory
+    /// taken once for the batch.
+    pub(crate) fn exec_batch<T: Text, S: From<(usize, usize)>>(
+        &self,
+        input: &[T::Unit],
+        mut at: usize,
+        unicode: bool,
+        sticky: bool,
+        spans: &mut [S],
+    ) -> (usize, usize, bool) {
+        let mut n = 0;
+        if self.groups == 0 && !sticky && !self.anchored {
+            let done;
+            (n, at, done) = self.shape_batch::<T, S>(input, at, unicode, spans);
+            if let Some(done) = done {
+                return (n, at, done);
+            }
+        }
+        STATE.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut st) => self.matcher_batch::<T, S>(&mut st, input, at, unicode, sticky, spans, n),
+            Err(_) => self.matcher_batch::<T, S>(&mut State::default(), input, at, unicode, sticky, spans, n),
+        })
+    }
+
+    /// `exec_batch` for a pattern of a simple shape: the matches written, where the search goes on, and whether it
+    /// has found every match, or `None` when the pattern is not of a simple shape (or not after all), for the matcher
+    /// to go on from there.
+    #[inline(always)]
+    fn shape_batch<T: Text, S: From<(usize, usize)>>(
+        &self,
+        input: &[T::Unit],
+        mut at: usize,
+        unicode: bool,
+        spans: &mut [S],
+    ) -> (usize, usize, Option<bool>) {
+        let mut n = 0;
+        let (len, need) = (input.len(), if T::UTF8 { self.need } else { self.need16 });
+        // One class and one loop of a class, the shapes with the most matches, each by a loop of its own.
+        match &self.search.shape {
+            Shape::Set(set) => {
+                while n < spans.len() {
+                    let start = T::normalize(input, at, unicode);
+                    if start > len || len - start < need {
+                        return (n, at, Some(true));
+                    }
+                    let Some((from, w)) = self.next_member::<T>(set, input, start) else {
+                        return (n, at, Some(true));
+                    };
+                    // A member is never empty.
+                    spans[n] = S::from((from, from + w));
+                    n += 1;
+                    at = from + w;
+                }
+                return (n, at, Some(false));
+            }
+            Shape::Loop(set, min, end) => {
+                while n < spans.len() {
+                    let start = T::normalize(input, at, unicode);
+                    if start > len || len - start < need {
+                        return (n, at, Some(true));
+                    }
+                    let Some((from, to)) = self.loop_match::<T>(set, *min, end, input, start) else {
+                        return (n, at, Some(true));
+                    };
+                    spans[n] = S::from((from, to));
+                    n += 1;
+                    at = if to != from {
+                        to
+                    } else if to < len && input[to].into() < 0x80 {
+                        // An empty match before an ASCII character (a loop of `.` before a line's end) goes on one
+                        // unit later in either encoding, with or without the u flag.
+                        to + 1
+                    } else {
+                        T::advance(input, to, unicode)
+                    };
+                }
+                return (n, at, Some(false));
+            }
+            Shape::None => return (n, at, None),
+            _ => {}
+        }
+        while n < spans.len() {
+            let start = T::normalize(input, at, unicode);
+            match self.shape_search::<T>(input, start) {
+                Some(Some((from, to))) => {
+                    spans[n] = S::from((from, to));
+                    n += 1;
+                    at = if to == from { T::advance(input, to, unicode) } else { to };
+                }
+                Some(None) => return (n, at, Some(true)),
+                // Not answered by the search after all: the matcher goes on from here.
+                None => return (n, at, None),
+            }
+        }
+        (n, at, Some(false))
+    }
+
+    /// The matches of a global search from `at` (with no limit) with what each group captured, as many as `groups`
+    /// holds at `width` entries a match (the match, then each group the program records, `None` for one that did
+    /// not take part), written to its start: how many matches, where the search goes on, and whether it has found
+    /// every match. A program that records no group is answered as `exec_batch` answers it.
+    pub(crate) fn exec_batch_groups<T: Text, S: From<Option<(usize, usize)>>>(
+        &self,
+        input: &[T::Unit],
+        mut at: usize,
+        unicode: bool,
+        sticky: bool,
+        groups: &mut [S],
+        width: usize,
+    ) -> (usize, usize, bool) {
+        debug_assert_eq!(width, self.groups + 1);
+        if self.groups == 0 {
+            let mut spans = [(0, 0); 64];
+            let mut n = 0;
+            while n < groups.len() {
+                let want = (groups.len() - n).min(spans.len());
+                let done;
+                let got;
+                (got, at, done) = self.exec_batch::<T, (usize, usize)>(input, at, unicode, sticky, &mut spans[..want]);
+                for (slot, &span) in groups[n..].iter_mut().zip(&spans[..got]) {
+                    *slot = S::from(Some(span));
+                }
+                n += got;
+                if done {
+                    return (n, at, true);
+                }
+            }
+            return (n, at, false);
+        }
+        STATE.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut st) => self.groups_batch::<T, S>(&mut st, input, at, unicode, sticky, groups, width),
+            Err(_) => self.groups_batch::<T, S>(&mut State::default(), input, at, unicode, sticky, groups, width),
+        })
+    }
+
+    /// `exec_batch_groups` by the matcher, with the memory `st`.
+    #[allow(clippy::too_many_arguments)]
+    fn groups_batch<T: Text, S: From<Option<(usize, usize)>>>(
+        &self,
+        st: &mut State,
+        input: &[T::Unit],
+        mut at: usize,
+        unicode: bool,
+        sticky: bool,
+        groups: &mut [S],
+        width: usize,
+    ) -> (usize, usize, bool) {
+        let mut n = 0;
+        for one in groups.chunks_exact_mut(width) {
+            let start = T::normalize(input, at, unicode);
+            let (from, to) = self.match_with::<T>(st, input, start, sticky, None, None);
+            if from >= STOPPED_MEMORY {
+                return (n, at, true);
+            }
+            one[0] = S::from(Some((from, to)));
+            // What the match left in the memory is what each group captured.
+            for (slot, &[from, to]) in one[1..].iter_mut().zip(st.caps.as_chunks::<2>().0) {
+                *slot = S::from((from != NONE).then_some((from, to)));
+            }
+            n += 1;
+            at = if to == from { T::advance(input, to, unicode) } else { to };
+        }
+        (n, at, false)
+    }
+
+    /// `exec_batch` by the matcher, with the memory `st`, from `n` matches written.
+    #[allow(clippy::too_many_arguments)]
+    fn matcher_batch<T: Text, S: From<(usize, usize)>>(
+        &self,
+        st: &mut State,
+        input: &[T::Unit],
+        mut at: usize,
+        unicode: bool,
+        sticky: bool,
+        spans: &mut [S],
+        mut n: usize,
+    ) -> (usize, usize, bool) {
+        while n < spans.len() {
+            let start = T::normalize(input, at, unicode);
+            let (from, to) = self.match_with::<T>(st, input, start, sticky, None, None);
+            // No match (with no limit, a match is never abandoned).
+            if from >= STOPPED_MEMORY {
+                return (n, at, true);
+            }
+            spans[n] = S::from((from, to));
+            n += 1;
+            at = if to == from { T::advance(input, to, unicode) } else { to };
+        }
+        (n, at, false)
     }
 
     /// The first match at or after `start` of a pattern of a simple shape, or `None` when it has none.
@@ -404,18 +613,23 @@ impl Program {
                 }
             }
             Shape::Set(set) => self.next_member::<T>(set, input, start).map(|(at, w)| (at, at + w)),
-            Shape::Loop(set, min, end) => {
-                let from = if *min == 0 {
-                    start
-                } else {
-                    let Some((at, w)) = self.next_member::<T>(set, input, start) else { return Some(None) };
-                    let _ = w;
-                    at
-                };
-                let to = if T::UTF8 { end.end8(bytes, from) } else { end.end16(T::units16(input), from) };
-                Some((from, to.unwrap_or_else(|| self.end_of_run::<T>(set, input, from))))
-            }
+            Shape::Loop(set, min, end) => self.loop_match::<T>(set, *min, end, input, start),
         })
+    }
+
+    /// The first match at or after `start` of the shape of one greedy loop of a class (`Shape::Loop`).
+    #[inline(always)]
+    fn loop_match<T: Text>(
+        &self,
+        set: &CharSet,
+        min: usize,
+        end: &RunEnd,
+        input: &[T::Unit],
+        start: usize,
+    ) -> Option<(usize, usize)> {
+        let from = if min == 0 { start } else { self.next_member::<T>(set, input, start)?.0 };
+        let to = if T::UTF8 { end.end8(T::bytes(input), from) } else { end.end16(T::units16(input), from) };
+        Some((from, to.unwrap_or_else(|| self.end_of_run::<T>(set, input, from))))
     }
 
     /// The first member of the set at or after `at`, and its width.

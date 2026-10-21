@@ -231,14 +231,18 @@ static void measure(double seconds, int passes, count_fn count, void *state, dou
     free(times);
 }
 
-/* The C library: a global search made once, reset for each count. */
+/* The C library: a global search made once, reset for each count, its matches taken a batch at a time as a C
+ * program that wants many of them takes them. */
 static size_t count_corvus(void *state) {
     cre_matches *it = state;
     cre_matches_reset(it);
-    size_t n = 0;
-    cre_match m;
-    bool found;
-    while (cre_matches_next(it, &m, &found) == CRE_OK && found) n++;
+    size_t n = 0, got;
+    cre_match batch[256];
+    /* Fewer than asked for: the search has found every match. */
+    do {
+        if (cre_matches_next_batch(it, batch, 256, &got) != CRE_OK) break;
+        n += got;
+    } while (got == 256);
     return n;
 }
 

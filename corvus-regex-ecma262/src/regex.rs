@@ -780,6 +780,42 @@ impl<'t, H: Haystack + ?Sized> Iterator for Matches<'_, 't, H> {
     }
 }
 
+impl<H: Haystack + ?Sized> Matches<'_, '_, H> {
+    /// The next matches, as many as `spans` holds, written to its start as (start, end) in the units of the text, or
+    /// as any type made from that pair: how many. Fewer than `spans.len()` only when the search has found every match, so 0 ends it. They are the
+    /// matches `next` gives, a batch at a time, for a loop that wants very many of them (the C library's
+    /// `cre_matches_next_batch`), in one loop over the batch.
+    ///
+    /// ```
+    /// use corvus_regex_ecma262::Regex;
+    ///
+    /// let re = Regex::new(r"\d+", "g").unwrap();
+    /// let mut it = re.find_iter("1 22 333");
+    /// let mut spans = [(0, 0); 2];
+    /// assert_eq!(it.next_batch(&mut spans), 2);
+    /// assert_eq!(spans, [(0, 1), (2, 4)]);
+    /// assert_eq!(it.next_batch(&mut spans), 1);
+    /// assert_eq!(spans[0], (5, 8));
+    /// assert_eq!(it.next_batch(&mut spans), 0);
+    /// ```
+    pub fn next_batch<S: From<(usize, usize)>>(&mut self, spans: &mut [S]) -> usize {
+        if self.done || spans.is_empty() {
+            return 0;
+        }
+        let input = self.text.units();
+        let (re, at) = (self.re, self.at);
+        let batch = |spans: &mut [S]| re.prog.exec_batch::<H::Text, S>(input, at, re.unicode(), re.flags.sticky, spans);
+        // Only the UTF-16 searches keep anything between the searches of a global search.
+        let (n, at, done) = if <H::Text as Text>::UTF8 {
+            batch(spans)
+        } else {
+            super::search::in_session(self.session, || batch(spans))
+        };
+        (self.at, self.done) = (at, done);
+        n
+    }
+}
+
 impl<'t, H: Haystack + ?Sized> std::iter::FusedIterator for Matches<'_, 't, H> {}
 
 /// The captures of the matches of a global search (see [`Regex::captures_iter`]).
@@ -812,6 +848,45 @@ impl<'t, H: Haystack + ?Sized> Iterator for CaptureMatches<'_, 't, H> {
                 None
             }
         }
+    }
+}
+
+impl<H: Haystack + ?Sized> CaptureMatches<'_, '_, H> {
+    /// The next matches with what each group captured, as many as `groups` holds at `captures_len` entries a match
+    /// (the match, then each group in order, `None` for a group that did not take part), written to its start as
+    /// (start, end) in the units of the text, or as any type made from that: how many matches. Fewer than
+    /// `groups.len() / captures_len` only when the search has found every match, so 0 ends it. They are the matches
+    /// `next` gives, a batch at a time with no allocation, for a loop that wants very many of them (the C library's
+    /// `cre_matches_next_captures_batch`).
+    ///
+    /// ```
+    /// use corvus_regex_ecma262::Regex;
+    ///
+    /// let re = Regex::new(r"(\d)(x)?", "g").unwrap();
+    /// let mut it = re.captures_iter("1x 2");
+    /// let mut groups = [None; 6];
+    /// assert_eq!(it.next_batch(&mut groups), 2);
+    /// assert_eq!(groups, [Some((0, 2)), Some((0, 1)), Some((1, 2)), Some((3, 4)), Some((3, 4)), None]);
+    /// assert_eq!(it.next_batch(&mut groups), 0);
+    /// ```
+    pub fn next_batch<S: From<Option<(usize, usize)>>>(&mut self, groups: &mut [S]) -> usize {
+        let width = self.re.captures_len();
+        if self.done || groups.len() < width {
+            return 0;
+        }
+        let input = self.text.units();
+        let (re, at) = (self.re, self.at);
+        let batch = |groups: &mut [S]| {
+            re.caps_program().exec_batch_groups::<H::Text, S>(input, at, re.unicode(), re.flags.sticky, groups, width)
+        };
+        // Only the UTF-16 searches keep anything between the searches of a global search.
+        let (n, at, done) = if <H::Text as Text>::UTF8 {
+            batch(groups)
+        } else {
+            super::search::in_session(self.session, || batch(groups))
+        };
+        (self.at, self.done) = (at, done);
+        n
     }
 }
 

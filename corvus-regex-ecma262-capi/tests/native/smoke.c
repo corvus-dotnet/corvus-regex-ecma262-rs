@@ -118,6 +118,14 @@ static void searching_replacing_and_splitting_utf8(void) {
     CHECK(n == 2);
     cre_matches_reset(it);
     CHECK(cre_matches_next(it, &m, &found) == CRE_OK && found && m.start == 1 && m.end == 2);
+    /* The rest a batch at a time: fewer than asked for ends the search. */
+    cre_match batch[4];
+    CHECK(cre_matches_next_batch(it, batch, 4, &n) == CRE_OK && n == 1 && batch[0].start == 3 && batch[0].end == 5);
+    CHECK(cre_matches_next_batch(it, batch, 4, &n) == CRE_OK && n == 0);
+    cre_matches_reset(it);
+    CHECK(cre_matches_next_batch(it, batch, 1, &n) == CRE_OK && n == 1 && batch[0].start == 1);
+    CHECK(cre_matches_next_batch(it, NULL, 0, &n) == CRE_OK && n == 0);
+    CHECK(cre_matches_next_batch(it, batch, 4, &n) == CRE_OK && n == 1 && batch[0].start == 3);
     cre_matches_free(it);
 
     cre_captures *caps = NULL;
@@ -127,6 +135,13 @@ static void searching_replacing_and_splitting_utf8(void) {
     CHECK(cre_matches_next_captures(it, caps, &found) == CRE_OK && found && cre_captures_name(caps, "a", 1, &m));
     CHECK(m.start == 4 && m.end == 5);
     CHECK(cre_matches_next_captures(it, caps, &found) == CRE_OK && !found);
+    /* The groups a batch at a time, each match as its three groups. */
+    cre_matches_reset(it);
+    cre_match groups[7];
+    CHECK(cre_matches_next_captures_batch(it, groups, 7, &n) == CRE_OK && n == 2);
+    CHECK(groups[0].start == 1 && groups[1].start == 1 && groups[2].start == CRE_UNSET);
+    CHECK(groups[3].start == 3 && groups[3].end == 5 && groups[5].start == 4 && groups[5].end == 5);
+    CHECK(cre_matches_next_captures_batch(it, groups, 2, &n) == CRE_INVALID_ARGUMENT && n == 0);
     cre_matches_free(it);
     cre_captures_free(caps);
 
@@ -189,8 +204,11 @@ static void utf16(void) {
     while (cre_matches_next(it, &m, &found) == CRE_OK && found) {
         n++;
     }
-    cre_matches_free(it);
     CHECK(n == 2);
+    cre_matches_reset(it);
+    cre_match batch[8];
+    CHECK(cre_matches_next_batch(it, batch, 8, &n) == CRE_OK && n == 2 && batch[0].start == 5 && batch[1].start == 6);
+    cre_matches_free(it);
     CHECK(cre_regex_captures_iter_utf16(re, text, len, &it) == CRE_OK);
     CHECK(cre_matches_next_captures(it, caps, &found) == CRE_OK && found && cre_captures_get(caps, 1, &m));
     cre_matches_free(it);

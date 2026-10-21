@@ -356,10 +356,42 @@ bool cre_captures_name(const cre_captures *captures, const char *name, size_t na
  * when there is none). Once there is none, every later call finds none until cre_matches_reset. */
 cre_status cre_matches_next(cre_matches *matches, cre_match *out_match, bool *out_found);
 
+/* The next matches of a global search, up to capacity of them, written in order to out_matches[0] to
+ * out_matches[*out_count - 1]: the matches cre_matches_next would give one call each, with one call for many, which
+ * spares a call for each match where a text has very many (a buffer of some hundreds is enough). *out_count is less
+ * than capacity only when the search has found every match, so a call that writes 0 ends it; a capacity of 0 writes
+ * nothing and out_matches may then be NULL. It reads a search made by cre_regex_captures_iter as well, giving where
+ * each match is.
+ *
+ *     cre_match batch[256];
+ *     size_t n;
+ *     while (cre_matches_next_batch(it, batch, 256, &n) == CRE_OK && n > 0) {
+ *         for (size_t k = 0; k < n; k++) use(batch[k].start, batch[k].end);
+ *     }
+ */
+cre_status cre_matches_next_batch(cre_matches *matches, cre_match *out_matches, size_t capacity, size_t *out_count);
+
 /* The next match of a global search made by cre_regex_captures_iter (or its UTF-16 form), with its groups written
  * into captures (made for the same regular expression): *out_found. CRE_INVALID_ARGUMENT for a search made by
  * cre_regex_find_iter, which keeps no groups. */
 cre_status cre_matches_next_captures(cre_matches *matches, cre_captures *captures, bool *out_found);
+
+/* The next matches of a global search made by cre_regex_captures_iter (or its UTF-16 form) with their groups, written
+ * in order to out_groups: each match as cre_regex_group_count(regex) + 1 entries (the match, then each group,
+ * CRE_UNSET for one that did not take part), as many matches as capacity entries hold, and *out_count matches. It
+ * spares a call for each match and allocates nothing. *out_count is less than capacity / (groups + 1) only when the
+ * search has found every match. A capacity of 0 writes nothing (out_groups may then be NULL); a capacity that holds
+ * no match, or a search made by cre_regex_find_iter, is CRE_INVALID_ARGUMENT. The groups are by number
+ * (cre_matches_next_captures and cre_captures_name read them by name).
+ *
+ *     size_t width = cre_regex_group_count(re) + 1, n;
+ *     cre_match groups[64 * 4];
+ *     while (cre_matches_next_captures_batch(it, groups, 64 * 4, &n) == CRE_OK && n > 0) {
+ *         for (size_t k = 0; k < n; k++) use(&groups[k * width]);
+ *     }
+ */
+cre_status cre_matches_next_captures_batch(cre_matches *matches, cre_match *out_groups, size_t capacity,
+                                           size_t *out_count);
 
 /* Starts the global search again at the start of its text, which is not checked again: as setting lastIndex to 0.
  * NULL is allowed and does nothing. */

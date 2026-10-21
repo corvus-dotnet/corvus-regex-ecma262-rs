@@ -88,7 +88,8 @@ and `-e JOB=short` makes a quick look of it.
 
 The C library has a harness of its own, in C (`tools/c/industry.c`, driven by `tools/c/run.sh`), under the same
 protocol and writing the same data file, with the engines a C program would choose between: the C library over UTF-8
-and over UTF-16 (through its header, a global search made once per text and reset for each count), QuickJS's
+and over UTF-16 (through its header, a global search made once per text and reset for each count, its matches taken
+256 at a time with `cre_matches_next_batch`, as a C program that wants many of them takes them), QuickJS's
 `libregexp` (quickjs-ng 0.17.0, an ECMA-262 engine in C, over the text as QuickJS holds a string: 8-bit when every
 character is Latin-1, UTF-16 otherwise), PCRE2 10.49 with its JIT (not ECMA-262: the pattern as it is in UTF mode with
 the flags i, m and s, its row marked where its count differs from V8's) and V8. The C library and libregexp run with

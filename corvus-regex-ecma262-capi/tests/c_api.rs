@@ -169,9 +169,27 @@ fn the_global_search_is_find_iter() {
             }
             all
         };
+        // The same matches a batch at a time, until a batch is short.
+        let batches = |it: *mut cre_matches, size: usize| -> Vec<(usize, usize)> {
+            let (mut all, mut place) = (Vec::new(), vec![unset(); size]);
+            loop {
+                let mut n = usize::MAX;
+                assert_eq!(unsafe { cre_matches_next_batch(it, place.as_mut_ptr(), size, &mut n) }, CRE_OK);
+                all.extend(place[..n].iter().map(|m| (m.start, m.end)));
+                if n < size {
+                    break;
+                }
+            }
+            all
+        };
         let mut it = std::ptr::null_mut();
         assert_eq!(unsafe { cre_regex_find_iter(re, ptr(text), text.len(), &mut it) }, CRE_OK);
         let want: Vec<(usize, usize)> = reference.find_iter(text).map(|m| (m.start(), m.end())).collect();
+        for size in [1, 2, 5] {
+            unsafe { cre_matches_reset(it) };
+            assert_eq!(batches(it, size), want, "/{pattern}/{flags} in batches of {size}");
+        }
+        unsafe { cre_matches_reset(it) };
         assert_eq!(collect(it), want, "/{pattern}/{flags}");
         assert!(collect(it).is_empty());
         unsafe { cre_matches_reset(it) };
@@ -179,6 +197,8 @@ fn the_global_search_is_find_iter() {
         unsafe { cre_matches_free(it) };
         assert_eq!(unsafe { cre_regex_find_iter_utf16(re, t16.as_ptr(), t16.len(), &mut it) }, CRE_OK);
         let want16: Vec<(usize, usize)> = reference.find_iter_utf16(&t16).map(|m| (m.start(), m.end())).collect();
+        assert_eq!(batches(it, 2), want16, "/{pattern}/{flags} in batches");
+        unsafe { cre_matches_reset(it) };
         assert_eq!(collect(it), want16, "/{pattern}/{flags}");
         // A search without groups cannot give them.
         let mut caps = std::ptr::null_mut();
@@ -202,6 +222,25 @@ fn the_global_search_is_find_iter() {
         unsafe { cre_matches_free(it) };
         assert_eq!(unsafe { cre_regex_captures_iter(re, ptr(text), text.len(), &mut it) }, CRE_OK);
         assert_eq!(collect(it), want, "/{pattern}/{flags}");
+        unsafe { cre_matches_reset(it) };
+        assert_eq!(batches(it, 3), want, "/{pattern}/{flags} with groups, in batches");
+        // The groups a batch at a time, two matches a batch, as the crate's captures_iter gives them.
+        let width = reference.captures_len();
+        let want_groups: Vec<Option<(usize, usize)>> = reference
+            .captures_iter(text)
+            .flat_map(|c| (0..width).map(|k| c.get(k).map(|m| (m.start(), m.end()))).collect::<Vec<_>>())
+            .collect();
+        unsafe { cre_matches_reset(it) };
+        let (mut got, mut place) = (Vec::new(), vec![unset(); 2 * width + 1]);
+        loop {
+            let mut n = usize::MAX;
+            assert_eq!(unsafe { cre_matches_next_captures_batch(it, place.as_mut_ptr(), place.len(), &mut n) }, CRE_OK);
+            got.extend(place[..n * width].iter().map(|&m| span(m)));
+            if n < 2 {
+                break;
+            }
+        }
+        assert_eq!(got, want_groups, "/{pattern}/{flags}, the groups in batches");
         unsafe { cre_matches_free(it) };
         unsafe { cre_captures_free(caps) };
         unsafe { cre_regex_free(re) };
@@ -317,6 +356,45 @@ fn errors_have_their_status_and_message() {
     assert_eq!(unsafe { cre_regex_captures(re, ptr("a"), 1, 0, caps, &mut found) }, CRE_INVALID_ARGUMENT);
     unsafe { cre_captures_free(caps) };
     unsafe { cre_regex_free(u) };
+    // A batch: a capacity of 0 writes nothing and takes NULL; a NULL place with a capacity, or no count, fails.
+    let mut it = std::ptr::null_mut();
+    assert_eq!(unsafe { cre_regex_find_iter(re, ptr("aa"), 2, &mut it) }, CRE_OK);
+    let mut n = usize::MAX;
+    assert_eq!(unsafe { cre_matches_next_batch(it, std::ptr::null_mut(), 0, &mut n) }, CRE_OK);
+    assert_eq!(n, 0);
+    n = usize::MAX;
+    assert_eq!(unsafe { cre_matches_next_batch(it, std::ptr::null_mut(), 4, &mut n) }, CRE_INVALID_ARGUMENT);
+    assert_eq!(n, 0);
+    let mut place = [unset(); 4];
+    assert_eq!(
+        unsafe { cre_matches_next_batch(it, place.as_mut_ptr(), 4, std::ptr::null_mut()) },
+        CRE_INVALID_ARGUMENT
+    );
+    assert_eq!(unsafe { cre_matches_next_batch(it, place.as_mut_ptr(), 4, &mut n) }, CRE_OK);
+    assert_eq!((n, place[1].start), (2, 1));
+    unsafe { cre_matches_free(it) };
+    let status = unsafe { cre_matches_next_batch(std::ptr::null_mut(), place.as_mut_ptr(), 4, &mut n) };
+    assert_eq!((status, n), (CRE_INVALID_ARGUMENT, 0));
+    // The groups a batch at a time: only from a search that keeps them, and room for one match at least.
+    let groups = compile("(a)(b)?", "g");
+    assert_eq!(unsafe { cre_regex_find_iter(groups, ptr("aab"), 3, &mut it) }, CRE_OK);
+    let status = unsafe { cre_matches_next_captures_batch(it, place.as_mut_ptr(), 4, &mut n) };
+    assert_eq!((status, n), (CRE_INVALID_ARGUMENT, 0));
+    unsafe { cre_matches_free(it) };
+    assert_eq!(unsafe { cre_regex_captures_iter(groups, ptr("aab"), 3, &mut it) }, CRE_OK);
+    assert_eq!(unsafe { cre_matches_next_captures_batch(it, place.as_mut_ptr(), 2, &mut n) }, CRE_INVALID_ARGUMENT);
+    assert_eq!(unsafe { cre_matches_next_captures_batch(it, std::ptr::null_mut(), 0, &mut n) }, CRE_OK);
+    assert_eq!(n, 0);
+    let status = unsafe { cre_matches_next_captures_batch(it, std::ptr::null_mut(), 3, &mut n) };
+    assert_eq!(status, CRE_INVALID_ARGUMENT);
+    assert_eq!(unsafe { cre_matches_next_captures_batch(it, place.as_mut_ptr(), 4, &mut n) }, CRE_OK);
+    assert_eq!((n, span(place[0]), span(place[2])), (1, Some((0, 1)), None));
+    assert_eq!(unsafe { cre_matches_next_captures_batch(it, place.as_mut_ptr(), 3, &mut n) }, CRE_OK);
+    assert_eq!((n, span(place[2])), (1, Some((2, 3))));
+    assert_eq!(unsafe { cre_matches_next_captures_batch(it, place.as_mut_ptr(), 3, &mut n) }, CRE_OK);
+    assert_eq!(n, 0);
+    unsafe { cre_matches_free(it) };
+    unsafe { cre_regex_free(groups) };
     // A NULL buffer with a length, and a misaligned UTF-16 text.
     let status = unsafe { cre_regex_captures_read(re, ptr("a"), 1, 0, std::ptr::null_mut(), 2, &mut found) };
     assert_eq!(status, CRE_INVALID_ARGUMENT);
