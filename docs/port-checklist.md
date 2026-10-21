@@ -102,7 +102,12 @@ the dot-all row left out), and above on one:
 |---|--:|--:|--:|---|
 | `Holmes.{0,25}Watson\|Watson.{0,25}Holmes` | 66.6 us | 59.3 us | 1.12 | Both find the 542 occurrences with the same Teddy searcher and check each with an automaton; Teddy takes 37.8 us here against 34.4 us in `regex`, the check 19.9 against 18.1 us. Reading on through the window after a failed occurrence, as `regex`'s lazy automaton does, was tried two ways and both were slower: looking at the window's units for a literal's first byte before calling the search (62.9 to 68.9 us over UTF-8, 88 to 138 us over UTF-16) and running the forward automaton (item 50) from each occurrence (1.12 times the time). Not an ECMA-262 rule. |
 
-IPv4, above `regex` before the forward automaton, is level with it.
+IPv4, above `regex` before the forward automaton, is level with it. With the pair search (item 52)
+`Holmes.{0,25}Watson|Watson.{0,25}Holmes` finds its occurrences by `H` or `W` and `m` or `s` three bytes on, and is
+below `regex` (42.8 us against 63.2 in the final run of this work, 0.68), as IPv4 is with the window of item 54 (660
+against 2,039 us). On the central page's runner `\s[a-zA-Z]{0,12}ing\s` (1.14) and `Tom.{10,25}river|river.{10,25}Tom`
+(1.06) were above `regex`; on the reference machine both are level with it by the test above (0.99 and 1.03 to 1.09
+with p above 0.01), so what they spend there could not be looked at here.
 
 ### UTF-16 against UTF-8
 
