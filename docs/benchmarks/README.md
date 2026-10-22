@@ -29,6 +29,9 @@ changes on the host during a run (its clock, its heat, its other work) falls on 
 - **The counts.** Every engine's count is compared with V8's, the oracle of the test data. An ECMA-262 engine that
   counts otherwise is an error on that workload; regex, which does not claim ECMA-262, keeps its figure and the
   workload carries "counts differ" with both counts.
+- **V8 once.** Run with `V8=0` (the central benchmark run gives it to every image but the one that times V8), a harness
+  times no V8 and runs no V8 over the test data: it compares each count with the workload's `v8Count`, V8's count,
+  which the central run writes into the workloads once before any image runs, and its data file has no V8 row.
 
 `ROUNDS`, `SECONDS_EACH`, `PASSES` and `SPREAD` change the protocol's numbers; `JOB=short` is 3 rounds of 0.1 s for a
 look. The numbers were chosen on the reference machine (an unpinned i7-13800H laptop under WSL, cores 0-11): there the
