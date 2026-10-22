@@ -441,6 +441,163 @@ fn a_match_has_a_limit_when_asked() {
 }
 
 #[test]
+fn the_unchecked_functions_find_what_the_checked_ones_do() {
+    for (pattern, flags, text) in CASES {
+        let re = compile(pattern, flags);
+        let (p, n) = (ptr(text), text.len());
+        let (mut a, mut b) = (false, true);
+        assert_eq!(unsafe { cre_regex_is_match(re, p, n, &mut a) }, CRE_OK);
+        assert_eq!(unsafe { cre_regex_is_match_unchecked(re, p, n, &mut b) }, CRE_OK);
+        assert_eq!(a, b, "/{pattern}/{flags}");
+        assert_eq!(unsafe { cre_regex_is_match_limit_unchecked(re, p, n, 1000, &mut b) }, CRE_OK);
+        assert_eq!(a, b, "/{pattern}/{flags}");
+        for start in (0..=n).filter(|&k| text.is_char_boundary(k)) {
+            assert_eq!(unsafe { cre_regex_is_match_at(re, p, n, start, &mut a) }, CRE_OK);
+            assert_eq!(unsafe { cre_regex_is_match_at_unchecked(re, p, n, start, &mut b) }, CRE_OK);
+            assert_eq!(a, b, "/{pattern}/{flags} at {start}");
+            let (mut m, mut found, mut m2, mut found2) = (unset(), false, unset(), false);
+            assert_eq!(unsafe { cre_regex_find(re, p, n, start, &mut m, &mut found) }, CRE_OK);
+            assert_eq!(unsafe { cre_regex_find_unchecked(re, p, n, start, &mut m2, &mut found2) }, CRE_OK);
+            assert_eq!((found, span(m)), (found2, span(m2)), "/{pattern}/{flags} at {start}");
+            let status = unsafe { cre_regex_find_limit_unchecked(re, p, n, start, 1000, &mut m2, &mut found2) };
+            assert_eq!(status, CRE_OK);
+            assert_eq!((found, span(m)), (found2, span(m2)), "/{pattern}/{flags} at {start}");
+            let width = unsafe { cre_regex_group_count(re) } + 1;
+            let (mut g, mut g2) = (vec![unset(); width], vec![unset(); width]);
+            let read = |groups: &mut Vec<cre_match>, found: &mut bool, unchecked: bool, limit: bool| unsafe {
+                match (unchecked, limit) {
+                    (false, _) => cre_regex_captures_read(re, p, n, start, groups.as_mut_ptr(), width, found),
+                    (true, false) => {
+                        cre_regex_captures_read_unchecked(re, p, n, start, groups.as_mut_ptr(), width, found)
+                    }
+                    (true, true) => cre_regex_captures_read_limit_unchecked(
+                        re,
+                        p,
+                        n,
+                        start,
+                        1000,
+                        groups.as_mut_ptr(),
+                        width,
+                        found,
+                    ),
+                }
+            };
+            assert_eq!(read(&mut g, &mut found, false, false), CRE_OK);
+            for limit in [false, true] {
+                assert_eq!(read(&mut g2, &mut found2, true, limit), CRE_OK);
+                let spans = |g: &[cre_match]| g.iter().map(|&m| span(m)).collect::<Vec<_>>();
+                assert_eq!((found, spans(&g)), (found2, spans(&g2)), "/{pattern}/{flags} at {start}");
+            }
+            let (mut caps, mut caps2) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(unsafe { cre_captures_new(re, &mut caps) }, CRE_OK);
+            assert_eq!(unsafe { cre_captures_new(re, &mut caps2) }, CRE_OK);
+            let all = |c: *mut cre_captures| -> Vec<Option<(usize, usize)>> {
+                (0..unsafe { cre_captures_len(c) })
+                    .map(|k| {
+                        let mut m = unset();
+                        unsafe { cre_captures_get(c, k, &mut m) }.then_some((m.start, m.end))
+                    })
+                    .collect()
+            };
+            assert_eq!(unsafe { cre_regex_captures(re, p, n, start, caps, &mut found) }, CRE_OK);
+            assert_eq!(unsafe { cre_regex_captures_unchecked(re, p, n, start, caps2, &mut found2) }, CRE_OK);
+            assert_eq!((found, all(caps)), (found2, all(caps2)), "/{pattern}/{flags} at {start}");
+            assert_eq!(
+                unsafe { cre_regex_captures_limit_unchecked(re, p, n, start, 1000, caps2, &mut found2) },
+                CRE_OK
+            );
+            assert_eq!((found, all(caps)), (found2, all(caps2)), "/{pattern}/{flags} at {start}");
+            unsafe { cre_captures_free(caps) };
+            unsafe { cre_captures_free(caps2) };
+        }
+        // The global searches, each match with its groups.
+        for captures in [false, true] {
+            let run = |unchecked: bool| -> Vec<(usize, usize)> {
+                let mut it = std::ptr::null_mut();
+                let status = unsafe {
+                    match (captures, unchecked) {
+                        (false, false) => cre_regex_find_iter(re, p, n, &mut it),
+                        (false, true) => cre_regex_find_iter_unchecked(re, p, n, &mut it),
+                        (true, false) => cre_regex_captures_iter(re, p, n, &mut it),
+                        (true, true) => cre_regex_captures_iter_unchecked(re, p, n, &mut it),
+                    }
+                };
+                assert_eq!(status, CRE_OK);
+                let mut all = Vec::new();
+                loop {
+                    let (mut m, mut found) = (unset(), false);
+                    assert_eq!(unsafe { cre_matches_next(it, &mut m, &mut found) }, CRE_OK);
+                    if !found {
+                        break;
+                    }
+                    all.push((m.start, m.end));
+                }
+                unsafe { cre_matches_free(it) };
+                all
+            };
+            assert_eq!(run(false), run(true), "/{pattern}/{flags}");
+        }
+        let template = "<$&|$1|$`|$'>";
+        for all in [false, true] {
+            let replace = |unchecked: bool| -> String {
+                let mut out = cre_string { ptr: std::ptr::null_mut(), len: 0 };
+                let (t, tn) = (ptr(template), template.len());
+                let status = unsafe {
+                    match (all, unchecked) {
+                        (false, false) => cre_regex_replace(re, p, n, t, tn, &mut out),
+                        (false, true) => cre_regex_replace_unchecked(re, p, n, t, tn, &mut out),
+                        (true, false) => cre_regex_replace_all(re, p, n, t, tn, &mut out),
+                        (true, true) => cre_regex_replace_all_unchecked(re, p, n, t, tn, &mut out),
+                    }
+                };
+                assert_eq!(status, CRE_OK);
+                let got = string(cre_str { ptr: out.ptr, len: out.len });
+                unsafe { cre_string_free(&mut out) };
+                got
+            };
+            assert_eq!(replace(false), replace(true), "/{pattern}/{flags}");
+        }
+        let split = |unchecked: bool| -> Vec<Option<String>> {
+            let mut out = cre_pieces { items: std::ptr::null(), len: 0, internal: std::ptr::null_mut() };
+            let status = unsafe {
+                if unchecked {
+                    cre_regex_split_unchecked(re, p, n, CRE_SPLIT_ALL, &mut out)
+                } else {
+                    cre_regex_split(re, p, n, CRE_SPLIT_ALL, &mut out)
+                }
+            };
+            assert_eq!(status, CRE_OK);
+            let items = unsafe { std::slice::from_raw_parts(out.items, out.len) };
+            let got = items.iter().map(|&s| (!s.ptr.is_null()).then(|| string(s))).collect();
+            unsafe { cre_pieces_free(&mut out) };
+            got
+        };
+        assert_eq!(split(false), split(true), "/{pattern}/{flags}");
+        unsafe { cre_regex_free(re) };
+    }
+    // An empty text may be NULL; a NULL text with a length is still refused.
+    let re = compile("a", "");
+    let mut matched = true;
+    assert_eq!(unsafe { cre_regex_is_match_unchecked(re, std::ptr::null(), 0, &mut matched) }, CRE_OK);
+    assert!(!matched);
+    assert_eq!(unsafe { cre_regex_is_match_unchecked(re, std::ptr::null(), 1, &mut matched) }, CRE_INVALID_ARGUMENT);
+    unsafe { cre_regex_free(re) };
+}
+
+#[test]
+fn a_text_that_is_not_utf8_far_in_is_refused_where_it_stops_being_utf8() {
+    // Past the first blocks the fast check reads, so the offset comes from the second, exact check.
+    let re = compile("a", "");
+    let mut text = "a".repeat(1000).into_bytes();
+    text.extend_from_slice(b"\xe2\x82");
+    text.extend_from_slice("b".repeat(100).as_bytes());
+    let mut matched = true;
+    assert_eq!(unsafe { cre_regex_is_match(re, text.as_ptr().cast(), text.len(), &mut matched) }, CRE_INVALID_UTF8);
+    assert_eq!((cre_last_error_offset(), matched), (1000, false));
+    unsafe { cre_regex_free(re) };
+}
+
+#[test]
 fn the_header_declares_what_the_library_exports() {
     let header = include_str!("../include/corvus_regex_ecma262.h").replace("\r\n", "\n");
     let source = include_str!("../src/lib.rs");

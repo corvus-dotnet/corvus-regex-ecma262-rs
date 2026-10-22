@@ -51,7 +51,7 @@ pub const CRE_PANIC: cre_status = 7;
 /// The header's version: compare with `cre_version()`, the library's.
 pub const CRE_VERSION_MAJOR: u32 = 0;
 pub const CRE_VERSION_MINOR: u32 = 1;
-pub const CRE_VERSION_PATCH: u32 = 2;
+pub const CRE_VERSION_PATCH: u32 = 3;
 
 /// The start and the end of a group that did not take part in a match.
 pub const CRE_UNSET: usize = usize::MAX;
@@ -310,11 +310,44 @@ unsafe fn text<'a>(ptr: *const c_char, len: usize, what: &str) -> Result<&'a str
     }
     // SAFETY: the caller passes `len` readable bytes at `ptr`.
     let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    // simdutf8 checks a large text in about half the time std does; std then says where a text that fails stops being
+    // UTF-8.
+    if let Ok(s) = simdutf8::basic::from_utf8(bytes) {
+        return Ok(s);
+    }
     std::str::from_utf8(bytes).map_err(|e| Failure {
         status: CRE_INVALID_UTF8,
         message: format!("{what} is not UTF-8 at byte {}", e.valid_up_to()),
         offset: e.valid_up_to(),
     })
+}
+
+/// How a function takes the UTF-8 text it searches.
+#[derive(Clone, Copy)]
+enum Utf8 {
+    /// Checked to be UTF-8 on each call (`CRE_INVALID_UTF8` when it is not): the functions without a suffix.
+    Checked,
+    /// Trusted to be UTF-8, not checked: the `_unchecked` functions, for a caller whose strings are UTF-8 by
+    /// construction (a Swift `String`, a Rust `str`), so that a large text is not read once more on every call. Text
+    /// that is not UTF-8 is undefined behaviour.
+    Unchecked,
+}
+
+/// The UTF-8 text a function searches: `len` bytes at `ptr` (which may be NULL when `len` is 0), taken as `mode` says.
+unsafe fn haystack<'a>(ptr: *const c_char, len: usize, mode: Utf8) -> Result<&'a str, Failure> {
+    match mode {
+        Utf8::Checked => unsafe { text(ptr, len, "text") },
+        Utf8::Unchecked => {
+            if len == 0 {
+                return Ok("");
+            }
+            if ptr.is_null() {
+                return Err(Failure::argument(format!("text is NULL with a length of {len}")));
+            }
+            // SAFETY: the caller passes `len` readable bytes at `ptr`, and promises they are UTF-8.
+            Ok(unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr.cast::<u8>(), len)) })
+        }
+    }
 }
 
 /// A UTF-16 argument: `len` code units at `ptr` (which may be NULL when `len` is 0), lone surrogates and all.
@@ -603,6 +636,17 @@ pub unsafe extern "C" fn cre_regex_is_match(
     unsafe { cre_regex_is_match_limit(regex, text_ptr, text_len, 0, out_matched) }
 }
 
+/// `cre_regex_is_match` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_is_match_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    out_matched: *mut bool,
+) -> cre_status {
+    unsafe { cre_regex_is_match_limit_unchecked(regex, text_ptr, text_len, 0, out_matched) }
+}
+
 /// `cre_regex_is_match` with a limit on the time the match may take, in milliseconds (0 for none). A match that
 /// reaches it, or whose backtracking memory reaches its cap, is `CRE_MATCH_LIMIT`, and `*out_matched` is false.
 #[unsafe(no_mangle)]
@@ -613,11 +657,34 @@ pub unsafe extern "C" fn cre_regex_is_match_limit(
     limit_ms: u64,
     out_matched: *mut bool,
 ) -> cre_status {
+    unsafe { is_match_limit8(regex, text_ptr, text_len, limit_ms, out_matched, Utf8::Checked) }
+}
+
+/// `cre_regex_is_match_limit` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_is_match_limit_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    limit_ms: u64,
+    out_matched: *mut bool,
+) -> cre_status {
+    unsafe { is_match_limit8(regex, text_ptr, text_len, limit_ms, out_matched, Utf8::Unchecked) }
+}
+
+unsafe fn is_match_limit8(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    limit_ms: u64,
+    out_matched: *mut bool,
+    mode: Utf8,
+) -> cre_status {
     guard(|| {
         let slot = unsafe { out(out_matched, "out_matched") }?;
         *slot = false;
         let regex = unsafe { handle(regex, "regex") }?;
-        let text = unsafe { text(text_ptr, text_len, "text") }?;
+        let text = unsafe { haystack(text_ptr, text_len, mode) }?;
         let limit = limit_of(limit_ms);
         *slot = regex.inner.try_is_match(text, limit).map_err(|e| limited(e, limit))?;
         Ok(())
@@ -634,11 +701,34 @@ pub unsafe extern "C" fn cre_regex_is_match_at(
     start: usize,
     out_matched: *mut bool,
 ) -> cre_status {
+    unsafe { is_match_at8(regex, text_ptr, text_len, start, out_matched, Utf8::Checked) }
+}
+
+/// `cre_regex_is_match_at` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_is_match_at_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    start: usize,
+    out_matched: *mut bool,
+) -> cre_status {
+    unsafe { is_match_at8(regex, text_ptr, text_len, start, out_matched, Utf8::Unchecked) }
+}
+
+unsafe fn is_match_at8(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    start: usize,
+    out_matched: *mut bool,
+    mode: Utf8,
+) -> cre_status {
     guard(|| {
         let slot = unsafe { out(out_matched, "out_matched") }?;
         *slot = false;
         let regex = unsafe { handle(regex, "regex") }?;
-        let text = unsafe { text(text_ptr, text_len, "text") }?;
+        let text = unsafe { haystack(text_ptr, text_len, mode) }?;
         start_in(regex, text, start)?;
         *slot = regex.inner.is_match_at(text, start);
         Ok(())
@@ -661,6 +751,19 @@ pub unsafe extern "C" fn cre_regex_find(
     unsafe { cre_regex_find_limit(regex, text_ptr, text_len, start, 0, out_match, out_found) }
 }
 
+/// `cre_regex_find` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_find_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    start: usize,
+    out_match: *mut cre_match,
+    out_found: *mut bool,
+) -> cre_status {
+    unsafe { cre_regex_find_limit_unchecked(regex, text_ptr, text_len, start, 0, out_match, out_found) }
+}
+
 /// `cre_regex_find` with a limit on the time the match may take, in milliseconds (0 for none): `CRE_MATCH_LIMIT`
 /// when it is reached.
 #[unsafe(no_mangle)]
@@ -673,13 +776,42 @@ pub unsafe extern "C" fn cre_regex_find_limit(
     out_match: *mut cre_match,
     out_found: *mut bool,
 ) -> cre_status {
+    unsafe { find_limit8(regex, text_ptr, text_len, start, limit_ms, out_match, out_found, Utf8::Checked) }
+}
+
+/// `cre_regex_find_limit` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_find_limit_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    start: usize,
+    limit_ms: u64,
+    out_match: *mut cre_match,
+    out_found: *mut bool,
+) -> cre_status {
+    unsafe { find_limit8(regex, text_ptr, text_len, start, limit_ms, out_match, out_found, Utf8::Unchecked) }
+}
+
+// The C function's arguments and how it takes its text.
+#[allow(clippy::too_many_arguments)]
+unsafe fn find_limit8(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    start: usize,
+    limit_ms: u64,
+    out_match: *mut cre_match,
+    out_found: *mut bool,
+    mode: Utf8,
+) -> cre_status {
     guard(|| {
         let found = unsafe { out(out_found, "out_found") }?;
         *found = false;
         let place = unsafe { out(out_match, "out_match") }?;
         *place = cre_match::UNSET;
         let regex = unsafe { handle(regex, "regex") }?;
-        let text = unsafe { text(text_ptr, text_len, "text") }?;
+        let text = unsafe { haystack(text_ptr, text_len, mode) }?;
         start_in(regex, text, start)?;
         let limit = limit_of(limit_ms);
         if let Some(m) = regex.inner.try_find_at(text, start, limit).map_err(|e| limited(e, limit))? {
@@ -704,12 +836,41 @@ pub unsafe extern "C" fn cre_regex_captures_read(
     groups_len: usize,
     out_found: *mut bool,
 ) -> cre_status {
+    unsafe { captures_read8(regex, text_ptr, text_len, start, groups, groups_len, out_found, Utf8::Checked) }
+}
+
+/// `cre_regex_captures_read` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_captures_read_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    start: usize,
+    groups: *mut cre_match,
+    groups_len: usize,
+    out_found: *mut bool,
+) -> cre_status {
+    unsafe { captures_read8(regex, text_ptr, text_len, start, groups, groups_len, out_found, Utf8::Unchecked) }
+}
+
+// The C function's arguments and how it takes its text.
+#[allow(clippy::too_many_arguments)]
+unsafe fn captures_read8(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    start: usize,
+    groups: *mut cre_match,
+    groups_len: usize,
+    out_found: *mut bool,
+    mode: Utf8,
+) -> cre_status {
     guard(|| {
         let found = unsafe { out(out_found, "out_found") }?;
         *found = false;
         let groups = unsafe { groups_out(groups, groups_len) }?;
         let regex = unsafe { handle(regex, "regex") }?;
-        let text = unsafe { text(text_ptr, text_len, "text") }?;
+        let text = unsafe { haystack(text_ptr, text_len, mode) }?;
         start_in(regex, text, start)?;
         LOCATIONS.with(|cell| {
             let mut cell = cell.borrow_mut();
@@ -738,12 +899,47 @@ pub unsafe extern "C" fn cre_regex_captures_read_limit(
     groups_len: usize,
     out_found: *mut bool,
 ) -> cre_status {
+    unsafe {
+        captures_read_limit8(regex, text_ptr, text_len, start, limit_ms, groups, groups_len, out_found, Utf8::Checked)
+    }
+}
+
+/// `cre_regex_captures_read_limit` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_captures_read_limit_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    start: usize,
+    limit_ms: u64,
+    groups: *mut cre_match,
+    groups_len: usize,
+    out_found: *mut bool,
+) -> cre_status {
+    unsafe {
+        captures_read_limit8(regex, text_ptr, text_len, start, limit_ms, groups, groups_len, out_found, Utf8::Unchecked)
+    }
+}
+
+// The C function's arguments and how it takes its text.
+#[allow(clippy::too_many_arguments)]
+unsafe fn captures_read_limit8(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    start: usize,
+    limit_ms: u64,
+    groups: *mut cre_match,
+    groups_len: usize,
+    out_found: *mut bool,
+    mode: Utf8,
+) -> cre_status {
     guard(|| {
         let found = unsafe { out(out_found, "out_found") }?;
         *found = false;
         let groups = unsafe { groups_out(groups, groups_len) }?;
         let regex = unsafe { handle(regex, "regex") }?;
-        let text = unsafe { text(text_ptr, text_len, "text") }?;
+        let text = unsafe { haystack(text_ptr, text_len, mode) }?;
         start_in(regex, text, start)?;
         let limit = limit_of(limit_ms);
         if let Some(caps) = regex.inner.try_captures_at(text, start, limit).map_err(|e| limited(e, limit))? {
@@ -770,6 +966,19 @@ pub unsafe extern "C" fn cre_regex_captures(
     unsafe { cre_regex_captures_limit(regex, text_ptr, text_len, start, 0, captures, out_found) }
 }
 
+/// `cre_regex_captures` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_captures_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    start: usize,
+    captures: *mut cre_captures,
+    out_found: *mut bool,
+) -> cre_status {
+    unsafe { cre_regex_captures_limit_unchecked(regex, text_ptr, text_len, start, 0, captures, out_found) }
+}
+
 /// `cre_regex_captures` with a limit on the time the match may take, in milliseconds (0 for none):
 /// `CRE_MATCH_LIMIT` when it is reached.
 #[unsafe(no_mangle)]
@@ -782,13 +991,42 @@ pub unsafe extern "C" fn cre_regex_captures_limit(
     captures: *mut cre_captures,
     out_found: *mut bool,
 ) -> cre_status {
+    unsafe { captures_limit8(regex, text_ptr, text_len, start, limit_ms, captures, out_found, Utf8::Checked) }
+}
+
+/// `cre_regex_captures_limit` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_captures_limit_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    start: usize,
+    limit_ms: u64,
+    captures: *mut cre_captures,
+    out_found: *mut bool,
+) -> cre_status {
+    unsafe { captures_limit8(regex, text_ptr, text_len, start, limit_ms, captures, out_found, Utf8::Unchecked) }
+}
+
+// The C function's arguments and how it takes its text.
+#[allow(clippy::too_many_arguments)]
+unsafe fn captures_limit8(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    start: usize,
+    limit_ms: u64,
+    captures: *mut cre_captures,
+    out_found: *mut bool,
+    mode: Utf8,
+) -> cre_status {
     guard(|| {
         let found = unsafe { out(out_found, "out_found") }?;
         *found = false;
         let caps = unsafe { captures_for(captures, regex) }?;
         caps.fill::<str>(None);
         let regex = unsafe { handle(regex, "regex") }?;
-        let text = unsafe { text(text_ptr, text_len, "text") }?;
+        let text = unsafe { haystack(text_ptr, text_len, mode) }?;
         start_in(regex, text, start)?;
         let limit = limit_of(limit_ms);
         let got = regex.inner.try_captures_at(text, start, limit).map_err(|e| limited(e, limit))?;
@@ -808,7 +1046,18 @@ pub unsafe extern "C" fn cre_regex_find_iter(
     text_len: usize,
     out_matches: *mut *mut cre_matches,
 ) -> cre_status {
-    unsafe { new_matches8(regex, text_ptr, text_len, false, out_matches) }
+    unsafe { new_matches8(regex, text_ptr, text_len, false, out_matches, Utf8::Checked) }
+}
+
+/// `cre_regex_find_iter` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_find_iter_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    out_matches: *mut *mut cre_matches,
+) -> cre_status {
+    unsafe { new_matches8(regex, text_ptr, text_len, false, out_matches, Utf8::Unchecked) }
 }
 
 /// `cre_regex_find_iter` with the groups of each match, for `cre_matches_next_captures`.
@@ -819,7 +1068,18 @@ pub unsafe extern "C" fn cre_regex_captures_iter(
     text_len: usize,
     out_matches: *mut *mut cre_matches,
 ) -> cre_status {
-    unsafe { new_matches8(regex, text_ptr, text_len, true, out_matches) }
+    unsafe { new_matches8(regex, text_ptr, text_len, true, out_matches, Utf8::Checked) }
+}
+
+/// `cre_regex_captures_iter` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_captures_iter_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    out_matches: *mut *mut cre_matches,
+) -> cre_status {
+    unsafe { new_matches8(regex, text_ptr, text_len, true, out_matches, Utf8::Unchecked) }
 }
 
 unsafe fn new_matches8(
@@ -828,12 +1088,13 @@ unsafe fn new_matches8(
     text_len: usize,
     captures: bool,
     out_matches: *mut *mut cre_matches,
+    mode: Utf8,
 ) -> cre_status {
     guard(|| {
         let slot = unsafe { out(out_matches, "out_matches") }?;
         *slot = std::ptr::null_mut();
         unsafe { handle(regex, "regex") }?;
-        let s = unsafe { text(text_ptr, text_len, "text") }?;
+        let s = unsafe { haystack(text_ptr, text_len, mode) }?;
         let text = Text::Utf8(s.as_ptr(), s.len());
         let iter = unsafe { cre_matches::start(regex, text, captures) };
         *slot = Box::into_raw(Box::new(cre_matches { regex, text, iter }));
@@ -856,7 +1117,20 @@ pub unsafe extern "C" fn cre_regex_replace(
     replacement_len: usize,
     out_result: *mut cre_string,
 ) -> cre_status {
-    unsafe { replace8(regex, text_ptr, text_len, replacement, replacement_len, false, out_result) }
+    unsafe { replace8(regex, text_ptr, text_len, replacement, replacement_len, false, out_result, Utf8::Checked) }
+}
+
+/// `cre_regex_replace` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_replace_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    replacement: *const c_char,
+    replacement_len: usize,
+    out_result: *mut cre_string,
+) -> cre_status {
+    unsafe { replace8(regex, text_ptr, text_len, replacement, replacement_len, false, out_result, Utf8::Unchecked) }
 }
 
 /// `cre_regex_replace` with every match replaced, whether or not the g flag is set (`String.prototype.replaceAll`).
@@ -869,9 +1143,24 @@ pub unsafe extern "C" fn cre_regex_replace_all(
     replacement_len: usize,
     out_result: *mut cre_string,
 ) -> cre_status {
-    unsafe { replace8(regex, text_ptr, text_len, replacement, replacement_len, true, out_result) }
+    unsafe { replace8(regex, text_ptr, text_len, replacement, replacement_len, true, out_result, Utf8::Checked) }
 }
 
+/// `cre_regex_replace_all` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_replace_all_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    replacement: *const c_char,
+    replacement_len: usize,
+    out_result: *mut cre_string,
+) -> cre_status {
+    unsafe { replace8(regex, text_ptr, text_len, replacement, replacement_len, true, out_result, Utf8::Unchecked) }
+}
+
+// The C function's arguments and how it takes its text.
+#[allow(clippy::too_many_arguments)]
 unsafe fn replace8(
     regex: *const cre_regex,
     text_ptr: *const c_char,
@@ -880,12 +1169,13 @@ unsafe fn replace8(
     replacement_len: usize,
     all: bool,
     out_result: *mut cre_string,
+    mode: Utf8,
 ) -> cre_status {
     guard(|| {
         let slot = unsafe { out(out_result, "out_result") }?;
         *slot = cre_string { ptr: std::ptr::null_mut(), len: 0 };
         let regex = unsafe { handle(regex, "regex") }?;
-        let text = unsafe { text(text_ptr, text_len, "text") }?;
+        let text = unsafe { haystack(text_ptr, text_len, mode) }?;
         let replacement = unsafe { self::text(replacement, replacement_len, "replacement") }?;
         let result =
             if all { regex.inner.replace_all(text, replacement) } else { regex.inner.replace(text, replacement) };
@@ -906,11 +1196,34 @@ pub unsafe extern "C" fn cre_regex_split(
     limit: u32,
     out_pieces: *mut cre_pieces,
 ) -> cre_status {
+    unsafe { split8(regex, text_ptr, text_len, limit, out_pieces, Utf8::Checked) }
+}
+
+/// `cre_regex_split` with the text trusted to be UTF-8, unchecked: see `Utf8::Unchecked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_split_unchecked(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    limit: u32,
+    out_pieces: *mut cre_pieces,
+) -> cre_status {
+    unsafe { split8(regex, text_ptr, text_len, limit, out_pieces, Utf8::Unchecked) }
+}
+
+unsafe fn split8(
+    regex: *const cre_regex,
+    text_ptr: *const c_char,
+    text_len: usize,
+    limit: u32,
+    out_pieces: *mut cre_pieces,
+    mode: Utf8,
+) -> cre_status {
     guard(|| {
         let slot = unsafe { out(out_pieces, "out_pieces") }?;
         *slot = cre_pieces { items: std::ptr::null(), len: 0, internal: std::ptr::null_mut() };
         let regex = unsafe { handle(regex, "regex") }?;
-        let text = unsafe { text(text_ptr, text_len, "text") }?;
+        let text = unsafe { haystack(text_ptr, text_len, mode) }?;
         let parts = regex.inner.splitn(text, limit as usize);
         let parts: Vec<Option<Cow<'_, [u8]>>> = parts
             .into_iter()

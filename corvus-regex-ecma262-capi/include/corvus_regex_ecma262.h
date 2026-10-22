@@ -46,7 +46,7 @@ extern "C" {
 /* The header's version: compare with cre_version(), the library's. */
 #define CRE_VERSION_MAJOR 0
 #define CRE_VERSION_MINOR 1
-#define CRE_VERSION_PATCH 2
+#define CRE_VERSION_PATCH 3
 
 /* The limits of size of a pattern: its length in bytes, the depth its groups nest to, and the size counted for it as
  * it is read. A pattern over any of them is CRE_PATTERN_TOO_LARGE. */
@@ -197,7 +197,7 @@ cre_str cre_regex_group_name(const cre_regex *regex, size_t index);
  * A start is a byte offset no greater than the text's length, on a character boundary or, without the u or v flag,
  * between the halves of a character beyond the Basic Multilingual Plane (its third byte); anything else is
  * CRE_INVALID_ARGUMENT. Each call checks that the whole text is UTF-8; a global search (cre_regex_find_iter) checks it
- * once. */
+ * once. A caller whose strings are UTF-8 by construction can skip the check with the _unchecked functions below. */
 
 /* Whether the pattern matches anywhere in the text (at its start alone with the y flag): *out_matched. */
 cre_status cre_regex_is_match(const cre_regex *regex, const char *text, size_t text_len, bool *out_matched);
@@ -273,6 +273,43 @@ cre_status cre_regex_replace_all(const cre_regex *regex, const char *text, size_
  * success *out_pieces holds the pieces, to free with cre_pieces_free. A half character is written as U+FFFD. */
 cre_status cre_regex_split(const cre_regex *regex, const char *text, size_t text_len, uint32_t limit,
                            cre_pieces *out_pieces);
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * Matching UTF-8 text without the check
+ *
+ * Each function is the one without the suffix, with the text taken on trust to be UTF-8: it is not checked, so a call
+ * does not read the whole text once more before it searches. They are for a caller whose strings are UTF-8 by
+ * construction, such as a Swift String or a Rust str. Text that is not UTF-8 is undefined behaviour. Everything else
+ * (the arguments, the results, the statuses, CRE_INVALID_UTF8 aside) is as the function without the suffix. */
+
+cre_status cre_regex_is_match_unchecked(const cre_regex *regex, const char *text, size_t text_len, bool *out_matched);
+cre_status cre_regex_is_match_limit_unchecked(const cre_regex *regex, const char *text, size_t text_len,
+                                              uint64_t limit_ms, bool *out_matched);
+cre_status cre_regex_is_match_at_unchecked(const cre_regex *regex, const char *text, size_t text_len, size_t start,
+                                           bool *out_matched);
+cre_status cre_regex_find_unchecked(const cre_regex *regex, const char *text, size_t text_len, size_t start,
+                                    cre_match *out_match, bool *out_found);
+cre_status cre_regex_find_limit_unchecked(const cre_regex *regex, const char *text, size_t text_len, size_t start,
+                                          uint64_t limit_ms, cre_match *out_match, bool *out_found);
+cre_status cre_regex_captures_read_unchecked(const cre_regex *regex, const char *text, size_t text_len, size_t start,
+                                             cre_match *groups, size_t groups_len, bool *out_found);
+cre_status cre_regex_captures_read_limit_unchecked(const cre_regex *regex, const char *text, size_t text_len,
+                                                   size_t start, uint64_t limit_ms, cre_match *groups,
+                                                   size_t groups_len, bool *out_found);
+cre_status cre_regex_captures_unchecked(const cre_regex *regex, const char *text, size_t text_len, size_t start,
+                                        cre_captures *captures, bool *out_found);
+cre_status cre_regex_captures_limit_unchecked(const cre_regex *regex, const char *text, size_t text_len, size_t start,
+                                              uint64_t limit_ms, cre_captures *captures, bool *out_found);
+cre_status cre_regex_find_iter_unchecked(const cre_regex *regex, const char *text, size_t text_len,
+                                         cre_matches **out_matches);
+cre_status cre_regex_captures_iter_unchecked(const cre_regex *regex, const char *text, size_t text_len,
+                                             cre_matches **out_matches);
+cre_status cre_regex_replace_unchecked(const cre_regex *regex, const char *text, size_t text_len,
+                                       const char *replacement, size_t replacement_len, cre_string *out_result);
+cre_status cre_regex_replace_all_unchecked(const cre_regex *regex, const char *text, size_t text_len,
+                                           const char *replacement, size_t replacement_len, cre_string *out_result);
+cre_status cre_regex_split_unchecked(const cre_regex *regex, const char *text, size_t text_len, uint32_t limit,
+                                     cre_pieces *out_pieces);
 
 /* ------------------------------------------------------------------------------------------------------------------
  * Matching UTF-16 text
