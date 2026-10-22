@@ -38,7 +38,7 @@ if(CRE_LIB_DIR)
   set_target_properties(corvus_regex_ecma262 PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${CRE_INCLUDE_DIR}")
   set(kinds cargo)
 else()
-  find_package(corvus_regex_ecma262 0.1 CONFIG REQUIRED)
+  find_package(corvus_regex_ecma262 0.2 CONFIG REQUIRED)
   set(kinds shared static)
   if(TARGET corvus_regex_ecma262::corvus_regex_ecma262_static_mt)
     # MSVC: the static library for the static C runtime, linked from a test built with /MT.

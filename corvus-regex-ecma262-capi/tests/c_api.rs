@@ -686,6 +686,10 @@ fn the_versions_agree() {
     let manifest = include_str!("../Cargo.toml");
     let dependency = format!("version = \"{}\" }}", env!("CARGO_PKG_VERSION"));
     assert!(manifest.lines().any(|l| l.starts_with("corvus = ") && l.ends_with(&dependency)), "the engine dependency");
+    // The smoke test asks the CMake package for this version, which with a major version of 0 is the minor one.
+    let smoke = include_str!("../tests/native/CMakeLists.txt");
+    let wanted = format!("find_package(corvus_regex_ecma262 {}.{} CONFIG REQUIRED)", parts[0], parts[1]);
+    assert!(smoke.contains(&wanted), "tests/native/CMakeLists.txt does not ask for {}.{}", parts[0], parts[1]);
 }
 
 #[test]
