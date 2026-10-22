@@ -1,27 +1,10 @@
-# The C library's release archives (corvus-regex-ecma262-capi): on every release platform the package (package.ps1:
-# the header, the shared and the static library, a CMake package and a pkg-config file), archived, and the archive
-# unpacked and the C smoke test built against it and run, shared and static, as a consumer builds it. Each platform's archive is uploaded as an artifact
-# (capi-<target>); capi-publish.yml calls this workflow to attach them to a release.
+# The C library's release archives (corvus-regex-ecma262-capi): on every release platform the package (package.ps1: the
+# header, the shared and the static library, a CMake package and a pkg-config file), archived, and the archive unpacked
+# and the C smoke test built against it and run, shared and static, as a consumer builds it. Each platform's archive is
+# uploaded as an artifact (capi-<target>); ci.yml calls this workflow on every pull request and push to main, and
+# capi-publish.yml to attach the archives to a release.
 name: capi
 on:
-  push:
-    branches:
-    - main
-    paths:
-    - 'corvus-regex-ecma262/**'
-    - 'corvus-regex-ecma262-capi/**'
-    - 'Cargo.lock'
-    - 'rust-toolchain.toml'
-    - '.github/workflows/capi.yml'
-    - '.github/workflows/capi-publish.yml'
-  pull_request:
-    paths:
-    - 'corvus-regex-ecma262/**'
-    - 'corvus-regex-ecma262-capi/**'
-    - 'Cargo.lock'
-    - 'rust-toolchain.toml'
-    - '.github/workflows/capi.yml'
-    - '.github/workflows/capi-publish.yml'
   workflow_dispatch:
   workflow_call:
 

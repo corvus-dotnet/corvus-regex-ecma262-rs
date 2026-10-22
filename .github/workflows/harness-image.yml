@@ -1,13 +1,14 @@
-# The benchmark harness image: built and smoke-run on every push to main and every release, and published to
-# ghcr.io/corvus-dotnet/corvus-regex-ecma262-rs (`:latest` from main, the release's tag from a release). This
-# repository publishes no benchmark results of its own: the central benchmark site
-# (https://corvus-oss.org/corvus-regex-ecma262-benchmarks/) runs this image each night on its runner, beside every
-# other Corvus ECMA-262 engine, and is the one page of figures.
+# The benchmark harness image: built and smoke-run on every pull request, every push to main and every release, and
+# published to ghcr.io/corvus-dotnet/corvus-regex-ecma262-rs (`:latest` from main, the release's tag from a release).
+# This repository publishes no benchmark results of its own: the central benchmark site
+# (https://corvus-oss.org/corvus-regex-ecma262-benchmarks/) runs this image each night on its runner, beside every other
+# Corvus ECMA-262 engine, and is the one page of figures.
 name: harness-image
 on:
   push:
     branches:
     - main
+  pull_request:
   release:
     types: [published]
   workflow_dispatch:
@@ -17,12 +18,12 @@ permissions:
   packages: write
 
 concurrency:
-  group: harness-image
+  group: harness-image-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   image:
-    name: Build, smoke-run and publish the harness image
+    name: Harness image
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
