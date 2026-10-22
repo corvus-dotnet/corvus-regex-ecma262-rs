@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use corvus_regex_ecma262::{Error, Limit, MatchError, Regex};
+use corvus_regex_ecma262::{Error, Flags, Limit, MatchError, Regex};
 
 /// A time no test should come near.
 const GENEROUS: Duration = Duration::from_secs(20);
@@ -31,7 +31,7 @@ fn a_match_that_reaches_its_limit_is_an_error() {
     let re = Regex::new(NEVER_ANSWERS, "u").unwrap();
     let text = never_answered();
     let start = Instant::now();
-    let result = re.try_is_match(&text, limit);
+    let result = re.is_match_within(&text, limit);
     let took = start.elapsed();
     assert_eq!(result, Err(MatchError::Time));
     assert!(took >= limit && took < limit + GENEROUS, "abandoned after {took:?}");
@@ -41,7 +41,7 @@ fn a_match_that_reaches_its_limit_is_an_error() {
 fn the_match_limit_is_for_each_match() {
     let re = Regex::new(NEVER_ANSWERS, "u").unwrap();
     for _ in 0..3 {
-        assert_eq!(re.try_is_match("aaaa", Duration::from_millis(50)), Ok(true));
+        assert_eq!(re.is_match_within("aaaa", Duration::from_millis(50)), Ok(true));
     }
 }
 
@@ -50,13 +50,13 @@ fn a_match_that_reaches_its_memory_limit_is_an_error() {
     let hour = Duration::from_secs(3600);
     let re = Regex::new("(?:a?){2147483647}", "u").unwrap();
     let start = Instant::now();
-    assert_eq!(re.try_is_match("", hour), Err(MatchError::Memory));
+    assert_eq!(re.is_match_within("", hour), Err(MatchError::Memory));
     assert!(start.elapsed() < GENEROUS, "abandoned after {:?}", start.elapsed());
     // With no limit of time there is none of memory either, and the match is the engine's to finish: this one
     // gives up at once, because the text is shorter than the least the pattern consumes.
     let re = Regex::new("(?:a){2147483647}", "u").unwrap();
-    assert!(!re.is_match("aaa"));
-    assert_eq!(re.try_is_match("aaa", Duration::ZERO), Ok(false));
+    assert!(!re.is_match("aaa").unwrap());
+    assert_eq!(re.is_match_within("aaa", Duration::ZERO), Ok(false));
 }
 
 #[test]
@@ -78,9 +78,9 @@ fn an_ordinary_pattern_is_not_affected_by_the_limit() {
     ] {
         let re = Regex::new(pattern, "u").unwrap();
         for limit in [Duration::from_secs(1), Duration::from_secs(10), Duration::ZERO] {
-            assert_eq!(re.try_is_match(text, limit), Ok(want), "{pattern} with the limit {limit:?}");
+            assert_eq!(re.is_match_within(text, limit), Ok(want), "{pattern} with the limit {limit:?}");
         }
-        assert_eq!(re.is_match(text), want, "{pattern}");
+        assert_eq!(re.is_match(text).unwrap(), want, "{pattern}");
     }
 }
 
@@ -97,7 +97,7 @@ fn no_search_reads_the_text_from_every_position() {
     ] {
         let re = Regex::new(pattern, "u").unwrap();
         let start = Instant::now();
-        let result = re.try_is_match(&text, limit);
+        let result = re.is_match_within(&text, limit);
         let took = start.elapsed();
         assert!(
             matches!(result, Ok(false) | Err(_)) && took < limit + GENEROUS,
@@ -180,4 +180,98 @@ fn a_pattern_that_is_not_valid_is_not_too_large() {
             assert!(matches!(e, Error::Invalid(_)), "{pattern:.20}: {e}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The match timeout of a pattern.
+
+/// Every member that matches gives its match the pattern's timeout, and returns its error, over UTF-8 and UTF-16: the
+/// global searches give it as an item and end, and replace and split give it for the whole call.
+#[test]
+fn every_member_returns_the_error_of_the_timeout() {
+    let timeout = Duration::from_millis(30);
+    let re = Regex::with_timeout(NEVER_ANSWERS, Flags::parse("u").unwrap(), Some(timeout)).unwrap();
+    assert_eq!(re.match_timeout(), Some(timeout));
+    let text = never_answered();
+    let t16: Vec<u16> = text.encode_utf16().collect();
+    let time = Err(MatchError::Time);
+    let start = Instant::now();
+    assert_eq!(re.is_match(&text), time);
+    assert_eq!(re.is_match_at(&text, 0), time);
+    assert_eq!(re.find(&text).map(|m| m.is_some()), time);
+    assert_eq!(re.find_at(&text, 0).map(|m| m.is_some()), time);
+    assert_eq!(re.captures(&text).map(|c| c.is_some()), time);
+    assert_eq!(re.captures_at(&text, 0).map(|c| c.is_some()), time);
+    let mut locs = re.capture_locations();
+    assert_eq!(re.captures_read_at(&mut locs, &text, 0).map(|m| m.is_some()), time);
+    let mut it = re.find_iter(&text);
+    assert_eq!(it.next().map(|m| m.map(|_| ())), Some(Err(MatchError::Time)));
+    assert!(it.next().is_none(), "the search ends at the error");
+    let mut it = re.captures_iter(&text);
+    assert_eq!(it.next().map(|c| c.map(|_| ())), Some(Err(MatchError::Time)));
+    assert!(it.next().is_none());
+    assert_eq!(re.find_iter(&text).next_batch(&mut [(0, 0); 4]), Err(MatchError::Time));
+    assert_eq!(re.captures_iter(&text).next_batch(&mut [None::<(usize, usize)>; 4]), Err(MatchError::Time));
+    assert_eq!(re.replace(&text, "x").map(|_| ()), time.map(|_| ()));
+    assert_eq!(re.replace_all(&text, "x").map(|_| ()), time.map(|_| ()));
+    assert_eq!(re.replace_with(&text, |_| String::new()).map(|_| ()), time.map(|_| ()));
+    assert_eq!(re.split(&text).map(|_| ()), time.map(|_| ()));
+    assert_eq!(re.splitn(&text, 2).map(|_| ()), time.map(|_| ()));
+    assert_eq!(re.is_match_utf16(&t16), time);
+    assert_eq!(re.is_match_at_utf16(&t16, 0), time);
+    assert_eq!(re.find_utf16(&t16).map(|m| m.is_some()), time);
+    assert_eq!(re.find_at_utf16(&t16, 0).map(|m| m.is_some()), time);
+    assert_eq!(re.captures_utf16(&t16).map(|c| c.is_some()), time);
+    assert_eq!(re.captures_at_utf16(&t16, 0).map(|c| c.is_some()), time);
+    assert_eq!(re.captures_read_at_utf16(&mut locs, &t16, 0).map(|m| m.is_some()), time);
+    assert_eq!(re.find_iter_utf16(&t16).next().map(|m| m.map(|_| ())), Some(Err(MatchError::Time)));
+    assert_eq!(re.captures_iter_utf16(&t16).next().map(|c| c.map(|_| ())), Some(Err(MatchError::Time)));
+    assert_eq!(re.find_iter_utf16(&t16).next_batch(&mut [(0, 0); 4]), Err(MatchError::Time));
+    assert_eq!(re.captures_iter_utf16(&t16).next_batch(&mut [None::<(usize, usize)>; 4]), Err(MatchError::Time));
+    assert_eq!(re.replace_utf16(&t16, &[0x78]).map(|_| ()), time.map(|_| ()));
+    assert_eq!(re.replace_all_utf16(&t16, &[0x78]).map(|_| ()), time.map(|_| ()));
+    assert_eq!(re.split_utf16(&t16).map(|_| ()), time.map(|_| ()));
+    assert_eq!(re.splitn_utf16(&t16, 2).map(|_| ()), time.map(|_| ()));
+    assert!(start.elapsed() < GENEROUS, "the members took {:?}", start.elapsed());
+    // A text the pattern answers within the timeout is answered, by every member.
+    assert_eq!(re.is_match("aaaa"), Ok(true));
+    assert_eq!(re.replace("aaaa", "<$&>").unwrap(), "<aaaa>");
+    assert_eq!(re.split("aaaa").unwrap().len(), 3, "the empty pieces and the group");
+    assert_eq!(re.find_iter("aaaa").count(), 1);
+}
+
+/// A timeout brings the cap on the memory of the backtracking with it.
+#[test]
+fn a_timeout_caps_the_memory_of_a_match() {
+    let re = Regex::with_timeout("(?:a?){2147483647}", Flags::default(), Some(Duration::from_secs(3600))).unwrap();
+    let start = Instant::now();
+    assert_eq!(re.is_match(""), Err(MatchError::Memory));
+    assert_eq!(re.find_iter("").next().map(|m| m.map(|_| ())), Some(Err(MatchError::Memory)));
+    assert_eq!(re.split("").map(|_| ()), Err(MatchError::Memory));
+    assert!(start.elapsed() < GENEROUS, "abandoned after {:?}", start.elapsed());
+}
+
+/// The `_within` members give one match a limit in place of the pattern's timeout, and a timeout of `None` or zero is
+/// none.
+#[test]
+fn a_limit_of_its_own_takes_the_place_of_the_timeout() {
+    let hour = Some(Duration::from_secs(3600));
+    let re = Regex::with_timeout(NEVER_ANSWERS, Flags::parse("u").unwrap(), hour).unwrap();
+    let text = never_answered();
+    let t16: Vec<u16> = text.encode_utf16().collect();
+    let short = Duration::from_millis(30);
+    assert_eq!(re.is_match_within(&text, short), Err(MatchError::Time));
+    assert_eq!(re.find_at_within(&text, 0, short).map(|m| m.is_some()), Err(MatchError::Time));
+    assert_eq!(re.captures_at_within(&text, 0, short).map(|c| c.is_some()), Err(MatchError::Time));
+    assert_eq!(re.is_match_within_utf16(&t16, short), Err(MatchError::Time));
+    assert_eq!(re.find_at_within_utf16(&t16, 0, short).map(|m| m.is_some()), Err(MatchError::Time));
+    assert_eq!(re.captures_at_within_utf16(&t16, 0, short).map(|c| c.is_some()), Err(MatchError::Time));
+    // A limit of zero is none, whatever the pattern's timeout.
+    let quick = Regex::with_timeout("^(a+)\\1$", Flags::default(), Some(Duration::from_nanos(1))).unwrap();
+    assert_eq!(quick.is_match_within("aaaa", Duration::ZERO), Ok(true));
+    for none in [None, Some(Duration::ZERO)] {
+        let re = Regex::with_timeout("a", Flags::default(), none).unwrap();
+        assert_eq!(re.match_timeout(), None);
+    }
+    assert_eq!(Regex::new("a", "").unwrap().match_timeout(), None, "no timeout unless one is set");
 }

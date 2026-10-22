@@ -23,8 +23,8 @@ fn a_pattern_is_read_by_the_grammar_of_its_flags() {
     // An identity escape is Annex B's alone, and set notation the v flag's alone.
     assert!(Regex::new(r"\&", "").is_ok());
     assert!(matches!(Regex::new(r"\&", "u"), Err(Error::Invalid(_))));
-    assert!(Regex::new(r"[\w--\d]", "v").unwrap().is_match("a"));
-    assert!(!Regex::new(r"^[\w--\d]$", "v").unwrap().is_match("1"));
+    assert!(Regex::new(r"[\w--\d]", "v").unwrap().is_match("a").unwrap());
+    assert!(!Regex::new(r"^[\w--\d]$", "v").unwrap().is_match("1").unwrap());
     assert!(Regex::new(r"^[\w--\d]$", "u").is_err());
     assert!(Regex::is_valid(r"\p{RGI_Emoji}", "v"));
     assert!(!Regex::is_valid(r"\p{RGI_Emoji}", "u"));
@@ -34,33 +34,33 @@ fn a_pattern_is_read_by_the_grammar_of_its_flags() {
 #[test]
 fn find_and_find_at() {
     let re = Regex::new(r"\d+", "").unwrap();
-    let m = re.find("ab 12 345").unwrap();
+    let m = re.find("ab 12 345").unwrap().unwrap();
     assert_eq!((m.start(), m.end(), m.as_str()), (3, 5, "12"));
-    assert_eq!(re.find_at("ab 12 345", 5).unwrap().as_str(), "345");
-    assert!(re.find_at("ab 12 345", 10).is_none());
-    assert!(re.find("none").is_none());
+    assert_eq!(re.find_at("ab 12 345", 5).unwrap().unwrap().as_str(), "345");
+    assert!(re.find_at("ab 12 345", 10).unwrap().is_none());
+    assert!(re.find("none").unwrap().is_none());
 }
 
 #[test]
 fn the_sticky_flag_anchors_each_match_at_its_start() {
     let re = Regex::new("a", "y").unwrap();
-    assert!(re.find("ba").is_none());
-    assert_eq!(re.find_at("ba", 1).unwrap().start(), 1);
-    assert!(!re.is_match("ba"));
-    let all: Vec<usize> = re.find_iter("aab").map(|m| m.start()).collect();
+    assert!(re.find("ba").unwrap().is_none());
+    assert_eq!(re.find_at("ba", 1).unwrap().unwrap().start(), 1);
+    assert!(!re.is_match("ba").unwrap());
+    let all: Vec<usize> = re.find_iter("aab").map(Result::unwrap).map(|m| m.start()).collect();
     assert_eq!(all, [0, 1]);
 }
 
 #[test]
 fn a_global_search_steps_over_an_empty_match_by_a_character() {
     let re = Regex::new("", "u").unwrap();
-    let starts: Vec<usize> = re.find_iter("a\u{1F600}b").map(|m| m.start()).collect();
+    let starts: Vec<usize> = re.find_iter("a\u{1F600}b").map(Result::unwrap).map(|m| m.start()).collect();
     assert_eq!(starts, [0, 1, 5, 6]);
     // Without the u flag the step is a code unit, which over UTF-8 stands between the halves at the third byte.
     let re = Regex::new("", "").unwrap();
-    let starts: Vec<usize> = re.find_iter("a\u{1F600}b").map(|m| m.start()).collect();
+    let starts: Vec<usize> = re.find_iter("a\u{1F600}b").map(Result::unwrap).map(|m| m.start()).collect();
     assert_eq!(starts, [0, 1, 3, 5, 6]);
-    let starts: Vec<usize> = re.find_iter_utf16(&utf16("a\u{1F600}b")).map(|m| m.start()).collect();
+    let starts: Vec<usize> = re.find_iter_utf16(&utf16("a\u{1F600}b")).map(Result::unwrap).map(|m| m.start()).collect();
     assert_eq!(starts, [0, 1, 2, 3, 4]);
 }
 
@@ -69,7 +69,7 @@ fn captures_and_names() {
     let re = Regex::new(r"(?<y>\d{4})-(?<m>\d{2})(?:-(?<d>\d{2}))?", "").unwrap();
     assert_eq!(re.captures_len(), 4);
     assert_eq!(re.group_names().collect::<Vec<_>>(), ["y", "m", "d"]);
-    let caps = re.captures("on 2026-10!").unwrap();
+    let caps = re.captures("on 2026-10!").unwrap().unwrap();
     assert_eq!(caps.get(0).unwrap().as_str(), "2026-10");
     assert_eq!(caps.name("y").unwrap().as_str(), "2026");
     assert_eq!(caps.name("m").unwrap().range(), 8..10);
@@ -77,16 +77,16 @@ fn captures_and_names() {
     assert!(caps.get(3).is_none() && caps.get(4).is_none());
     // Two groups of one name in separate alternatives: the one that took part.
     let re = Regex::new(r"(?<x>a)|(?<x>b)", "").unwrap();
-    assert_eq!(re.captures("b").unwrap().name("x").unwrap().start(), 0);
+    assert_eq!(re.captures("b").unwrap().unwrap().name("x").unwrap().start(), 0);
 }
 
 #[test]
 fn the_groups_of_a_repetition_are_those_of_its_last_iteration() {
     let re = Regex::new(r"(?:(a)|b)+", "").unwrap();
-    let caps = re.captures("ab").unwrap();
+    let caps = re.captures("ab").unwrap().unwrap();
     assert!(caps.get(1).is_none(), "the last iteration took b, so group 1 is cleared");
     let mut locs = re.capture_locations();
-    let m = re.captures_read_at(&mut locs, "xba", 0).unwrap();
+    let m = re.captures_read_at(&mut locs, "xba", 0).unwrap().unwrap();
     assert_eq!((m.start(), m.end()), (1, 3));
     assert_eq!(locs.get(1), Some((2, 3)));
 }
@@ -94,34 +94,38 @@ fn the_groups_of_a_repetition_are_those_of_its_last_iteration() {
 #[test]
 fn replace_substitutes_as_get_substitution_does() {
     let re = Regex::new(r"(\w)(\w)?", "").unwrap();
-    assert_eq!(re.replace("ab cd", "[$2$1]"), "[ba] cd");
-    assert_eq!(re.replace_all("ab c", "[$2$1]"), "[ba] [c]");
-    assert_eq!(Regex::new(r"(\w)(\w)?", "g").unwrap().replace("ab c", "[$2$1]"), "[ba] [c]");
+    assert_eq!(re.replace("ab cd", "[$2$1]").unwrap(), "[ba] cd");
+    assert_eq!(re.replace_all("ab c", "[$2$1]").unwrap(), "[ba] [c]");
+    assert_eq!(Regex::new(r"(\w)(\w)?", "g").unwrap().replace("ab c", "[$2$1]").unwrap(), "[ba] [c]");
     let re = Regex::new("b", "").unwrap();
-    assert_eq!(re.replace("abc", "<$&|$`|$'|$$|$1|$<n>>"), "a<b|a|c|$|$1|$<n>>c");
+    assert_eq!(re.replace("abc", "<$&|$`|$'|$$|$1|$<n>>").unwrap(), "a<b|a|c|$|$1|$<n>>c");
     let re = Regex::new("(?<n>b)", "").unwrap();
-    assert_eq!(re.replace("abc", "<$<n>|$<m>|$01|$10|$<n"), "a<b||b|b0|$<nc");
+    assert_eq!(re.replace("abc", "<$<n>|$<m>|$01|$10|$<n").unwrap(), "a<b||b|b0|$<nc");
     // The name runs to the next `>`, wherever it is.
-    assert_eq!(re.replace("abc", "<$<n|$1>"), "a<c");
+    assert_eq!(re.replace("abc", "<$<n|$1>").unwrap(), "a<c");
     let re = Regex::new(r"(?<first>\w+) (?<last>\w+)", "").unwrap();
-    assert_eq!(re.replace_with("Ada Lovelace", |c| c.name("last").unwrap().as_str().to_uppercase()), "LOVELACE");
+    assert_eq!(
+        re.replace_with("Ada Lovelace", |c| c.name("last").unwrap().as_str().to_uppercase()).unwrap(),
+        "LOVELACE"
+    );
     // Nothing matched: the text itself.
-    assert!(matches!(re.replace("x", "y"), std::borrow::Cow::Borrowed("x")));
+    assert!(matches!(re.replace("x", "y").unwrap(), std::borrow::Cow::Borrowed("x")));
 }
 
 #[test]
 fn split_splices_the_groups_in() {
     let re = Regex::new(r"(-)|(\+)", "").unwrap();
-    let parts: Vec<Option<String>> = re.split("a-b+c").into_iter().map(|p| p.map(|s| s.into_owned())).collect();
+    let parts: Vec<Option<String>> =
+        re.split("a-b+c").unwrap().into_iter().map(|p| p.map(|s| s.into_owned())).collect();
     let want = [Some("a"), Some("-"), None, Some("b"), None, Some("+"), Some("c")];
     assert_eq!(parts, want.map(|p| p.map(String::from)));
-    assert_eq!(re.splitn("a-b+c", 2).len(), 2);
+    assert_eq!(re.splitn("a-b+c", 2).unwrap().len(), 2);
     // An empty match at the start or the end of the text splits nothing, and the empty text is one piece unless the
     // pattern matches it.
     let re = Regex::new("", "").unwrap();
-    assert_eq!(re.split("ab").len(), 2);
-    assert_eq!(re.split("").len(), 0);
-    assert_eq!(Regex::new("x", "").unwrap().split("").len(), 1);
+    assert_eq!(re.split("ab").unwrap().len(), 2);
+    assert_eq!(re.split("").unwrap().len(), 0);
+    assert_eq!(Regex::new("x", "").unwrap().split("").unwrap().len(), 1);
 }
 
 #[test]
@@ -129,16 +133,16 @@ fn utf16_text_with_lone_surrogates() {
     let text = [0x61, 0xD800, 0x62, 0xD83D, 0xDE00];
     // With the u flag a lone surrogate is a code point of its own, and a pair is one character.
     let re = Regex::new(r"^a\ud800b.$", "u").unwrap();
-    assert!(re.is_match_utf16(&text));
+    assert!(re.is_match_utf16(&text).unwrap());
     let re = Regex::new(r"^a.b..$", "").unwrap();
-    assert!(re.is_match_utf16(&text), "without the u flag a pair is two units");
+    assert!(re.is_match_utf16(&text).unwrap(), "without the u flag a pair is two units");
     let re = Regex::new(r"\udc00", "u").unwrap();
-    assert!(!re.is_match_utf16(&utf16("\u{10400}")), "the half of a whole pair is not a lone surrogate");
+    assert!(!re.is_match_utf16(&utf16("\u{10400}")).unwrap(), "the half of a whole pair is not a lone surrogate");
     let re = Regex::new(r"(?<x>\w)", "").unwrap();
-    let caps = re.captures_utf16(&text).unwrap();
+    let caps = re.captures_utf16(&text).unwrap().unwrap();
     assert_eq!(caps.name("x").unwrap().as_slice(), &[0x61]);
     assert_eq!(
-        re.replace_all_utf16(&text, &utf16("<$1>")).into_owned(),
+        re.replace_all_utf16(&text, &utf16("<$1>")).unwrap().into_owned(),
         [0x3C, 0x61, 0x3E, 0xD800, 0x3C, 0x62, 0x3E, 0xD83D, 0xDE00]
     );
 }
@@ -147,30 +151,30 @@ fn utf16_text_with_lone_surrogates() {
 fn a_backreference_does_not_end_inside_a_surrogate_pair_with_the_u_flag() {
     // The group holds a lone high surrogate; what follows is a pair, one code point that is not it.
     let re = Regex::new(r"^(.)\1", "u").unwrap();
-    assert!(!re.is_match_utf16(&[0xD800, 0xD800, 0xDC00]));
-    assert!(Regex::new(r"^(.)\1", "").unwrap().is_match_utf16(&[0xD800, 0xD800, 0xDC00]));
+    assert!(!re.is_match_utf16(&[0xD800, 0xD800, 0xDC00]).unwrap());
+    assert!(Regex::new(r"^(.)\1", "").unwrap().is_match_utf16(&[0xD800, 0xD800, 0xDC00]).unwrap());
 }
 
 #[test]
 fn a_half_character_over_utf8_is_written_as_a_replacement_character() {
     // Without the u flag the pattern matches the high half of the character, which UTF-8 cannot hold.
     let re = Regex::new(r"\ud83d", "").unwrap();
-    let m = re.find("a\u{1F600}").unwrap();
+    let m = re.find("a\u{1F600}").unwrap().unwrap();
     assert_eq!((m.start(), m.end()), (1, 3));
     assert_eq!(m.as_str(), "");
     assert_eq!(m.as_cow(), "\u{FFFD}");
-    assert_eq!(re.replace("a\u{1F600}", "x"), "ax\u{FFFD}");
+    assert_eq!(re.replace("a\u{1F600}", "x").unwrap(), "ax\u{FFFD}");
 }
 
 #[test]
 fn modifiers_and_flags_mean_the_same() {
     for (flags, pattern) in [("i", "k"), ("", "(?i:k)")] {
         let re = Regex::new(&format!("^{pattern}$"), &format!("{flags}u")).unwrap();
-        assert!(re.is_match("K") && re.is_match("\u{212A}"), "/{pattern}/{flags}u");
+        assert!(re.is_match("K").unwrap() && re.is_match("\u{212A}").unwrap(), "/{pattern}/{flags}u");
     }
-    assert!(Regex::new("^b$", "m").unwrap().is_match("a\nb\nc"));
-    assert!(Regex::new("a.b", "s").unwrap().is_match("a\nb"));
-    assert!(!Regex::new("a.b", "").unwrap().is_match("a\nb"));
+    assert!(Regex::new("^b$", "m").unwrap().is_match("a\nb\nc").unwrap());
+    assert!(Regex::new("a.b", "s").unwrap().is_match("a\nb").unwrap());
+    assert!(!Regex::new("a.b", "").unwrap().is_match("a\nb").unwrap());
 }
 
 #[test]
@@ -201,18 +205,20 @@ fn a_run_of_the_dot_with_the_s_flag_is_the_rest_of_the_text() {
                     && (0xDC00..=0xDFFF).contains(&text[start])
                     && (0xD800..=0xDBFF).contains(&text[start - 1]);
                 let from = if unicode && mid_pair { start - 1 } else { start };
-                let got = shortcut.find_at_utf16(text, start).map(|m| (m.start(), m.end()));
-                let want = matcher.find_at_utf16(text, start).map(|m| (m.start(), m.end()));
+                let got = shortcut.find_at_utf16(text, start).unwrap().map(|m| (m.start(), m.end()));
+                let want = matcher.find_at_utf16(text, start).unwrap().map(|m| (m.start(), m.end()));
                 assert_eq!(got, want, "/.*/{flags} over {text:x?} from {start}");
                 assert_eq!(got, Some((from, text.len())), "/.*/{flags} over {text:x?} from {start}");
-                let got = plus.find_at_utf16(text, start).map(|m| (m.start(), m.end()));
-                let want = plus_matcher.find_at_utf16(text, start).map(|m| (m.start(), m.end()));
+                let got = plus.find_at_utf16(text, start).unwrap().map(|m| (m.start(), m.end()));
+                let want = plus_matcher.find_at_utf16(text, start).unwrap().map(|m| (m.start(), m.end()));
                 assert_eq!(got, want, "/.+/{flags} over {text:x?} from {start}");
                 assert_eq!(got, (from < text.len()).then_some((from, text.len())), "/.+/{flags} {text:x?} {start}");
             }
             // The global search: the rest of the text, then the empty match at its end.
-            let all: Vec<(usize, usize)> = shortcut.find_iter_utf16(text).map(|m| (m.start(), m.end())).collect();
-            let want: Vec<(usize, usize)> = matcher.find_iter_utf16(text).map(|m| (m.start(), m.end())).collect();
+            let all: Vec<(usize, usize)> =
+                shortcut.find_iter_utf16(text).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
+            let want: Vec<(usize, usize)> =
+                matcher.find_iter_utf16(text).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
             assert_eq!(all, want, "/.*/{flags} global over {text:x?}");
             if !flags.contains('y') {
                 let expected: &[(usize, usize)] =
@@ -256,38 +262,40 @@ fn a_batch_of_matches_is_what_find_iter_gives() {
     for (pattern, flags) in patterns {
         let re = Regex::new(pattern, flags).unwrap();
         for text in texts {
-            let want: Vec<(usize, usize)> = re.find_iter(text).map(|m| (m.start(), m.end())).collect();
+            let want: Vec<(usize, usize)> =
+                re.find_iter(text).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
             let mut t16 = utf16(text);
             t16.push(0xD800);
             t16.insert(0, 0xDC00);
-            let want16: Vec<(usize, usize)> = re.find_iter_utf16(&t16).map(|m| (m.start(), m.end())).collect();
+            let want16: Vec<(usize, usize)> =
+                re.find_iter_utf16(&t16).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
             for size in [1, 2, 3, 7, 64] {
                 let mut it = re.find_iter(text);
                 let (mut got, mut spans) = (Vec::new(), vec![(0, 0); size]);
                 loop {
-                    let n = it.next_batch(&mut spans);
+                    let n = it.next_batch(&mut spans).unwrap();
                     got.extend_from_slice(&spans[..n]);
                     if n < size {
                         break;
                     }
                 }
                 assert_eq!(got, want, "/{pattern}/{flags} over {text:?} in batches of {size}");
-                assert_eq!(it.next_batch(&mut spans), 0);
+                assert_eq!(it.next_batch(&mut spans).unwrap(), 0);
                 assert!(it.next().is_none());
                 let mut it = re.find_iter_utf16(&t16);
                 let mut got = Vec::new();
                 // Batches and single matches mixed.
                 loop {
-                    let n = it.next_batch(&mut spans);
+                    let n = it.next_batch(&mut spans).unwrap();
                     got.extend_from_slice(&spans[..n]);
                     if n < size {
                         break;
                     }
-                    got.extend(it.next().map(|m| (m.start(), m.end())));
+                    got.extend(it.next().map(|m| m.unwrap()).map(|m| (m.start(), m.end())));
                 }
                 assert_eq!(got, want16, "/{pattern}/{flags} over UTF-16 {t16:?} in batches of {size}");
             }
-            assert_eq!(re.find_iter(text).next_batch::<(usize, usize)>(&mut []), 0);
+            assert_eq!(re.find_iter(text).next_batch::<(usize, usize)>(&mut []), Ok(0));
         }
     }
 }
@@ -311,13 +319,17 @@ fn a_batch_of_captures_is_what_captures_iter_gives() {
         let width = re.captures_len();
         for text in texts {
             let span = |m: Option<corvus_regex_ecma262::Match<'_, _>>| m.map(|m| (m.start(), m.end()));
-            let want: Vec<Option<(usize, usize)>> =
-                re.captures_iter(text).flat_map(|c| (0..width).map(|k| span(c.get(k))).collect::<Vec<_>>()).collect();
+            let want: Vec<Option<(usize, usize)>> = re
+                .captures_iter(text)
+                .map(Result::unwrap)
+                .flat_map(|c| (0..width).map(|k| span(c.get(k))).collect::<Vec<_>>())
+                .collect();
             let mut t16 = utf16(text);
             t16.push(0xDC00);
             let span16 = |m: Option<corvus_regex_ecma262::Match<'_, [u16]>>| m.map(|m| (m.start(), m.end()));
             let want16: Vec<Option<(usize, usize)>> = re
                 .captures_iter_utf16(&t16)
+                .map(Result::unwrap)
                 .flat_map(|c| (0..width).map(|k| span16(c.get(k))).collect::<Vec<_>>())
                 .collect();
             for size in [1, 2, 5, 11] {
@@ -327,7 +339,7 @@ fn a_batch_of_captures_is_what_captures_iter_gives() {
                 let mut it = re.captures_iter(text);
                 let mut got = Vec::new();
                 loop {
-                    let n = it.next_batch(&mut groups);
+                    let n = it.next_batch(&mut groups).unwrap();
                     got.extend_from_slice(&groups[..n * width]);
                     if n < matches {
                         break;
@@ -338,7 +350,7 @@ fn a_batch_of_captures_is_what_captures_iter_gives() {
                 let mut it = re.captures_iter_utf16(&t16);
                 let mut got = Vec::new();
                 loop {
-                    let n = it.next_batch(&mut groups);
+                    let n = it.next_batch(&mut groups).unwrap();
                     got.extend_from_slice(&groups[..n * width]);
                     if n < matches {
                         break;
@@ -348,7 +360,7 @@ fn a_batch_of_captures_is_what_captures_iter_gives() {
             }
             // Too little room for one match.
             let mut small = vec![None::<(usize, usize)>; width - 1];
-            assert_eq!(re.captures_iter(text).next_batch(&mut small), 0);
+            assert_eq!(re.captures_iter(text).next_batch(&mut small), Ok(0));
         }
     }
 }

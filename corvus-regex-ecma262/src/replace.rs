@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 
+use super::MatchError;
 use super::regex::{Captures, GroupInfo, Haystack, Regex};
 use super::units::Text;
 
@@ -10,20 +11,20 @@ type Unit<H> = <<H as Haystack>::Text as Text>::Unit;
 /// The value of a slot for a group that did not take part.
 const UNSET: usize = usize::MAX;
 
-/// Replaces the first match, or every match with `all`, by the template.
+/// Replaces the first match, or every match with `all`, by the template. Each match has the pattern's timeout.
 pub(crate) fn replace<'t, H: Haystack + ?Sized>(
     re: &Regex,
     text: &'t H,
     template: &[Unit<H>],
     all: bool,
-) -> Cow<'t, H> {
+) -> Result<Cow<'t, H>, MatchError> {
     let input = text.units();
     let info = re.info();
     let mut slots = vec![UNSET; 2 * re.captures_len()];
     let sticky = re.flags().sticky;
     let (mut out, mut last, mut at) = (Vec::new(), 0, 0);
     let mut any = false;
-    while let Ok(Some((from, to))) = re.exec::<H::Text>(input, at, sticky, None, Some(&mut slots)) {
+    while let Some((from, to)) = re.exec::<H::Text>(input, at, sticky, re.timeout(), Some(&mut slots))? {
         any = true;
         H::Text::push_lossy(&mut out, input, last, from);
         substitute::<H::Text>(&mut out, input, &slots, info, template);
@@ -34,24 +35,25 @@ pub(crate) fn replace<'t, H: Haystack + ?Sized>(
         at = re.next_start::<H::Text>(input, from, to);
     }
     if !any {
-        return Cow::Borrowed(text);
+        return Ok(Cow::Borrowed(text));
     }
     H::Text::push_lossy(&mut out, input, last, input.len());
-    Cow::Owned(H::from_units(out))
+    Ok(Cow::Owned(H::from_units(out)))
 }
 
-/// Replaces the first match, or every match with `all`, by what the function returns.
+/// Replaces the first match, or every match with `all`, by what the function returns. Each match has the pattern's
+/// timeout.
 pub(crate) fn replace_with<'t>(
     re: &Regex,
     text: &'t str,
     all: bool,
     mut f: impl FnMut(&Captures<'t>) -> String,
-) -> Cow<'t, str> {
+) -> Result<Cow<'t, str>, MatchError> {
     let input = text.as_bytes();
     let sticky = re.flags().sticky;
     let (mut out, mut last, mut at) = (Vec::new(), 0, 0);
     let mut any = false;
-    while let Ok(Some(caps)) = re.captures_generic(text, at, sticky, None) {
+    while let Some(caps) = re.captures_generic(text, at, sticky, re.timeout())? {
         any = true;
         let m = caps.get_match();
         <str as Haystack>::Text::push_lossy(&mut out, input, last, m.start());
@@ -63,10 +65,10 @@ pub(crate) fn replace_with<'t>(
         at = re.next_start::<<str as Haystack>::Text>(input, m.start(), m.end());
     }
     if !any {
-        return Cow::Borrowed(text);
+        return Ok(Cow::Borrowed(text));
     }
     <str as Haystack>::Text::push_lossy(&mut out, input, last, input.len());
-    Cow::Owned(String::from_utf8(out).expect("what the engine writes from UTF-8 is UTF-8"))
+    Ok(Cow::Owned(String::from_utf8(out).expect("what the engine writes from UTF-8 is UTF-8")))
 }
 
 /// Appends the template with each `$` form replaced (`GetSubstitution`).
@@ -160,24 +162,28 @@ fn substitute<T: Text>(
 
 /// Splits the text around the matches (`RegExp.prototype[Symbol.split]`), with at most `limit` items. The flags g
 /// and y do not apply: split searches with a copy of the pattern that is sticky, from each position in turn, which
-/// is what a search from the position finds first.
-pub(crate) fn split<'t, H: Haystack + ?Sized>(re: &Regex, text: &'t H, limit: usize) -> Vec<Option<Cow<'t, H>>> {
+/// is what a search from the position finds first. Each match has the pattern's timeout.
+pub(crate) fn split<'t, H: Haystack + ?Sized>(
+    re: &Regex,
+    text: &'t H,
+    limit: usize,
+) -> Result<Vec<Option<Cow<'t, H>>>, MatchError> {
     let input = text.units();
     let size = input.len();
     let mut out = Vec::new();
     if limit == 0 {
-        return out;
+        return Ok(out);
     }
     let mut slots = vec![UNSET; 2 * re.captures_len()];
     if size == 0 {
-        if !matches!(re.exec::<H::Text>(input, 0, true, None, Some(&mut slots)), Ok(Some(_))) {
+        if re.exec::<H::Text>(input, 0, true, re.timeout(), Some(&mut slots))?.is_none() {
             out.push(Some(text.piece(0, 0)));
         }
-        return out;
+        return Ok(out);
     }
     let (mut p, mut q) = (0, 0);
     while q < size {
-        let Ok(Some((from, to))) = re.exec::<H::Text>(input, q, false, None, Some(&mut slots)) else { break };
+        let Some((from, to)) = re.exec::<H::Text>(input, q, false, re.timeout(), Some(&mut slots))? else { break };
         if from >= size {
             break;
         }
@@ -188,17 +194,17 @@ pub(crate) fn split<'t, H: Haystack + ?Sized>(re: &Regex, text: &'t H, limit: us
         }
         out.push(Some(text.piece(p, from)));
         if out.len() == limit {
-            return out;
+            return Ok(out);
         }
         p = e;
         for g in 1..slots.len() / 2 {
             out.push((slots[2 * g] != UNSET).then(|| text.piece(slots[2 * g], slots[2 * g + 1])));
             if out.len() == limit {
-                return out;
+                return Ok(out);
             }
         }
         q = p;
     }
     out.push(Some(text.piece(p, size)));
-    out
+    Ok(out)
 }

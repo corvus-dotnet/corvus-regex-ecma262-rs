@@ -930,7 +930,7 @@ fn backtracking_semantics() {
     ] {
         let re = compile(pattern).unwrap();
         assert!(!re.is_regular(), "{pattern:?} needs no backtracking");
-        assert_eq!(re.is_match(text), want, "{pattern:?} on {text:?}");
+        assert_eq!(re.is_match(text).unwrap(), want, "{pattern:?} on {text:?}");
     }
 }
 
@@ -952,7 +952,7 @@ fn long_input() {
     ] {
         let re = compile(pattern).unwrap();
         assert!(!re.is_regular(), "{pattern:?} needs no backtracking");
-        assert_eq!(re.is_match(&text), want, "{pattern:?} on {} bytes", text.len());
+        assert_eq!(re.is_match(&text).unwrap(), want, "{pattern:?} on {} bytes", text.len());
     }
 }
 
@@ -967,7 +967,7 @@ fn concurrent_use() {
                 std::thread::spawn(move || {
                     let yes = "aa1b2".repeat(50 + g);
                     let no = format!("{yes}!");
-                    (0..500).all(|_| re.is_match(&yes) && !re.is_match(&no))
+                    (0..500).all(|_| re.is_match(&yes).unwrap() && !re.is_match(&no).unwrap())
                 })
             })
             .collect();
@@ -1047,7 +1047,7 @@ fn modifiers() {
         (r"^(?<\u0061b>.)\k<ab>$", "zz", true),
     ] {
         let re = compile(pattern).unwrap();
-        assert_eq!(re.is_match(text), want, "{pattern:?} on {text:?}");
+        assert_eq!(re.is_match(text).unwrap(), want, "{pattern:?} on {text:?}");
         assert_eq!(re.match_backtrack(text, None), Ok(want), "{pattern:?} on {text:?} (the backtracking matcher)");
     }
     for p in [
@@ -1133,7 +1133,7 @@ fn properties() {
         (r"^[^\p{L}]+$", "1a", false),
     ] {
         let re = compile(pattern).unwrap();
-        assert_eq!(re.is_match(text), want, "{pattern:?} on {text:?}");
+        assert_eq!(re.is_match(text).unwrap(), want, "{pattern:?} on {text:?}");
     }
     for p in
         [r"\p{Nope}", r"\p{L=x}", r"\p{gc=Greek}", r"\p{sc=L}", r"\p{}", r"\p{Lu", r"\pL", r"\p{sc=}", r"\p{ascii}"]
@@ -1163,7 +1163,7 @@ fn automaton() {
         (r"(a)\1", false),
     ] {
         let re = compile(p).unwrap();
-        re.is_match("");
+        re.is_match("").unwrap();
         assert_eq!(matches!(re.dfa.get(), Some(Some(_))), want, "{p:?}: automaton");
     }
     for (p, s, want) in [
@@ -1206,16 +1206,16 @@ fn automaton() {
         (r"^(a$|b)c?$", "ac", false),
     ] {
         let re = compile(p).unwrap();
-        assert_eq!(re.is_match(s), want, "{p:?} on {s:?}");
+        assert_eq!(re.is_match(s).unwrap(), want, "{p:?} on {s:?}");
         assert_eq!(re.match_backtrack(s, None), Ok(want), "{p:?} on {s:?} (the backtracking matcher)");
         let Some(Some(dfa)) = re.dfa.get() else { panic!("{p:?}: no automaton") };
         assert_eq!(dfa.is_match(s.as_bytes()), Some(want), "{p:?} on {s:?}: the automaton");
     }
     let re = compile(r"^[a-z]+$").unwrap();
-    assert!(re.is_match("abc") && !re.is_match("caf\u{e9}"));
+    assert!(re.is_match("abc").unwrap() && !re.is_match("caf\u{e9}").unwrap());
     assert_eq!(re.dfa.get().unwrap().as_ref().unwrap().is_match("caf\u{e9}".as_bytes()), None);
     let re = compile(r"^\p{L}+$").unwrap();
-    assert!(re.is_match("caf\u{e9}") && !re.is_match("caf\u{e9} 1") && re.is_match("cafe"));
+    assert!(re.is_match("caf\u{e9}").unwrap() && !re.is_match("caf\u{e9} 1").unwrap() && re.is_match("cafe").unwrap());
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1257,7 +1257,7 @@ fn a_match_with_no_limit_is_not_abandoned() {
     assert_eq!(re.match_limit(&text, None), Ok(false));
     // A limit of zero is no limit.
     assert_eq!(re.match_limit(&text, Some(Duration::ZERO)), Ok(false));
-    assert!(!re.is_match(&text));
+    assert!(!re.is_match(&text).unwrap());
     assert_eq!(re.match_limit(&text[..14], Some(GENEROUS)), Ok(true));
 }
 
@@ -1561,8 +1561,8 @@ fn the_deepest_nesting_of_classes_does_not_overflow_a_small_stack() {
             ] {
                 assert!(Regex::is_valid(&pattern, flags), "{}", short(&pattern));
                 let re = Regex::new(&pattern, flags).unwrap_or_else(|e| panic!("{}: {e}", short(&pattern)));
-                assert_eq!(re.is_match(text), want, "{} on {text}", short(&pattern));
-                assert_eq!(re.find_iter(text).count() > 0, want, "{} on {text}", short(&pattern));
+                assert_eq!(re.is_match(text).unwrap(), want, "{} on {text}", short(&pattern));
+                assert_eq!(re.find_iter(text).map(Result::unwrap).count() > 0, want, "{} on {text}", short(&pattern));
             }
             // One level more, and a great many more, open and not closed, are refused.
             for pattern in [nest("[", "a", "]", MAX_NESTING + 1), nest("[", "a", "]", 200_000), "[".repeat(200_000)] {
@@ -1586,8 +1586,8 @@ fn many_classes_without_the_v_flag_are_read_where_they_are_asked() {
     let test = small.spawn(move || {
         for flags in ["", "u", "i", "iu"] {
             let re = Regex::new(&classes, flags).unwrap_or_else(|e| panic!("{flags}: {e}"));
-            assert!(re.is_match(&"a".repeat(400)), "{flags}");
-            assert!(!re.is_match(&"a".repeat(399)), "{flags}");
+            assert!(re.is_match(&"a".repeat(400)).unwrap(), "{flags}");
+            assert!(!re.is_match(&"a".repeat(399)).unwrap(), "{flags}");
             assert!(Regex::is_valid(&classes, flags), "{flags}");
         }
     });
@@ -1836,26 +1836,32 @@ fn the_searches_find_what_every_position_finds() {
             super::search::NO_SEARCH.with(|n| n.set(true));
             let plain = Regex::new(pattern, &flags).unwrap();
             // The program that records the groups is built on the first use, so it is built here.
-            let _ = plain.captures("");
+            let _ = plain.captures("").unwrap();
             super::search::NO_SEARCH.with(|n| n.set(false));
-            let _ = searched.captures("");
+            let _ = searched.captures("").unwrap();
             assert!(!matches!(plain.program().search.plan, super::search::Plan::Windows { .. }));
             for text in &texts {
                 let a: Vec<Vec<Option<(usize, usize)>>> = searched
                     .captures_iter(text)
+                    .map(Result::unwrap)
                     .map(|c| c.iter().map(|m| m.map(|m| (m.start(), m.end()))).collect())
                     .collect();
                 let b: Vec<Vec<Option<(usize, usize)>>> = plain
                     .captures_iter(text)
+                    .map(Result::unwrap)
                     .map(|c| c.iter().map(|m| m.map(|m| (m.start(), m.end()))).collect())
                     .collect();
                 assert_eq!(a, b, "/{pattern}/{flags} on {text:?} over UTF-8");
-                let f: Vec<(usize, usize)> = searched.find_iter(text).map(|m| (m.start(), m.end())).collect();
-                let g: Vec<(usize, usize)> = plain.find_iter(text).map(|m| (m.start(), m.end())).collect();
+                let f: Vec<(usize, usize)> =
+                    searched.find_iter(text).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
+                let g: Vec<(usize, usize)> =
+                    plain.find_iter(text).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
                 assert_eq!(f, g, "/{pattern}/{flags} on {text:?} over UTF-8, without groups");
                 let t16: Vec<u16> = text.encode_utf16().collect();
-                let f: Vec<(usize, usize)> = searched.find_iter_utf16(&t16).map(|m| (m.start(), m.end())).collect();
-                let g: Vec<(usize, usize)> = plain.find_iter_utf16(&t16).map(|m| (m.start(), m.end())).collect();
+                let f: Vec<(usize, usize)> =
+                    searched.find_iter_utf16(&t16).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
+                let g: Vec<(usize, usize)> =
+                    plain.find_iter_utf16(&t16).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
                 assert_eq!(f, g, "/{pattern}/{flags} on {text:?} over UTF-16");
             }
         }
@@ -1922,7 +1928,7 @@ fn a_literal_with_a_rare_byte_is_found_as_any_other() {
             let text: String =
                 (0..n).map(|_| ['a', 'b', 'q', 'j', 'z', 'Z', 'X', ' '][(seed.next() % 8) as usize]).collect();
             let want: Vec<usize> = text.match_indices(literal).map(|(i, _)| i).collect();
-            let got: Vec<usize> = re.find_iter(&text).map(|m| m.start()).collect();
+            let got: Vec<usize> = re.find_iter(&text).map(Result::unwrap).map(|m| m.start()).collect();
             assert_eq!(got, want, "/{literal}/ in {text:?}");
         }
     }

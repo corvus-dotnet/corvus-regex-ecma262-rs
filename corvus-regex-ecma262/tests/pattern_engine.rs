@@ -120,7 +120,7 @@ mod json_schema {
         pub fn try_validate(&self, instance: &Value) -> Result<bool, SchemaEvaluationError> {
             let text = instance.as_str().expect("a string");
             let limit = self.limit.unwrap_or(Duration::ZERO);
-            self.re.try_is_match(text, limit).map_err(|_: MatchError| {
+            self.re.is_match_within(text, limit).map_err(|_: MatchError| {
                 SchemaEvaluationError::PatternMatchLimit(LimitError { pattern: self.re.as_str().to_string(), limit })
             })
         }

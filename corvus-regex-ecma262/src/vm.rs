@@ -248,6 +248,16 @@ fn mid_pair(units: &[u16], at: usize) -> bool {
     at > 0 && at < units.len() && (0xDC00..=0xDFFF).contains(&units[at]) && (0xD800..=0xDBFF).contains(&units[at - 1])
 }
 
+/// What a match start of `NO_MATCH`, `STOPPED_TIME` or `STOPPED_MEMORY` says: no match, or the error of a match that
+/// reached its limit.
+fn stopped(from: usize) -> Result<(), MatchError> {
+    match from {
+        STOPPED_TIME => Err(MatchError::Time),
+        STOPPED_MEMORY => Err(MatchError::Memory),
+        _ => Ok(()),
+    }
+}
+
 impl Program {
     /// The bit of the memory for the memo point `m` at a position, with the state of the loops around the point:
     /// for each, whether it would refuse an iteration that ended here as empty.
@@ -370,8 +380,9 @@ impl Program {
         }
     }
 
-    /// The matches of a global search from `at` (with no limit), as many as `spans` holds, written to its start:
-    /// how many, where the search goes on, and whether it has found every match. The matches `exec` finds one call
+    /// The matches of a global search from `at`, each with the limit `limit`, as many as `spans` holds, written to
+    /// its start: how many, where the search goes on, and whether it has found every match, or the error of a match
+    /// that reached its limit. The matches `exec` finds one call
     /// at a time, in one loop over the batch: a pattern of a simple shape by the search inlined into the loop (one
     /// class and one loop of a class each by a loop of its own), any other by the matcher with the thread's memory
     /// taken once for the batch.
@@ -381,19 +392,20 @@ impl Program {
         mut at: usize,
         unicode: bool,
         sticky: bool,
+        limit: Option<Duration>,
         spans: &mut [S],
-    ) -> (usize, usize, bool) {
+    ) -> Result<(usize, usize, bool), MatchError> {
         let mut n = 0;
         if self.groups == 0 && !sticky && !self.anchored {
             let done;
             (n, at, done) = self.shape_batch::<T, S>(input, at, unicode, spans);
             if let Some(done) = done {
-                return (n, at, done);
+                return Ok((n, at, done));
             }
         }
         STATE.with(|cell| match cell.try_borrow_mut() {
-            Ok(mut st) => self.matcher_batch::<T, S>(&mut st, input, at, unicode, sticky, spans, n),
-            Err(_) => self.matcher_batch::<T, S>(&mut State::default(), input, at, unicode, sticky, spans, n),
+            Ok(mut st) => self.matcher_batch::<T, S>(&mut st, input, at, unicode, sticky, limit, spans, n),
+            Err(_) => self.matcher_batch::<T, S>(&mut State::default(), input, at, unicode, sticky, limit, spans, n),
         })
     }
 
@@ -470,19 +482,22 @@ impl Program {
         (n, at, Some(false))
     }
 
-    /// The matches of a global search from `at` (with no limit) with what each group captured, as many as `groups`
+    /// The matches of a global search from `at`, each with the limit `limit`, with what each group captured, as many as `groups`
     /// holds at `width` entries a match (the match, then each group the program records, `None` for one that did
     /// not take part), written to its start: how many matches, where the search goes on, and whether it has found
-    /// every match. A program that records no group is answered as `exec_batch` answers it.
+    /// every match, or the error of a match that reached its limit. A program that records no group is answered as
+    /// `exec_batch` answers it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn exec_batch_groups<T: Text, S: From<Option<(usize, usize)>>>(
         &self,
         input: &[T::Unit],
         mut at: usize,
         unicode: bool,
         sticky: bool,
+        limit: Option<Duration>,
         groups: &mut [S],
         width: usize,
-    ) -> (usize, usize, bool) {
+    ) -> Result<(usize, usize, bool), MatchError> {
         debug_assert_eq!(width, self.groups + 1);
         if self.groups == 0 {
             let mut spans = [(0, 0); 64];
@@ -491,20 +506,23 @@ impl Program {
                 let want = (groups.len() - n).min(spans.len());
                 let done;
                 let got;
-                (got, at, done) = self.exec_batch::<T, (usize, usize)>(input, at, unicode, sticky, &mut spans[..want]);
+                (got, at, done) =
+                    self.exec_batch::<T, (usize, usize)>(input, at, unicode, sticky, limit, &mut spans[..want])?;
                 for (slot, &span) in groups[n..].iter_mut().zip(&spans[..got]) {
                     *slot = S::from(Some(span));
                 }
                 n += got;
                 if done {
-                    return (n, at, true);
+                    return Ok((n, at, true));
                 }
             }
-            return (n, at, false);
+            return Ok((n, at, false));
         }
         STATE.with(|cell| match cell.try_borrow_mut() {
-            Ok(mut st) => self.groups_batch::<T, S>(&mut st, input, at, unicode, sticky, groups, width),
-            Err(_) => self.groups_batch::<T, S>(&mut State::default(), input, at, unicode, sticky, groups, width),
+            Ok(mut st) => self.groups_batch::<T, S>(&mut st, input, at, unicode, sticky, limit, groups, width),
+            Err(_) => {
+                self.groups_batch::<T, S>(&mut State::default(), input, at, unicode, sticky, limit, groups, width)
+            }
         })
     }
 
@@ -517,15 +535,16 @@ impl Program {
         mut at: usize,
         unicode: bool,
         sticky: bool,
+        limit: Option<Duration>,
         groups: &mut [S],
         width: usize,
-    ) -> (usize, usize, bool) {
+    ) -> Result<(usize, usize, bool), MatchError> {
         let mut n = 0;
         for one in groups.chunks_exact_mut(width) {
             let start = T::normalize(input, at, unicode);
-            let (from, to) = self.match_with::<T>(st, input, start, sticky, None, None);
+            let (from, to) = self.match_with::<T>(st, input, start, sticky, limit, None);
             if from >= STOPPED_MEMORY {
-                return (n, at, true);
+                return stopped(from).map(|()| (n, at, true));
             }
             one[0] = S::from(Some((from, to)));
             // What the match left in the memory is what each group captured.
@@ -535,7 +554,7 @@ impl Program {
             n += 1;
             at = if to == from { T::advance(input, to, unicode) } else { to };
         }
-        (n, at, false)
+        Ok((n, at, false))
     }
 
     /// `exec_batch` by the matcher, with the memory `st`, from `n` matches written.
@@ -547,21 +566,21 @@ impl Program {
         mut at: usize,
         unicode: bool,
         sticky: bool,
+        limit: Option<Duration>,
         spans: &mut [S],
         mut n: usize,
-    ) -> (usize, usize, bool) {
+    ) -> Result<(usize, usize, bool), MatchError> {
         while n < spans.len() {
             let start = T::normalize(input, at, unicode);
-            let (from, to) = self.match_with::<T>(st, input, start, sticky, None, None);
-            // No match (with no limit, a match is never abandoned).
+            let (from, to) = self.match_with::<T>(st, input, start, sticky, limit, None);
             if from >= STOPPED_MEMORY {
-                return (n, at, true);
+                return stopped(from).map(|()| (n, at, true));
             }
             spans[n] = S::from((from, to));
             n += 1;
             at = if to == from { T::advance(input, to, unicode) } else { to };
         }
-        (n, at, false)
+        Ok((n, at, false))
     }
 
     /// The first match at or after `start` of a pattern of a simple shape, or `None` when it has none.

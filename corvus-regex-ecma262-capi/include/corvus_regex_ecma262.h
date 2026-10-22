@@ -25,10 +25,14 @@
  *   halves of a character beyond the Basic Multilingual Plane; such a position is the offset of the character's
  *   third byte. The g flag makes cre_regex_replace replace every match; the y flag makes a match start where the
  *   search starts.
- * - Limits. A pattern over a limit of size is refused (CRE_PATTERN_TOO_LARGE). The functions with the suffix
- *   _limit take a limit of time in milliseconds (0 for none); a match that reaches it, or whose backtracking memory
- *   reaches CRE_MAX_STACK entries, is CRE_MATCH_LIMIT, which is not an answer. A pattern without a backreference
- *   takes time in proportion to its size times the text.
+ * - Limits. A pattern over a limit of size is refused (CRE_PATTERN_TOO_LARGE). A regular expression has a match
+ *   timeout, as a Regex of .NET has: the time each match may take, given by cre_regex_new_with_timeout or for every
+ *   regular expression by cre_set_default_match_timeout, and none unless one of them gives one. A match that reaches
+ *   it, or whose backtracking memory reaches CRE_MAX_STACK entries, is CRE_MATCH_LIMIT, which is not an answer, from
+ *   whichever function matched. The functions with the suffix _limit take a limit of their own in milliseconds (0
+ *   for the regular expression's timeout). Without a timeout a match has no limit of time or of memory, so a program
+ *   that matches patterns or texts from outside should set one. A pattern without a backreference takes time in
+ *   proportion to its size times the text.
  *
  * Licensed under the Apache License, Version 2.0.
  */
@@ -45,8 +49,8 @@ extern "C" {
 
 /* The header's version: compare with cre_version(), the library's. */
 #define CRE_VERSION_MAJOR 0
-#define CRE_VERSION_MINOR 1
-#define CRE_VERSION_PATCH 3
+#define CRE_VERSION_MINOR 2
+#define CRE_VERSION_PATCH 0
 
 /* The limits of size of a pattern: its length in bytes, the depth its groups nest to, and the size counted for it as
  * it is read. A pattern over any of them is CRE_PATTERN_TOO_LARGE. */
@@ -158,12 +162,30 @@ size_t cre_last_error_offset(void);
 /* ------------------------------------------------------------------------------------------------------------------
  * Compiling */
 
+/* Sets the match timeout of every regular expression compiled from now on by cre_regex_new, in milliseconds (0 for
+ * none, the default): the time each match may take before it is abandoned with CRE_MATCH_LIMIT. A program that
+ * matches patterns or texts from outside should set it when it starts (see cre_regex_new_with_timeout). */
+void cre_set_default_match_timeout(uint64_t timeout_ms);
+
+/* The match timeout a regular expression compiled now by cre_regex_new takes, in milliseconds (0 for none). */
+uint64_t cre_default_match_timeout(void);
+
 /* Compiles a pattern with the flags new RegExp(pattern, flags) takes, any of dgimsuvy (flags may be NULL with a
- * length of 0 for none). On success *out_regex is a handle to free with cre_regex_free; on failure it is NULL and the
- * status says why: CRE_INVALID_PATTERN, CRE_INVALID_FLAGS, CRE_PATTERN_TOO_LARGE, CRE_INVALID_UTF8 or
- * CRE_INVALID_ARGUMENT. */
+ * length of 0 for none), and the match timeout of cre_default_match_timeout. On success *out_regex is a handle to
+ * free with cre_regex_free; on failure it is NULL and the status says why: CRE_INVALID_PATTERN, CRE_INVALID_FLAGS,
+ * CRE_PATTERN_TOO_LARGE, CRE_INVALID_UTF8 or CRE_INVALID_ARGUMENT. */
 cre_status cre_regex_new(const char *pattern, size_t pattern_len, const char *flags, size_t flags_len,
                          cre_regex **out_regex);
+
+/* cre_regex_new with a match timeout in milliseconds (0 for none): the time each match may take before it is
+ * abandoned with CRE_MATCH_LIMIT, which brings a cap on the memory of its backtracking with it. Every function that
+ * matches gives its match this timeout, except where a _limit function is given a limit of its own. Without one a
+ * match has no limit of time or of memory. */
+cre_status cre_regex_new_with_timeout(const char *pattern, size_t pattern_len, const char *flags, size_t flags_len,
+                                      uint64_t timeout_ms, cre_regex **out_regex);
+
+/* The match timeout of the regular expression, in milliseconds (0 for none). */
+uint64_t cre_regex_match_timeout(const cre_regex *regex);
 
 /* Frees a regular expression. NULL is allowed and does nothing. */
 void cre_regex_free(cre_regex *regex);
@@ -202,8 +224,9 @@ cre_str cre_regex_group_name(const cre_regex *regex, size_t index);
 /* Whether the pattern matches anywhere in the text (at its start alone with the y flag): *out_matched. */
 cre_status cre_regex_is_match(const cre_regex *regex, const char *text, size_t text_len, bool *out_matched);
 
-/* cre_regex_is_match with a limit on the time the match may take, in milliseconds (0 for none). A match that reaches
- * it, or whose backtracking memory reaches its cap, is CRE_MATCH_LIMIT, and *out_matched is false. */
+/* cre_regex_is_match with a limit on the time the match may take, in milliseconds (0 for the regular expression's match
+ * timeout). A match that reaches it, or whose backtracking memory reaches its cap, is CRE_MATCH_LIMIT, and *out_matched
+ * is false. */
 cre_status cre_regex_is_match_limit(const cre_regex *regex, const char *text, size_t text_len, uint64_t limit_ms,
                                     bool *out_matched);
 
@@ -217,8 +240,8 @@ cre_status cre_regex_is_match_at(const cre_regex *regex, const char *text, size_
 cre_status cre_regex_find(const cre_regex *regex, const char *text, size_t text_len, size_t start,
                           cre_match *out_match, bool *out_found);
 
-/* cre_regex_find with a limit on the time the match may take, in milliseconds (0 for none): CRE_MATCH_LIMIT when it
- * is reached. */
+/* cre_regex_find with a limit on the time the match may take, in milliseconds (0 for the regular expression's match
+ * timeout): CRE_MATCH_LIMIT when it is reached. */
 cre_status cre_regex_find_limit(const cre_regex *regex, const char *text, size_t text_len, size_t start,
                                 uint64_t limit_ms, cre_match *out_match, bool *out_found);
 
@@ -229,8 +252,8 @@ cre_status cre_regex_find_limit(const cre_regex *regex, const char *text, size_t
 cre_status cre_regex_captures_read(const cre_regex *regex, const char *text, size_t text_len, size_t start,
                                    cre_match *groups, size_t groups_len, bool *out_found);
 
-/* cre_regex_captures_read with a limit on the time the match may take, in milliseconds (0 for none): CRE_MATCH_LIMIT
- * when it is reached. It allocates for each match. */
+/* cre_regex_captures_read with a limit on the time the match may take, in milliseconds (0 for the regular expression's
+ * match timeout): CRE_MATCH_LIMIT when it is reached. It allocates for each match. */
 cre_status cre_regex_captures_read_limit(const cre_regex *regex, const char *text, size_t text_len, size_t start,
                                          uint64_t limit_ms, cre_match *groups, size_t groups_len, bool *out_found);
 
@@ -239,8 +262,8 @@ cre_status cre_regex_captures_read_limit(const cre_regex *regex, const char *tex
 cre_status cre_regex_captures(const cre_regex *regex, const char *text, size_t text_len, size_t start,
                               cre_captures *captures, bool *out_found);
 
-/* cre_regex_captures with a limit on the time the match may take, in milliseconds (0 for none): CRE_MATCH_LIMIT when
- * it is reached. */
+/* cre_regex_captures with a limit on the time the match may take, in milliseconds (0 for the regular expression's match
+ * timeout): CRE_MATCH_LIMIT when it is reached. */
 cre_status cre_regex_captures_limit(const cre_regex *regex, const char *text, size_t text_len, size_t start,
                                     uint64_t limit_ms, cre_captures *captures, bool *out_found);
 

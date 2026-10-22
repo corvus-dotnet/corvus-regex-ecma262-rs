@@ -14,9 +14,10 @@ its C library, for any language that calls C.
   transcoded, and a match allocates nothing once the thread's working memory has grown.
 - `is_match`, `find`, `find_iter`, `captures`, `captures_iter`, `replace` (with every `$` form of `GetSubstitution`)
   and `split`, each as `RegExp` and `String.prototype` define it.
-- A pattern without a backreference is matched in time proportional to its size times the text; a match can be
-  given a limit of time, and a pattern has limits of size, so neither a pattern nor a text from outside can make a
-  program hang.
+- A pattern without a backreference is matched in time proportional to its size times the text. A pattern can be
+  given a match timeout, as a `Regex` of .NET can, which bounds the time and the backtracking memory of every match,
+  and a pattern has limits of size, so with a timeout neither a pattern nor a text from outside can make a program
+  hang.
 
 **Compliance.** Over the [ECMA-262 test data](https://github.com/corvus-dotnet/ecma262-regex-test-data) (what V8
 says about 117,889 patterns and 5,884,566 texts, test262's and `exec`, the global search, `replace` and `split` among
@@ -31,7 +32,7 @@ out with its history and brought to the design of the .NET engine
 
 ```toml
 [dependencies]
-corvus-regex-ecma262 = "0.1"
+corvus-regex-ecma262 = "0.2"
 ```
 
 The minimum Rust version is 1.89.
@@ -39,52 +40,81 @@ The minimum Rust version is 1.89.
 ## Getting started
 
 ```rust
-use corvus_regex_ecma262::Regex;
+use corvus_regex_ecma262::{MatchError, Regex};
 
-// The flags are those of new RegExp(pattern, flags).
-let re = Regex::new(r"(?<year>\d{4})-(?<month>\d{2})", "gu").unwrap();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The flags are those of new RegExp(pattern, flags).
+    let re = Regex::new(r"(?<year>\d{4})-(?<month>\d{2})", "gu")?;
 
-assert!(re.is_match("due 2026-10"));
+    // Every member that matches returns a Result: Err when a match reaches the pattern's timeout.
+    assert!(re.is_match("due 2026-10")?);
 
-let caps = re.captures("due 2026-10").unwrap();
-assert_eq!(caps.name("year").unwrap().as_str(), "2026");
+    let caps = re.captures("due 2026-10")?.expect("a match");
+    assert_eq!(caps.name("year").unwrap().as_str(), "2026");
 
-// Every match of a global search.
-let months: Vec<&str> = re.find_iter("2026-10, 2027-01").map(|m| m.as_str()).collect();
-assert_eq!(months, ["2026-10", "2027-01"]);
+    // Every match of a global search.
+    let months: Vec<&str> =
+        re.find_iter("2026-10, 2027-01").map(|m| m.map(|m| m.as_str())).collect::<Result<_, MatchError>>()?;
+    assert_eq!(months, ["2026-10", "2027-01"]);
 
-// replace replaces every match with the g flag, and the first without it.
-assert_eq!(re.replace("2026-10, 2027-01", "$<month>/$1"), "10/2026, 01/2027");
+    // replace replaces every match with the g flag, and the first without it.
+    assert_eq!(re.replace("2026-10, 2027-01", "$<month>/$1")?, "10/2026, 01/2027");
 
-// split splices in what the groups captured.
-let parts = Regex::new(r"\s*(;)\s*", "").unwrap().split("a ; b;c");
-assert_eq!(parts.len(), 5);
+    // split splices in what the groups captured.
+    let parts = Regex::new(r"\s*(;)\s*", "")?.split("a ; b;c")?;
+    assert_eq!(parts.len(), 5);
 
-// UTF-16, with a lone surrogate in the text.
-let text: Vec<u16> = vec![0x61, 0xD800, 0x62];
-assert!(Regex::new(r"^a\ud800b$", "u").unwrap().is_match_utf16(&text));
+    // UTF-16, with a lone surrogate in the text.
+    let text: Vec<u16> = vec![0x61, 0xD800, 0x62];
+    assert!(Regex::new(r"^a\ud800b$", "u")?.is_match_utf16(&text)?);
+    Ok(())
+}
 ```
+
+### Patterns and texts from outside
+
+A pattern has a match timeout, as a `Regex` of `System.Text.RegularExpressions` has: the time each match may take
+before it is abandoned with `MatchError::Time`. It brings a cap on the backtracking memory of the match with it,
+which is `MatchError::Memory`. Without one, the default, a match has no limit of time or of memory, so a program that
+matches a pattern or a text it did not write should give its patterns one:
+
+```rust
+use std::time::Duration;
+use corvus_regex_ecma262::{Flags, MatchError, Regex, set_default_match_timeout};
+
+// For one pattern.
+let re = Regex::with_timeout(r"^(?:(a+)\1*)+$", Flags::default(), Some(Duration::from_millis(100))).unwrap();
+assert_eq!(re.is_match(&("a".repeat(60) + "b")), Err(MatchError::Time));
+
+// For every pattern compiled from here on (the process-wide default of .NET).
+set_default_match_timeout(Some(Duration::from_secs(1)));
+# set_default_match_timeout(None);
+```
+
+The timeout applies to every member: `is_match`, `find`, the global searches, `captures`, `replace` and `split`, for
+each match they make.
 
 A loop over many matches that needs the groups reads them into a `CaptureLocations` with `captures_read_at`, which
 allocates nothing; `next_batch` on `find_iter` and `captures_iter` writes the next matches (with their groups, for
-`captures_iter`) into a slice, a batch at a time, which allocates nothing either. `try_is_match`, `try_find_at` and `try_captures_at` take a limit on the time a match may take and
-return `MatchError` when it is reached.
+`captures_iter`) into a slice, a batch at a time, which allocates nothing either. `is_match_within`, `find_at_within`
+and `captures_at_within` give one match a limit of its own in place of the pattern's timeout.
 
 ### From C
 
 The `corvus-regex-ecma262-capi` crate builds `libcorvus_regex_ecma262` (shared and static), with the header
-`corvus-regex-ecma262-capi/include/corvus_regex_ecma262.h`, which documents every function; each GitHub release has
-an archive of them for each platform, with a CMake package (`find_package(corvus_regex_ecma262)`) and a pkg-config
-file. Each member of `Regex`
-has its C function, over UTF-8 and (with the suffix `_utf16`) over UTF-16: `is_match`, `find`, the groups by number
-(into a buffer the caller owns) and by name (into a reusable `cre_captures`), the global search (`cre_matches`, a
-match a call or a batch of them into an array the caller owns, with or without the groups),
-`replace` and `replace_all` with every `$` form, and `split`, each matching function with a `_limit` form that takes
-a limit of time. Every fallible function returns a `cre_status` with a message for the thread, owned results have a
-free function each, and no panic crosses into the caller. A UTF-8 text is checked to be UTF-8 on each call (once for a
-global search); a caller whose strings are UTF-8 by construction can skip that read of the whole text with each UTF-8
-function's `_unchecked` form, for which text that is not UTF-8 is undefined behaviour; a caller whose strings carry no
-such guarantee can check a text once with `cre_utf8_check` and then search it unchecked.
+`corvus-regex-ecma262-capi/include/corvus_regex_ecma262.h`, which documents every function; each GitHub release has an
+archive of them for each platform, with a CMake package (`find_package(corvus_regex_ecma262)`) and a pkg-config file.
+Each member of `Regex` has its C function, over UTF-8 and (with the suffix `_utf16`) over UTF-16: `is_match`, `find`,
+the groups by number (into a buffer the caller owns) and by name (into a reusable `cre_captures`), the global search
+(`cre_matches`, a match a call or a batch of them into an array the caller owns, with or without the groups), `replace`
+and `replace_all` with every `$` form, and `split`, each matching function with a `_limit` form that takes a limit of
+time of its own; `cre_regex_new_with_timeout` gives a regular expression a match timeout that every function then gives
+its matches, and `cre_set_default_match_timeout` gives one to every regular expression. Every fallible function returns
+a `cre_status` with a message for the thread, owned results have a free function each, and no panic crosses into the
+caller. A UTF-8 text is checked to be UTF-8 on each call (once for a global search); a caller whose strings are UTF-8 by
+construction can skip that read of the whole text with each UTF-8 function's `_unchecked` form, for which text that is
+not UTF-8 is undefined behaviour; a caller whose strings carry no such guarantee can check a text once with
+`cre_utf8_check` and then search it unchecked.
 
 ```c
 cre_regex *re = NULL;
@@ -130,7 +160,7 @@ same pattern answers differently in places:
 | Case folding | ECMA-262's Canonicalize: simple case folding with `u` or `v`, `toUpperCase` without | Unicode simple case folding |
 | Without `u` | the Annex B grammar, and the text matched by UTF-16 code unit | not applicable |
 | Text | `&str` and `&[u16]` | `&str` and `&[u8]` |
-| Time | linear in the text for a pattern without a backreference (the memo of failed places); a pattern with one can take longer, and a match can be given a limit | linear for every pattern |
+| Time | linear in the text for a pattern without a backreference (the memo of failed places); a pattern with one can take longer, and a pattern can be given a match timeout | linear for every pattern |
 | Errors | a pattern over a limit of size is `Error::TooLarge`, apart from `Error::Invalid` | a size limit on the compiled program |
 
 Choose this crate when the pattern is a JavaScript one: from a JSON Schema, an OpenAPI or AsyncAPI document, a

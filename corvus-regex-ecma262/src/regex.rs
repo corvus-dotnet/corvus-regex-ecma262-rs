@@ -9,7 +9,10 @@ use std::time::Duration;
 use super::compile::{self, Program};
 use super::parse::{self, Node};
 use super::units::{Text, Utf8, Utf16};
-use super::{Error, Facts, Flags, MAX_RE2_COST, MatchError, deep, dfa, on_a_deep_stack, read_with, shallow};
+use super::{
+    Error, Facts, Flags, MAX_RE2_COST, MatchError, deep, default_match_timeout, dfa, on_a_deep_stack, read_with,
+    shallow,
+};
 
 /// The value of a slot for a group that did not take part.
 const UNSET: usize = usize::MAX;
@@ -119,6 +122,9 @@ pub struct Regex {
     info: Arc<GroupInfo>,
     /// The pattern needs no backtracking and is small enough to be tried for an automaton.
     regular: bool,
+    /// The time a match may take before it is abandoned, which brings the cap on the memory of its backtracking with
+    /// it; `None` for no limit.
+    timeout: Option<Duration>,
     /// The automaton of the pattern over ASCII text (see `dfa.rs`), built on the first match. `None` inside when
     /// the pattern has none.
     pub(crate) dfa: OnceLock<Option<dfa::Dfa>>,
@@ -150,8 +156,9 @@ impl std::str::FromStr for Regex {
 }
 
 impl Regex {
-    /// Compiles a pattern with the flags `new RegExp(pattern, flags)` takes, such as `""`, `"u"` or `"gimsuy"`. It
-    /// returns [`Error::Invalid`] for a pattern that is not valid in the grammar of its flags, [`Error::Flags`] for
+    /// Compiles a pattern with the flags `new RegExp(pattern, flags)` takes, such as `""`, `"u"` or `"gimsuy"`, and
+    /// the match timeout of [`default_match_timeout`](crate::default_match_timeout) (none unless the program set one).
+    /// It returns [`Error::Invalid`] for a pattern that is not valid in the grammar of its flags, [`Error::Flags`] for
     /// flags that are not valid, and [`Error::TooLarge`] for a pattern over a limit of size (see
     /// [`MAX_SIZE`](crate::MAX_SIZE)), whether or not it is valid.
     ///
@@ -159,7 +166,7 @@ impl Regex {
     /// use corvus_regex_ecma262::Regex;
     ///
     /// let re = Regex::new(r"(?<year>\d{4})-(?<month>\d{2})", "u").unwrap();
-    /// let caps = re.captures("on 2026-10").unwrap();
+    /// let caps = re.captures("on 2026-10").unwrap().unwrap();
     /// assert_eq!(caps.name("year").unwrap().as_str(), "2026");
     /// ```
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, Error> {
@@ -168,10 +175,33 @@ impl Regex {
 
     /// [`Regex::new`] with the flags already read.
     pub fn with_flags(pattern: &str, flags: Flags) -> Result<Regex, Error> {
+        Regex::with_timeout(pattern, flags, default_match_timeout())
+    }
+
+    /// [`Regex::with_flags`] with a match timeout: the time each match may take before it is abandoned with
+    /// [`MatchError::Time`], `None` (or zero) for no limit. A match with a timeout is also abandoned, with
+    /// [`MatchError::Memory`], when its backtracking stack reaches [`MAX_STACK`](crate::MAX_STACK) entries. The clock
+    /// is read every 4,096 steps of the backtracking matcher, so a match can go past the timeout by the time those
+    /// take, which is some tens of microseconds. A pattern without a backreference takes time in proportion to its
+    /// size times the text, and the automaton is never stopped.
+    ///
+    /// Without a timeout a match has no limit of time or of memory: a pattern and a text that come from outside can
+    /// then hold the thread, and take memory, for as long as the match takes. Give such a pattern a timeout, here or
+    /// for every pattern with [`set_default_match_timeout`](crate::set_default_match_timeout).
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use corvus_regex_ecma262::{Flags, MatchError, Regex};
+    ///
+    /// let re = Regex::with_timeout(r"^(?:(a+)\1*)+$", Flags::default(), Some(Duration::from_millis(50))).unwrap();
+    /// assert_eq!(re.is_match(&("a".repeat(60) + "b")), Err(MatchError::Time));
+    /// ```
+    pub fn with_timeout(pattern: &str, flags: Flags, match_timeout: Option<Duration>) -> Result<Regex, Error> {
         let syntax = flags.syntax();
+        let timeout = match_timeout.filter(|t| !t.is_zero());
         on_a_deep_stack(pattern, flags.unicode_sets, || {
             let (root, facts, ps) = read_with(pattern, syntax)?;
-            Ok(Regex::from_tree(pattern, flags, root, facts, &ps))
+            Ok(Regex::from_tree(pattern, flags, timeout, root, facts, &ps))
         })
         .unwrap_or(Err(super::NO_DEEP_STACK))
     }
@@ -183,7 +213,14 @@ impl Regex {
             .unwrap_or(false)
     }
 
-    pub(crate) fn from_tree(pattern: &str, flags: Flags, root: Node, facts: Facts, ps: &parse::Parser) -> Regex {
+    pub(crate) fn from_tree(
+        pattern: &str,
+        flags: Flags,
+        timeout: Option<Duration>,
+        root: Node,
+        facts: Facts,
+        ps: &parse::Parser,
+    ) -> Regex {
         let regular = !facts.needs_backtracking && facts.re2_cost <= MAX_RE2_COST;
         let dfa = OnceLock::new();
         if regular && !shallow(pattern, flags.unicode_sets) {
@@ -209,6 +246,7 @@ impl Regex {
             caps,
             info,
             regular,
+            timeout,
             dfa,
             #[cfg(test)]
             size: facts.size,
@@ -223,6 +261,11 @@ impl Regex {
     /// The flags of the pattern.
     pub fn flags(&self) -> Flags {
         self.flags
+    }
+
+    /// The time each match may take before it is abandoned, or `None` for no limit (see [`Regex::with_timeout`]).
+    pub fn match_timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 
     /// The number of groups of a match: one for the whole match, and one for each capturing group.
@@ -310,33 +353,31 @@ impl Regex {
 
     // -----------------------------------------------------------------------------------------------------------
     // UTF-8
+    //
+    // Every member that matches returns `Err` when a match reaches the pattern's timeout (see `with_timeout`), and
+    // the members that end in `_within` give the match a limit of their own in its place.
 
-    /// Whether the pattern matches anywhere in the text (at its start alone with the y flag), with no limit on the
-    /// time or the memory the match takes. It allocates nothing once the thread's working memory has grown to what
-    /// the pattern and the text need.
+    /// Whether the pattern matches anywhere in the text (at its start alone with the y flag). It allocates nothing
+    /// once the thread's working memory has grown to what the pattern and the text need.
     ///
     /// ```
     /// use corvus_regex_ecma262::Regex;
     ///
-    /// assert!(Regex::new(r"^\p{Lu}", "u").unwrap().is_match("Été"));
+    /// assert_eq!(Regex::new(r"^\p{Lu}", "u").unwrap().is_match("Été"), Ok(true));
     /// ```
-    pub fn is_match(&self, text: &str) -> bool {
-        self.test::<Utf8>(text.as_bytes(), 0, None).unwrap_or(false)
+    pub fn is_match(&self, text: &str) -> Result<bool, MatchError> {
+        self.test::<Utf8>(text.as_bytes(), 0, self.timeout)
     }
 
     /// [`Regex::is_match`] from the position `start` (a byte offset), as `RegExp.prototype.test` with `lastIndex`
     /// set to it.
-    pub fn is_match_at(&self, text: &str, start: usize) -> bool {
-        self.test::<Utf8>(text.as_bytes(), start, None).unwrap_or(false)
+    pub fn is_match_at(&self, text: &str, start: usize) -> Result<bool, MatchError> {
+        self.test::<Utf8>(text.as_bytes(), start, self.timeout)
     }
 
-    /// [`Regex::is_match`] with a limit on the time the match may take (none when it is zero). A match that reaches
-    /// the limit is abandoned and the error is [`MatchError::Time`]. So is a match whose backtracking stack reaches
-    /// [`MAX_STACK`](crate::MAX_STACK) entries, and the error is [`MatchError::Memory`]. The result is then not an
-    /// answer. The clock is read every 4,096 steps of the backtracking matcher, so a match can go past the limit by
-    /// the time those take, which is some tens of microseconds. A pattern without a backreference takes time in
-    /// proportion to its size times the text, and the automaton is never stopped.
-    pub fn try_is_match(&self, text: &str, limit: Duration) -> Result<bool, MatchError> {
+    /// [`Regex::is_match`] with a limit on the time the match may take in place of the pattern's timeout (none when
+    /// it is zero). The limit brings the cap on the memory of the backtracking with it, as a timeout does.
+    pub fn is_match_within(&self, text: &str, limit: Duration) -> Result<bool, MatchError> {
         self.test::<Utf8>(text.as_bytes(), 0, Some(limit))
     }
 
@@ -345,55 +386,55 @@ impl Regex {
     /// ```
     /// use corvus_regex_ecma262::Regex;
     ///
-    /// let m = Regex::new(r"\d+", "").unwrap().find("abc 123 def").unwrap();
+    /// let m = Regex::new(r"\d+", "").unwrap().find("abc 123 def").unwrap().unwrap();
     /// assert_eq!((m.start(), m.end(), m.as_str()), (4, 7, "123"));
     /// ```
-    pub fn find<'t>(&self, text: &'t str) -> Option<Match<'t>> {
+    pub fn find<'t>(&self, text: &'t str) -> Result<Option<Match<'t>>, MatchError> {
         self.find_at(text, 0)
     }
 
     /// The first match at or after `start`, a byte offset: `exec` with `lastIndex` set to it.
-    pub fn find_at<'t>(&self, text: &'t str, start: usize) -> Option<Match<'t>> {
-        self.try_find_at(text, start, Duration::ZERO).unwrap_or(None)
+    pub fn find_at<'t>(&self, text: &'t str, start: usize) -> Result<Option<Match<'t>>, MatchError> {
+        self.find_generic(text, start, self.timeout)
     }
 
-    /// [`Regex::find_at`] with a limit on the time the match may take (see [`Regex::try_is_match`]).
-    pub fn try_find_at<'t>(
+    /// [`Regex::find_at`] with a limit of its own (see [`Regex::is_match_within`]).
+    pub fn find_at_within<'t>(
         &self,
         text: &'t str,
         start: usize,
         limit: Duration,
     ) -> Result<Option<Match<'t>>, MatchError> {
-        let found = self.exec::<Utf8>(text.as_bytes(), start, self.flags.sticky, Some(limit), None)?;
-        Ok(found.map(|(from, to)| Match { text, start: from, end: to }))
+        self.find_generic(text, start, Some(limit))
     }
 
     /// Every match in the text, as a global search finds them (`matchAll`): after an empty match the search goes on
     /// one character later. With the y flag each match must start where the one before it ended. Nothing is
-    /// allocated for each match.
+    /// allocated for each match. A match that reaches the timeout is given as an `Err`, and ends the search.
     ///
     /// ```
     /// use corvus_regex_ecma262::Regex;
     ///
-    /// let words: Vec<&str> = Regex::new(r"\w+", "").unwrap().find_iter("a bc def").map(|m| m.as_str()).collect();
-    /// assert_eq!(words, ["a", "bc", "def"]);
+    /// let re = Regex::new(r"\w+", "").unwrap();
+    /// let words: Result<Vec<&str>, _> = re.find_iter("a bc def").map(|m| m.map(|m| m.as_str())).collect();
+    /// assert_eq!(words.unwrap(), ["a", "bc", "def"]);
     /// ```
     pub fn find_iter<'r, 't>(&'r self, text: &'t str) -> Matches<'r, 't> {
         Matches { re: self, text, at: 0, done: false, session: super::search::new_session() }
     }
 
     /// The first match and what each group captured (`exec`).
-    pub fn captures<'t>(&self, text: &'t str) -> Option<Captures<'t>> {
+    pub fn captures<'t>(&self, text: &'t str) -> Result<Option<Captures<'t>>, MatchError> {
         self.captures_at(text, 0)
     }
 
     /// [`Regex::captures`] from the position `start`, a byte offset.
-    pub fn captures_at<'t>(&self, text: &'t str, start: usize) -> Option<Captures<'t>> {
-        self.try_captures_at(text, start, Duration::ZERO).unwrap_or(None)
+    pub fn captures_at<'t>(&self, text: &'t str, start: usize) -> Result<Option<Captures<'t>>, MatchError> {
+        self.captures_generic(text, start, self.flags.sticky, self.timeout)
     }
 
-    /// [`Regex::captures_at`] with a limit on the time the match may take (see [`Regex::try_is_match`]).
-    pub fn try_captures_at<'t>(
+    /// [`Regex::captures_at`] with a limit of its own (see [`Regex::is_match_within`]).
+    pub fn captures_at_within<'t>(
         &self,
         text: &'t str,
         start: usize,
@@ -414,54 +455,62 @@ impl Regex {
     }
 
     /// The first match at or after `start` (a byte offset), with what each group captured written into `locs`.
-    pub fn captures_read_at<'t>(&self, locs: &mut CaptureLocations, text: &'t str, start: usize) -> Option<Match<'t>> {
-        let slots = locs.prepare(self.captures_len());
-        let found = self.exec::<Utf8>(text.as_bytes(), start, self.flags.sticky, None, Some(slots)).unwrap_or(None);
-        found.map(|(from, to)| Match { text, start: from, end: to })
+    pub fn captures_read_at<'t>(
+        &self,
+        locs: &mut CaptureLocations,
+        text: &'t str,
+        start: usize,
+    ) -> Result<Option<Match<'t>>, MatchError> {
+        self.read_generic(locs, text, start)
     }
 
     /// The text with the first match replaced, or every match with the g flag, as `String.prototype.replace`
     /// replaces them: the replacement is a template in which `$&` is the match, `` $` `` and `$'` the text before
     /// and after it, `$1` to `$99` a group, `$<name>` a named group, and `$$` a dollar sign (`GetSubstitution`).
+    /// The timeout is for each match.
     ///
     /// ```
     /// use corvus_regex_ecma262::Regex;
     ///
     /// let re = Regex::new(r"(?<first>\w+) (?<last>\w+)", "").unwrap();
-    /// assert_eq!(re.replace("Ada Lovelace", "$<last>, $1"), "Lovelace, Ada");
+    /// assert_eq!(re.replace("Ada Lovelace", "$<last>, $1").unwrap(), "Lovelace, Ada");
     /// ```
-    pub fn replace<'t>(&self, text: &'t str, replacement: &str) -> Cow<'t, str> {
+    pub fn replace<'t>(&self, text: &'t str, replacement: &str) -> Result<Cow<'t, str>, MatchError> {
         super::replace::replace(self, text, replacement.as_bytes(), self.flags.global)
     }
 
     /// The text with every match replaced (`String.prototype.replaceAll`), whether or not the g flag is set.
-    pub fn replace_all<'t>(&self, text: &'t str, replacement: &str) -> Cow<'t, str> {
+    pub fn replace_all<'t>(&self, text: &'t str, replacement: &str) -> Result<Cow<'t, str>, MatchError> {
         super::replace::replace(self, text, replacement.as_bytes(), true)
     }
 
     /// The text with the first match replaced, or every match with the g flag, by what the function returns for
     /// its captures.
-    pub fn replace_with<'t>(&self, text: &'t str, f: impl FnMut(&Captures<'t>) -> String) -> Cow<'t, str> {
+    pub fn replace_with<'t>(
+        &self,
+        text: &'t str,
+        f: impl FnMut(&Captures<'t>) -> String,
+    ) -> Result<Cow<'t, str>, MatchError> {
         super::replace::replace_with(self, text, self.flags.global, f)
     }
 
     /// The text split around the matches, as `String.prototype.split` splits it: what each group captured is
     /// spliced in after the piece before it, `None` for a group that did not take part, and an empty match at
-    /// the start or the end of the text splits nothing.
+    /// the start or the end of the text splits nothing. The timeout is for each match.
     ///
     /// ```
     /// use corvus_regex_ecma262::Regex;
     ///
-    /// let parts = Regex::new(r"\s*(,)\s*", "").unwrap().split("a , b,c");
+    /// let parts = Regex::new(r"\s*(,)\s*", "").unwrap().split("a , b,c").unwrap();
     /// let parts: Vec<Option<&str>> = parts.iter().map(|p| p.as_deref()).collect();
     /// assert_eq!(parts, [Some("a"), Some(","), Some("b"), Some(","), Some("c")]);
     /// ```
-    pub fn split<'t>(&self, text: &'t str) -> Vec<Option<Cow<'t, str>>> {
+    pub fn split<'t>(&self, text: &'t str) -> Result<Vec<Option<Cow<'t, str>>>, MatchError> {
         super::replace::split(self, text, u32::MAX as usize)
     }
 
     /// [`Regex::split`] with at most `limit` items, as `split(separator, limit)`.
-    pub fn splitn<'t>(&self, text: &'t str, limit: usize) -> Vec<Option<Cow<'t, str>>> {
+    pub fn splitn<'t>(&self, text: &'t str, limit: usize) -> Result<Vec<Option<Cow<'t, str>>>, MatchError> {
         super::replace::split(self, text, limit)
     }
 
@@ -469,39 +518,38 @@ impl Regex {
     // UTF-16
 
     /// [`Regex::is_match`] over UTF-16 text, which may hold lone surrogates.
-    pub fn is_match_utf16(&self, text: &[u16]) -> bool {
-        self.test::<Utf16>(text, 0, None).unwrap_or(false)
+    pub fn is_match_utf16(&self, text: &[u16]) -> Result<bool, MatchError> {
+        self.test::<Utf16>(text, 0, self.timeout)
     }
 
     /// [`Regex::is_match_at`] over UTF-16 text; `start` is a code unit offset.
-    pub fn is_match_at_utf16(&self, text: &[u16], start: usize) -> bool {
-        self.test::<Utf16>(text, start, None).unwrap_or(false)
+    pub fn is_match_at_utf16(&self, text: &[u16], start: usize) -> Result<bool, MatchError> {
+        self.test::<Utf16>(text, start, self.timeout)
     }
 
-    /// [`Regex::try_is_match`] over UTF-16 text.
-    pub fn try_is_match_utf16(&self, text: &[u16], limit: Duration) -> Result<bool, MatchError> {
+    /// [`Regex::is_match_within`] over UTF-16 text.
+    pub fn is_match_within_utf16(&self, text: &[u16], limit: Duration) -> Result<bool, MatchError> {
         self.test::<Utf16>(text, 0, Some(limit))
     }
 
     /// [`Regex::find`] over UTF-16 text.
-    pub fn find_utf16<'t>(&self, text: &'t [u16]) -> Option<Match<'t, [u16]>> {
+    pub fn find_utf16<'t>(&self, text: &'t [u16]) -> Result<Option<Match<'t, [u16]>>, MatchError> {
         self.find_at_utf16(text, 0)
     }
 
     /// [`Regex::find_at`] over UTF-16 text; `start` is a code unit offset.
-    pub fn find_at_utf16<'t>(&self, text: &'t [u16], start: usize) -> Option<Match<'t, [u16]>> {
-        self.try_find_at_utf16(text, start, Duration::ZERO).unwrap_or(None)
+    pub fn find_at_utf16<'t>(&self, text: &'t [u16], start: usize) -> Result<Option<Match<'t, [u16]>>, MatchError> {
+        self.find_generic(text, start, self.timeout)
     }
 
-    /// [`Regex::try_find_at`] over UTF-16 text.
-    pub fn try_find_at_utf16<'t>(
+    /// [`Regex::find_at_within`] over UTF-16 text.
+    pub fn find_at_within_utf16<'t>(
         &self,
         text: &'t [u16],
         start: usize,
         limit: Duration,
     ) -> Result<Option<Match<'t, [u16]>>, MatchError> {
-        let found = self.exec::<Utf16>(text, start, self.flags.sticky, Some(limit), None)?;
-        Ok(found.map(|(from, to)| Match { text, start: from, end: to }))
+        self.find_generic(text, start, Some(limit))
     }
 
     /// [`Regex::find_iter`] over UTF-16 text.
@@ -510,17 +558,21 @@ impl Regex {
     }
 
     /// [`Regex::captures`] over UTF-16 text.
-    pub fn captures_utf16<'t>(&self, text: &'t [u16]) -> Option<Captures<'t, [u16]>> {
+    pub fn captures_utf16<'t>(&self, text: &'t [u16]) -> Result<Option<Captures<'t, [u16]>>, MatchError> {
         self.captures_at_utf16(text, 0)
     }
 
     /// [`Regex::captures_at`] over UTF-16 text.
-    pub fn captures_at_utf16<'t>(&self, text: &'t [u16], start: usize) -> Option<Captures<'t, [u16]>> {
-        self.captures_generic(text, start, self.flags.sticky, None).unwrap_or(None)
+    pub fn captures_at_utf16<'t>(
+        &self,
+        text: &'t [u16],
+        start: usize,
+    ) -> Result<Option<Captures<'t, [u16]>>, MatchError> {
+        self.captures_generic(text, start, self.flags.sticky, self.timeout)
     }
 
-    /// [`Regex::try_captures_at`] over UTF-16 text.
-    pub fn try_captures_at_utf16<'t>(
+    /// [`Regex::captures_at_within`] over UTF-16 text.
+    pub fn captures_at_within_utf16<'t>(
         &self,
         text: &'t [u16],
         start: usize,
@@ -540,30 +592,54 @@ impl Regex {
         locs: &mut CaptureLocations,
         text: &'t [u16],
         start: usize,
-    ) -> Option<Match<'t, [u16]>> {
-        let slots = locs.prepare(self.captures_len());
-        let found = self.exec::<Utf16>(text, start, self.flags.sticky, None, Some(slots)).unwrap_or(None);
-        found.map(|(from, to)| Match { text, start: from, end: to })
+    ) -> Result<Option<Match<'t, [u16]>>, MatchError> {
+        self.read_generic(locs, text, start)
     }
 
     /// [`Regex::replace`] over UTF-16 text, with a UTF-16 template.
-    pub fn replace_utf16<'t>(&self, text: &'t [u16], replacement: &[u16]) -> Cow<'t, [u16]> {
+    pub fn replace_utf16<'t>(&self, text: &'t [u16], replacement: &[u16]) -> Result<Cow<'t, [u16]>, MatchError> {
         super::replace::replace(self, text, replacement, self.flags.global)
     }
 
     /// [`Regex::replace_all`] over UTF-16 text, with a UTF-16 template.
-    pub fn replace_all_utf16<'t>(&self, text: &'t [u16], replacement: &[u16]) -> Cow<'t, [u16]> {
+    pub fn replace_all_utf16<'t>(&self, text: &'t [u16], replacement: &[u16]) -> Result<Cow<'t, [u16]>, MatchError> {
         super::replace::replace(self, text, replacement, true)
     }
 
     /// [`Regex::split`] over UTF-16 text.
-    pub fn split_utf16<'t>(&self, text: &'t [u16]) -> Vec<Option<Cow<'t, [u16]>>> {
+    pub fn split_utf16<'t>(&self, text: &'t [u16]) -> Result<Vec<Option<Cow<'t, [u16]>>>, MatchError> {
         super::replace::split(self, text, u32::MAX as usize)
     }
 
     /// [`Regex::splitn`] over UTF-16 text.
-    pub fn splitn_utf16<'t>(&self, text: &'t [u16], limit: usize) -> Vec<Option<Cow<'t, [u16]>>> {
+    pub fn splitn_utf16<'t>(&self, text: &'t [u16], limit: usize) -> Result<Vec<Option<Cow<'t, [u16]>>>, MatchError> {
         super::replace::split(self, text, limit)
+    }
+
+    fn find_generic<'t, H: Haystack + ?Sized>(
+        &self,
+        text: &'t H,
+        start: usize,
+        limit: Option<Duration>,
+    ) -> Result<Option<Match<'t, H>>, MatchError> {
+        let found = self.exec::<H::Text>(text.units(), start, self.flags.sticky, limit, None)?;
+        Ok(found.map(|(from, to)| Match { text, start: from, end: to }))
+    }
+
+    fn read_generic<'t, H: Haystack + ?Sized>(
+        &self,
+        locs: &mut CaptureLocations,
+        text: &'t H,
+        start: usize,
+    ) -> Result<Option<Match<'t, H>>, MatchError> {
+        let slots = locs.prepare(self.captures_len());
+        let found = self.exec::<H::Text>(text.units(), start, self.flags.sticky, self.timeout, Some(slots))?;
+        Ok(found.map(|(from, to)| Match { text, start: from, end: to }))
+    }
+
+    /// The pattern's timeout, which a match is given unless it has a limit of its own.
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 
     pub(crate) fn captures_generic<'t, H: Haystack + ?Sized>(
@@ -762,24 +838,28 @@ pub struct Matches<'r, 't, H: ?Sized = str> {
 }
 
 impl<'t, H: Haystack + ?Sized> Iterator for Matches<'_, 't, H> {
-    type Item = Match<'t, H>;
+    type Item = Result<Match<'t, H>, MatchError>;
 
-    fn next(&mut self) -> Option<Match<'t, H>> {
+    fn next(&mut self) -> Option<Result<Match<'t, H>, MatchError>> {
         if self.done {
             return None;
         }
         let input = self.text.units();
-        let exec = || self.re.exec::<H::Text>(input, self.at, self.re.flags.sticky, None, None);
+        let exec = || self.re.exec::<H::Text>(input, self.at, self.re.flags.sticky, self.re.timeout, None);
         // Only the UTF-16 searches keep anything between the searches of a global search.
         let found = if <H::Text as Text>::UTF8 { exec() } else { super::search::in_session(self.session, exec) };
         match found {
             Ok(Some((from, to))) => {
                 self.at = self.re.next_start::<H::Text>(input, from, to);
-                Some(Match { text: self.text, start: from, end: to })
+                Some(Ok(Match { text: self.text, start: from, end: to }))
             }
-            _ => {
+            Ok(None) => {
                 self.done = true;
                 None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
             }
         }
     }
@@ -787,9 +867,10 @@ impl<'t, H: Haystack + ?Sized> Iterator for Matches<'_, 't, H> {
 
 impl<H: Haystack + ?Sized> Matches<'_, '_, H> {
     /// The next matches, as many as `spans` holds, written to its start as (start, end) in the units of the text, or
-    /// as any type made from that pair: how many. Fewer than `spans.len()` only when the search has found every match, so 0 ends it. They are the
-    /// matches `next` gives, a batch at a time, for a loop that wants very many of them (the C library's
-    /// `cre_matches_next_batch`), in one loop over the batch.
+    /// as any type made from that pair: how many. Fewer than `spans.len()` only when the search has found every
+    /// match, so 0 ends it. They are the matches `next` gives, a batch at a time, for a loop that wants very many of
+    /// them (the C library's `cre_matches_next_batch`), in one loop over the batch. A match that reaches the timeout
+    /// is an `Err`, and ends the search.
     ///
     /// ```
     /// use corvus_regex_ecma262::Regex;
@@ -797,27 +878,37 @@ impl<H: Haystack + ?Sized> Matches<'_, '_, H> {
     /// let re = Regex::new(r"\d+", "g").unwrap();
     /// let mut it = re.find_iter("1 22 333");
     /// let mut spans = [(0, 0); 2];
-    /// assert_eq!(it.next_batch(&mut spans), 2);
+    /// assert_eq!(it.next_batch(&mut spans), Ok(2));
     /// assert_eq!(spans, [(0, 1), (2, 4)]);
-    /// assert_eq!(it.next_batch(&mut spans), 1);
+    /// assert_eq!(it.next_batch(&mut spans), Ok(1));
     /// assert_eq!(spans[0], (5, 8));
-    /// assert_eq!(it.next_batch(&mut spans), 0);
+    /// assert_eq!(it.next_batch(&mut spans), Ok(0));
     /// ```
-    pub fn next_batch<S: From<(usize, usize)>>(&mut self, spans: &mut [S]) -> usize {
+    pub fn next_batch<S: From<(usize, usize)>>(&mut self, spans: &mut [S]) -> Result<usize, MatchError> {
         if self.done || spans.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let input = self.text.units();
         let (re, at) = (self.re, self.at);
-        let batch = |spans: &mut [S]| re.prog.exec_batch::<H::Text, S>(input, at, re.unicode(), re.flags.sticky, spans);
+        let batch = |spans: &mut [S]| {
+            re.prog.exec_batch::<H::Text, S>(input, at, re.unicode(), re.flags.sticky, re.timeout, spans)
+        };
         // Only the UTF-16 searches keep anything between the searches of a global search.
-        let (n, at, done) = if <H::Text as Text>::UTF8 {
+        let found = if <H::Text as Text>::UTF8 {
             batch(spans)
         } else {
             super::search::in_session(self.session, || batch(spans))
         };
-        (self.at, self.done) = (at, done);
-        n
+        match found {
+            Ok((n, at, done)) => {
+                (self.at, self.done) = (at, done);
+                Ok(n)
+            }
+            Err(e) => {
+                self.done = true;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -833,24 +924,28 @@ pub struct CaptureMatches<'r, 't, H: ?Sized = str> {
 }
 
 impl<'t, H: Haystack + ?Sized> Iterator for CaptureMatches<'_, 't, H> {
-    type Item = Captures<'t, H>;
+    type Item = Result<Captures<'t, H>, MatchError>;
 
-    fn next(&mut self) -> Option<Captures<'t, H>> {
+    fn next(&mut self) -> Option<Result<Captures<'t, H>, MatchError>> {
         if self.done {
             return None;
         }
-        let captures = || self.re.captures_generic(self.text, self.at, self.re.flags.sticky, None);
+        let captures = || self.re.captures_generic(self.text, self.at, self.re.flags.sticky, self.re.timeout);
         let found =
             if <H::Text as Text>::UTF8 { captures() } else { super::search::in_session(self.session, captures) };
         match found {
             Ok(Some(caps)) => {
                 let m = caps.get_match();
                 self.at = self.re.next_start::<H::Text>(self.text.units(), m.start, m.end);
-                Some(caps)
+                Some(Ok(caps))
             }
-            _ => {
+            Ok(None) => {
                 self.done = true;
                 None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
             }
         }
     }
@@ -862,7 +957,7 @@ impl<H: Haystack + ?Sized> CaptureMatches<'_, '_, H> {
     /// (start, end) in the units of the text, or as any type made from that: how many matches. Fewer than
     /// `groups.len() / captures_len` only when the search has found every match, so 0 ends it. They are the matches
     /// `next` gives, a batch at a time with no allocation, for a loop that wants very many of them (the C library's
-    /// `cre_matches_next_captures_batch`).
+    /// `cre_matches_next_captures_batch`). A match that reaches the timeout is an `Err`, and ends the search.
     ///
     /// ```
     /// use corvus_regex_ecma262::Regex;
@@ -870,28 +965,37 @@ impl<H: Haystack + ?Sized> CaptureMatches<'_, '_, H> {
     /// let re = Regex::new(r"(\d)(x)?", "g").unwrap();
     /// let mut it = re.captures_iter("1x 2");
     /// let mut groups = [None; 6];
-    /// assert_eq!(it.next_batch(&mut groups), 2);
+    /// assert_eq!(it.next_batch(&mut groups), Ok(2));
     /// assert_eq!(groups, [Some((0, 2)), Some((0, 1)), Some((1, 2)), Some((3, 4)), Some((3, 4)), None]);
-    /// assert_eq!(it.next_batch(&mut groups), 0);
+    /// assert_eq!(it.next_batch(&mut groups), Ok(0));
     /// ```
-    pub fn next_batch<S: From<Option<(usize, usize)>>>(&mut self, groups: &mut [S]) -> usize {
+    pub fn next_batch<S: From<Option<(usize, usize)>>>(&mut self, groups: &mut [S]) -> Result<usize, MatchError> {
         let width = self.re.captures_len();
         if self.done || groups.len() < width {
-            return 0;
+            return Ok(0);
         }
         let input = self.text.units();
         let (re, at) = (self.re, self.at);
         let batch = |groups: &mut [S]| {
-            re.caps_program().exec_batch_groups::<H::Text, S>(input, at, re.unicode(), re.flags.sticky, groups, width)
+            let (unicode, sticky, timeout) = (re.unicode(), re.flags.sticky, re.timeout);
+            re.caps_program().exec_batch_groups::<H::Text, S>(input, at, unicode, sticky, timeout, groups, width)
         };
         // Only the UTF-16 searches keep anything between the searches of a global search.
-        let (n, at, done) = if <H::Text as Text>::UTF8 {
+        let found = if <H::Text as Text>::UTF8 {
             batch(groups)
         } else {
             super::search::in_session(self.session, || batch(groups))
         };
-        (self.at, self.done) = (at, done);
-        n
+        match found {
+            Ok((n, at, done)) => {
+                (self.at, self.done) = (at, done);
+                Ok(n)
+            }
+            Err(e) => {
+                self.done = true;
+                Err(e)
+            }
+        }
     }
 }
 

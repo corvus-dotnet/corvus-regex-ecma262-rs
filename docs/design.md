@@ -37,8 +37,11 @@ Multilingual Plane, which the reference reports as the offset of the character's
 be cut there, so `Match::as_str` leaves the half character out, `Match::as_cow` writes it as U+FFFD, and `replace` and
 `split` write it as U+FFFD: the result is the lossy UTF-8 of what JavaScript gives. The UTF-16 methods are exact.
 
-Limits: a match has none unless asked for one (`try_is_match` and the other `try_` methods take it per call, where the
-reference keeps a timeout on the instance). A pattern without a backreference needs none: the memo keeps it linear.
+Limits: a pattern keeps a match timeout, as the reference does (`Regex::with_timeout`, and `set_default_match_timeout`
+for the process-wide default the reference reads from `REGEX_DEFAULT_MATCH_TIMEOUT`), none unless one is given. Where
+the reference throws `RegexMatchTimeoutException`, every member that matches returns `Result<_, MatchError>`, and the
+`_within` members give one match a limit of its own. A pattern without a backreference needs none: the memo keeps it
+linear.
 
 ## The search layer
 
