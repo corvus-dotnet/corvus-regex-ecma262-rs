@@ -89,3 +89,23 @@ jobs:
       with:
         name: wrong-cases-${{ matrix.os }}
         path: wrong-cases*.tsv
+
+  capi:
+    # The C library's archives on every release platform (capi.yml), with no filter of paths, so the gate can
+    # require them.
+    uses: ./.github/workflows/capi.yml
+
+  gate:
+    # The one check of this workflow that the ruleset of main requires: it passes when every job above passed (or was
+    # skipped), so a job added here is required with no change to the ruleset.
+    name: CI gate
+    if: always()
+    needs: [build, capi]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Every job passed
+      env:
+        RESULTS: ${{ toJSON(needs.*.result) }}
+      run: |
+        echo "$RESULTS"
+        if echo "$RESULTS" | grep -qE '"(failure|cancelled)"'; then exit 1; fi
