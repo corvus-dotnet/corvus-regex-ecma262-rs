@@ -279,8 +279,14 @@ cre_status cre_regex_split(const cre_regex *regex, const char *text, size_t text
  *
  * Each function is the one without the suffix, with the text taken on trust to be UTF-8: it is not checked, so a call
  * does not read the whole text once more before it searches. They are for a caller whose strings are UTF-8 by
- * construction, such as a Swift String or a Rust str. Text that is not UTF-8 is undefined behaviour. Everything else
- * (the arguments, the results, the statuses, CRE_INVALID_UTF8 aside) is as the function without the suffix. */
+ * construction, such as a Swift String or a Rust str, or that has checked a text once with cre_utf8_check. Text that
+ * is not UTF-8 is undefined behaviour. Everything else (the arguments, the results, the statuses, CRE_INVALID_UTF8
+ * aside) is as the function without the suffix. */
+
+/* Whether the text is UTF-8: CRE_OK, or CRE_INVALID_UTF8 with cre_last_error_offset at the first byte that is not. A
+ * caller whose strings carry no such guarantee checks a text once, when it makes it, and then searches it with the
+ * _unchecked functions as often as it likes. */
+cre_status cre_utf8_check(const char *text, size_t text_len);
 
 cre_status cre_regex_is_match_unchecked(const cre_regex *regex, const char *text, size_t text_len, bool *out_matched);
 cre_status cre_regex_is_match_limit_unchecked(const cre_regex *regex, const char *text, size_t text_len,

@@ -594,6 +594,12 @@ fn a_text_that_is_not_utf8_far_in_is_refused_where_it_stops_being_utf8() {
     let mut matched = true;
     assert_eq!(unsafe { cre_regex_is_match(re, text.as_ptr().cast(), text.len(), &mut matched) }, CRE_INVALID_UTF8);
     assert_eq!((cre_last_error_offset(), matched), (1000, false));
+    // The same check alone, as a caller makes it once before the _unchecked functions.
+    assert_eq!(unsafe { cre_utf8_check(text.as_ptr().cast(), text.len()) }, CRE_INVALID_UTF8);
+    assert_eq!(cre_last_error_offset(), 1000);
+    assert_eq!(unsafe { cre_utf8_check(text.as_ptr().cast(), 1000) }, CRE_OK);
+    assert_eq!(unsafe { cre_utf8_check(std::ptr::null(), 0) }, CRE_OK);
+    assert_eq!(unsafe { cre_utf8_check(std::ptr::null(), 1) }, CRE_INVALID_ARGUMENT);
     unsafe { cre_regex_free(re) };
 }
 

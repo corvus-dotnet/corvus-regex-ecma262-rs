@@ -83,7 +83,8 @@ match a call or a batch of them into an array the caller owns, with or without t
 a limit of time. Every fallible function returns a `cre_status` with a message for the thread, owned results have a
 free function each, and no panic crosses into the caller. A UTF-8 text is checked to be UTF-8 on each call (once for a
 global search); a caller whose strings are UTF-8 by construction can skip that read of the whole text with each UTF-8
-function's `_unchecked` form, for which text that is not UTF-8 is undefined behaviour.
+function's `_unchecked` form, for which text that is not UTF-8 is undefined behaviour; a caller whose strings carry no
+such guarantee can check a text once with `cre_utf8_check` and then search it unchecked.
 
 ```c
 cre_regex *re = NULL;

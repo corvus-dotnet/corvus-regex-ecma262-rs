@@ -624,6 +624,14 @@ pub unsafe extern "C" fn cre_regex_group_name(regex: *const cre_regex, index: us
 // ---------------------------------------------------------------------------------------------------------------------
 // Matching UTF-8
 
+/// Whether `text_len` bytes at `text_ptr` are UTF-8: `CRE_OK`, or `CRE_INVALID_UTF8` with `cre_last_error_offset` at
+/// the first byte that is not. A caller whose strings carry no such guarantee checks a text once, when it makes it,
+/// and then searches it with the `_unchecked` functions as often as it likes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_utf8_check(text_ptr: *const c_char, text_len: usize) -> cre_status {
+    guard(|| unsafe { text(text_ptr, text_len, "text") }.map(|_| ()))
+}
+
 /// Whether the pattern matches anywhere in the UTF-8 text (at its start alone with the y flag): `*out_matched`. With
 /// no limit on the time the match takes.
 #[unsafe(no_mangle)]
