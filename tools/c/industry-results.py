@@ -26,7 +26,7 @@ ap.add_argument("--v8", help="the V8 harness's own results, for a run whose harn
 ap.add_argument("--out", required=True)
 ap.add_argument("--compliance-corvus", required=True)
 ap.add_argument("--compliance-quickjs", required=True)
-ap.add_argument("--compliance-v8", required=True)
+ap.add_argument("--compliance-v8", help="V8's data-set run; absent for a run without V8 (V8=0)")
 ap.add_argument("--run-url", default="")
 ap.add_argument("--workloads", help="the workloads.json of the run (tools/benchmarks/workloads.json when not given)")
 args = ap.parse_args()
@@ -34,11 +34,14 @@ args = ap.parse_args()
 root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 run = json.load(open(args.run, encoding="utf-8"))
 facts = run["facts"]
-# V8 runs inside the interleaved run (results["v8"], its engine in the facts); a separate V8 run is still read.
+# V8 runs inside the interleaved run (results["v8"], its engine in the facts); a separate V8 run is still read. A run
+# without V8 (V8=0, whose counts were checked against the workloads' v8Count) has no V8 row.
 if "v8" in run["results"]:
     v8 = {"engine": facts.get("v8", "V8"), "results": run["results"]["v8"]}
-else:
+elif args.v8:
     v8 = json.load(open(args.v8, encoding="utf-8"))
+else:
+    v8 = None
 workloads = json.load(open(args.workloads or os.path.join(root, "tools", "benchmarks", "workloads.json"), encoding="utf-8"))
 ids = [w["id"] for w in workloads]
 
@@ -74,12 +77,13 @@ for key, name, _, _, _ in ENGINES:
         if r is None:
             continue
         results[name][w] = None if "error" in r else {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}}
-v8_name = "V8"
-ENGINES.append(("v8", v8_name, "V8", v8["engine"], compliance(args.compliance_v8)))
-results[v8_name] = {}
-for w in ids:
-    r = v8["results"].get(w)
-    results[v8_name][w] = {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}} if r and "error" not in r else None
+if v8:
+    v8_name = "V8"
+    ENGINES.append(("v8", v8_name, "V8", v8["engine"], compliance(args.compliance_v8)))
+    results[v8_name] = {}
+    for w in ids:
+        r = v8["results"].get(w)
+        results[v8_name][w] = {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}} if r and "error" not in r else None
 # Where PCRE2 counts otherwise than V8 (the oracle), the row says so; an ECMA-262 engine that does is an error above.
 differs = {w: r["differs"] for w, r in run["results"].get("pcre2", {}).items() if isinstance(r, dict) and "differs" in r}
 
@@ -113,7 +117,7 @@ data = {
         "runUrl": args.run_url,
         "runs": int(facts.get("passes") or 0),
         "versions": {name: version for _, name, _, version, _ in ENGINES},
-        "facts": [["Host", host]] + ([["Runner", runner]] if runner else []) + [["Runtime", facts.get("cc", "") + "; " + v8["engine"]], ["Harness", job]]
+        "facts": [["Host", host]] + ([["Runner", runner]] if runner else []) + [["Runtime", facts.get("cc", "") + ("; " + v8["engine"] if v8 else "")], ["Harness", job]]
                  + ([["Spread", spread]] if spread else [])
                  + ([["Counts", "PCRE2 counts otherwise than V8 on " + str(len(differs)) + " workloads (each says so)"]] if differs else []),
         "method": "<p>Each figure is one count of every match a global search finds over the whole text, after an empty match going on one character later. "

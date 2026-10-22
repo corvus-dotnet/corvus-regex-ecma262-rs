@@ -40,23 +40,31 @@ fi
 # The image (Dockerfile) has them built already.
 if [ "${SKIP_BUILD:-0}" != 1 ]; then cargo build --release -j 4 --bin industry --bin dataset; fi
 ./target/release/dataset "$data" "$work/wrong-corvus.tsv" > "$work/compliance-corvus.txt" 2>&1 || true
-node tools/benchmarks/v8/dataset.mjs "$data" > "$work/compliance-v8.txt" 2>&1 || true
+# V8=0 (the central run, for every image but one): no V8, whose counts the workloads carry (v8Count).
+v8=(--v8 tools/benchmarks/v8/industry.mjs)
+compliance_v8=(--compliance-v8 "$work/compliance-v8.txt")
+if [ "${V8:-1}" = 0 ]; then
+  v8=()
+  compliance_v8=()
+else
+  node tools/benchmarks/v8/dataset.mjs "$data" > "$work/compliance-v8.txt" 2>&1 || true
+fi
 if [ "${REGRESS_COMPLIANCE:-0}" = 1 ]; then
   cp target/release/dataset "$work/dataset-regress"
   "$work/dataset-regress" "$data" "$work/wrong-regress.tsv" --engine regress > "$work/compliance-regress.txt" 2>&1 || true
 else
   cp tools/benchmarks/compliance-regress.txt "$work/compliance-regress.txt"
 fi
-tail -n 1 "$work/compliance-corvus.txt" "$work/compliance-v8.txt" "$work/compliance-regress.txt"
+tail -n 1 "$work/compliance-corvus.txt" $([ -f "$work/compliance-v8.txt" ] && echo "$work/compliance-v8.txt") "$work/compliance-regress.txt"
 if [ "${SETTLE:-0}" -gt 0 ]; then
   echo "settling for $SETTLE s"
   sleep "$SETTLE"
 fi
 export CORVUS_REGEX_TEXTS="$texts"
-timed ./target/release/industry "$workloads" --v8 tools/benchmarks/v8/industry.mjs --rounds "$rounds" --seconds "$seconds" \
+timed ./target/release/industry "$workloads" "${v8[@]}" --rounds "$rounds" --seconds "$seconds" \
   --passes "$passes" --spread "$spread" --out "$work/run.json" 2> "$work/run.log"
 grep -E '^(SPREAD|COUNT) ' "$work/run.log" || true
 python3 tools/benchmarks/industry-results.py --workloads "$workloads" --run "$work/run.json" --out "$out_file" \
   --compliance-corvus "$work/compliance-corvus.txt" --compliance-regress "$work/compliance-regress.txt" \
-  --compliance-v8 "$work/compliance-v8.txt" --run-url "${RUN_URL:-}"
+  "${compliance_v8[@]}" --run-url "${RUN_URL:-}"
 if [ -n "${KEEP:-}" ]; then mkdir -p "$KEEP" && cp "$work"/*.json "$work"/*.txt "$work"/*.log "$KEEP"/; fi

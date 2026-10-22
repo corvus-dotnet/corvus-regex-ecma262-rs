@@ -43,6 +43,8 @@ struct Workload {
     pattern: String,
     flags: String,
     file: String,
+    /// V8's count, which the central run writes into the workloads once, for a run without V8 (V8=0) to check against.
+    v8_count: Option<f64>,
 }
 
 fn workloads(path: &str) -> Vec<Workload> {
@@ -56,6 +58,7 @@ fn workloads(path: &str) -> Vec<Workload> {
             pattern: w.get("pattern").and_then(Json::as_string).unwrap(),
             flags: w.get("flags").and_then(Json::as_string).unwrap(),
             file: w.get("file").and_then(Json::as_string).unwrap(),
+            v8_count: w.get("v8Count").and_then(Json::as_f64),
         })
         .collect()
 }
@@ -387,7 +390,8 @@ fn main() {
     };
     let v8_counts: Vec<Option<f64>> = match engines.iter().position(|e| e == "v8") {
         Some(e) => lines[e].iter().map(count_of).collect(),
-        None => vec![None; all.len()],
+        // Without V8 in the run, its counts as the workloads carry them, when they do.
+        None => all.iter().map(|w| w.v8_count).collect(),
     };
     for (e, engine) in engines.iter().enumerate() {
         let mut rows = Vec::new();
