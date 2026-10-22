@@ -174,20 +174,20 @@ fn ask(probe: &Probe) -> String {
     let text16: Vec<u16> = text.encode_utf16().collect();
     let limit = Duration::from_secs(5);
     let mut answers = Vec::new();
-    answers.push(format!("{:?}", re.try_is_match(text, limit)));
-    answers.push(format!("{:?}", re.try_is_match_utf16(&text16, limit)));
-    answers.push(format!("{:?}", re.try_find_at(text, 0, limit).map(|m| m.map(|m| m.range()))));
-    answers.push(format!("{:?}", re.try_captures_at(text, 0, limit).map(|c| c.map(|c| c.len()))));
-    answers.push(format!("{:?}", re.try_captures_at_utf16(&text16, 0, limit).map(|c| c.map(|c| c.len()))));
-    answers.push(re.find_iter(text).take(1000).count().to_string());
-    answers.push(re.find_iter_utf16(&text16).take(1000).count().to_string());
-    answers.push(re.captures_iter(text).take(100).count().to_string());
+    answers.push(format!("{:?}", re.is_match_within(text, limit)));
+    answers.push(format!("{:?}", re.is_match_within_utf16(&text16, limit)));
+    answers.push(format!("{:?}", re.find_at_within(text, 0, limit).map(|m| m.map(|m| m.range()))));
+    answers.push(format!("{:?}", re.captures_at_within(text, 0, limit).map(|c| c.map(|c| c.len()))));
+    answers.push(format!("{:?}", re.captures_at_within_utf16(&text16, 0, limit).map(|c| c.map(|c| c.len()))));
+    answers.push(re.find_iter(text).map(Result::unwrap).take(1000).count().to_string());
+    answers.push(re.find_iter_utf16(&text16).map(Result::unwrap).take(1000).count().to_string());
+    answers.push(re.captures_iter(text).map(Result::unwrap).take(100).count().to_string());
     let mut locations = re.capture_locations();
-    answers.push(format!("{:?}", re.captures_read_at(&mut locations, text, 0).map(|m| m.range())));
-    answers.push(re.replace_all(text, "$1x").len().to_string());
-    answers.push(re.replace_all_utf16(&text16, &[b'x' as u16]).len().to_string());
-    answers.push(re.split(text).len().to_string());
-    answers.push(re.split_utf16(&text16).len().to_string());
+    answers.push(format!("{:?}", re.captures_read_at(&mut locations, text, 0).unwrap().map(|m| m.range())));
+    answers.push(re.replace_all(text, "$1x").unwrap().len().to_string());
+    answers.push(re.replace_all_utf16(&text16, &[b'x' as u16]).unwrap().len().to_string());
+    answers.push(re.split(text).unwrap().len().to_string());
+    answers.push(re.split_utf16(&text16).unwrap().len().to_string());
     format!("answered {}", answers.join(" "))
 }
 

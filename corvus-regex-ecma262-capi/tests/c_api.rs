@@ -58,18 +58,18 @@ fn matches_and_finds_as_the_crate_does() {
         let t16 = utf16(text);
         let mut matched = false;
         assert_eq!(unsafe { cre_regex_is_match(re, ptr(text), text.len(), &mut matched) }, CRE_OK);
-        assert_eq!(matched, reference.is_match(text), "/{pattern}/{flags}");
+        assert_eq!(matched, reference.is_match(text).unwrap(), "/{pattern}/{flags}");
         assert_eq!(unsafe { cre_regex_is_match_utf16(re, t16.as_ptr(), t16.len(), &mut matched) }, CRE_OK);
-        assert_eq!(matched, reference.is_match_utf16(&t16), "/{pattern}/{flags}");
+        assert_eq!(matched, reference.is_match_utf16(&t16).unwrap(), "/{pattern}/{flags}");
         let at = (1..=text.len()).find(|&k| text.is_char_boundary(k)).unwrap_or(0);
         assert_eq!(unsafe { cre_regex_is_match_at(re, ptr(text), text.len(), at, &mut matched) }, CRE_OK);
-        assert_eq!(matched, reference.is_match_at(text, at), "/{pattern}/{flags}");
+        assert_eq!(matched, reference.is_match_at(text, at).unwrap(), "/{pattern}/{flags}");
         assert_eq!(unsafe { cre_regex_is_match_at_utf16(re, t16.as_ptr(), t16.len(), 1, &mut matched) }, CRE_OK);
-        assert_eq!(matched, reference.is_match_at_utf16(&t16, 1), "/{pattern}/{flags}");
+        assert_eq!(matched, reference.is_match_at_utf16(&t16, 1).unwrap(), "/{pattern}/{flags}");
         for start in (0..=text.len()).filter(|&k| text.is_char_boundary(k)) {
             let (mut m, mut found) = (unset(), false);
             assert_eq!(unsafe { cre_regex_find(re, ptr(text), text.len(), start, &mut m, &mut found) }, CRE_OK);
-            let want = reference.find_at(text, start).map(|m| (m.start(), m.end()));
+            let want = reference.find_at(text, start).unwrap().map(|m| (m.start(), m.end()));
             assert_eq!((found, span(m)), (want.is_some(), want), "/{pattern}/{flags} at {start}");
         }
         for start in 0..=t16.len() {
@@ -77,7 +77,7 @@ fn matches_and_finds_as_the_crate_does() {
             let status =
                 unsafe { cre_regex_find_limit_utf16(re, t16.as_ptr(), t16.len(), start, 1000, &mut m, &mut found) };
             assert_eq!(status, CRE_OK);
-            let want = reference.find_at_utf16(&t16, start).map(|m| (m.start(), m.end()));
+            let want = reference.find_at_utf16(&t16, start).unwrap().map(|m| (m.start(), m.end()));
             assert_eq!((found, span(m)), (want.is_some(), want), "/{pattern}/{flags} at {start}");
         }
         unsafe { cre_regex_free(re) };
@@ -104,7 +104,7 @@ fn groups_by_number_and_by_name_are_the_crate_s() {
         let mut found = false;
         let status = unsafe { cre_regex_captures(re, ptr(text), text.len(), 0, caps, &mut found) };
         assert_eq!(status, CRE_OK);
-        let want = reference.captures(text);
+        let want = reference.captures(text).unwrap();
         assert_eq!(found, want.is_some());
         let status = unsafe {
             cre_regex_captures_read(re, ptr(text), text.len(), 0, groups.as_mut_ptr(), groups.len(), &mut found)
@@ -131,7 +131,7 @@ fn groups_by_number_and_by_name_are_the_crate_s() {
         // Over UTF-16, with a limit, and into a short buffer.
         let status = unsafe { cre_regex_captures_limit_utf16(re, t16.as_ptr(), t16.len(), 0, 1000, caps, &mut found) };
         assert_eq!(status, CRE_OK);
-        let want = reference.captures_utf16(&t16);
+        let want = reference.captures_utf16(&t16).unwrap();
         assert_eq!(found, want.is_some());
         let mut short = [unset()];
         let status = unsafe {
@@ -184,7 +184,8 @@ fn the_global_search_is_find_iter() {
         };
         let mut it = std::ptr::null_mut();
         assert_eq!(unsafe { cre_regex_find_iter(re, ptr(text), text.len(), &mut it) }, CRE_OK);
-        let want: Vec<(usize, usize)> = reference.find_iter(text).map(|m| (m.start(), m.end())).collect();
+        let want: Vec<(usize, usize)> =
+            reference.find_iter(text).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
         for size in [1, 2, 5] {
             unsafe { cre_matches_reset(it) };
             assert_eq!(batches(it, size), want, "/{pattern}/{flags} in batches of {size}");
@@ -196,7 +197,8 @@ fn the_global_search_is_find_iter() {
         assert_eq!(collect(it), want, "/{pattern}/{flags} after a reset");
         unsafe { cre_matches_free(it) };
         assert_eq!(unsafe { cre_regex_find_iter_utf16(re, t16.as_ptr(), t16.len(), &mut it) }, CRE_OK);
-        let want16: Vec<(usize, usize)> = reference.find_iter_utf16(&t16).map(|m| (m.start(), m.end())).collect();
+        let want16: Vec<(usize, usize)> =
+            reference.find_iter_utf16(&t16).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
         assert_eq!(batches(it, 2), want16, "/{pattern}/{flags} in batches");
         unsafe { cre_matches_reset(it) };
         assert_eq!(collect(it), want16, "/{pattern}/{flags}");
@@ -208,7 +210,7 @@ fn the_global_search_is_find_iter() {
         unsafe { cre_matches_free(it) };
         // With the groups of every match.
         assert_eq!(unsafe { cre_regex_captures_iter_utf16(re, t16.as_ptr(), t16.len(), &mut it) }, CRE_OK);
-        for want in reference.captures_iter_utf16(&t16) {
+        for want in reference.captures_iter_utf16(&t16).map(Result::unwrap) {
             assert_eq!(unsafe { cre_matches_next_captures(it, caps, &mut found) }, CRE_OK);
             assert!(found);
             for k in 0..want.len() {
@@ -228,6 +230,7 @@ fn the_global_search_is_find_iter() {
         let width = reference.captures_len();
         let want_groups: Vec<Option<(usize, usize)>> = reference
             .captures_iter(text)
+            .map(Result::unwrap)
             .flat_map(|c| (0..width).map(|k| c.get(k).map(|m| (m.start(), m.end()))).collect::<Vec<_>>())
             .collect();
         unsafe { cre_matches_reset(it) };
@@ -260,14 +263,14 @@ fn replace_and_split_are_the_crate_s() {
         assert_eq!(status, CRE_OK);
         let got = unsafe { std::slice::from_raw_parts(out.ptr.cast::<u8>(), out.len + 1) };
         assert_eq!(got[out.len], 0, "NUL-terminated");
-        assert_eq!(std::str::from_utf8(&got[..out.len]).unwrap(), reference.replace(text, template));
+        assert_eq!(std::str::from_utf8(&got[..out.len]).unwrap(), reference.replace(text, template).unwrap());
         unsafe { cre_string_free(&mut out) };
         assert!(out.ptr.is_null());
         unsafe { cre_string_free(&mut out) };
         let status =
             unsafe { cre_regex_replace_all(re, ptr(text), text.len(), ptr(template), template.len(), &mut out) };
         assert_eq!(status, CRE_OK);
-        assert_eq!(string(cre_str { ptr: out.ptr, len: out.len }), reference.replace_all(text, template));
+        assert_eq!(string(cre_str { ptr: out.ptr, len: out.len }), reference.replace_all(text, template).unwrap());
         unsafe { cre_string_free(&mut out) };
         let mut out16 = cre_string16 { ptr: std::ptr::null_mut(), len: 0 };
         for all in [false, true] {
@@ -280,7 +283,11 @@ fn replace_and_split_are_the_crate_s() {
             };
             assert_eq!(status, CRE_OK);
             let got = unsafe { std::slice::from_raw_parts(out16.ptr, out16.len + 1) };
-            let want = if all { reference.replace_all_utf16(&s16, &t16) } else { reference.replace_utf16(&s16, &t16) };
+            let want = if all {
+                reference.replace_all_utf16(&s16, &t16).unwrap()
+            } else {
+                reference.replace_utf16(&s16, &t16).unwrap()
+            };
             assert_eq!((&got[..out16.len], got[out16.len]), (&*want, 0));
             unsafe { cre_string16_free(&mut out16) };
         }
@@ -289,8 +296,12 @@ fn replace_and_split_are_the_crate_s() {
             assert_eq!(unsafe { cre_regex_split(re, ptr(text), text.len(), limit, &mut pieces) }, CRE_OK);
             let items = unsafe { std::slice::from_raw_parts(pieces.items, pieces.len) };
             let got: Vec<Option<String>> = items.iter().map(|p| (!p.ptr.is_null()).then(|| string(*p))).collect();
-            let want: Vec<Option<String>> =
-                reference.splitn(text, limit as usize).into_iter().map(|p| p.map(|p| p.into_owned())).collect();
+            let want: Vec<Option<String>> = reference
+                .splitn(text, limit as usize)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.map(|p| p.into_owned()))
+                .collect();
             assert_eq!(got, want, "/{pattern}/{flags} split {limit}");
             unsafe { cre_pieces_free(&mut pieces) };
             assert!(pieces.items.is_null() && pieces.internal.is_null());
@@ -301,8 +312,12 @@ fn replace_and_split_are_the_crate_s() {
                 .iter()
                 .map(|p| (!p.ptr.is_null()).then(|| unsafe { std::slice::from_raw_parts(p.ptr, p.len) }.to_vec()))
                 .collect();
-            let want: Vec<Option<Vec<u16>>> =
-                reference.splitn_utf16(&s16, limit as usize).into_iter().map(|p| p.map(|p| p.into_owned())).collect();
+            let want: Vec<Option<Vec<u16>>> = reference
+                .splitn_utf16(&s16, limit as usize)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.map(|p| p.into_owned()))
+                .collect();
             assert_eq!(got, want, "/{pattern}/{flags} split16 {limit}");
             unsafe { cre_pieces16_free(&mut pieces) };
         }
@@ -671,4 +686,62 @@ fn the_versions_agree() {
     let manifest = include_str!("../Cargo.toml");
     let dependency = format!("version = \"{}\" }}", env!("CARGO_PKG_VERSION"));
     assert!(manifest.lines().any(|l| l.starts_with("corvus = ") && l.ends_with(&dependency)), "the engine dependency");
+    // The smoke test asks the CMake package for this version, which with a major version of 0 is the minor one.
+    let smoke = include_str!("../tests/native/CMakeLists.txt");
+    let wanted = format!("find_package(corvus_regex_ecma262 {}.{} CONFIG REQUIRED)", parts[0], parts[1]);
+    assert!(smoke.contains(&wanted), "tests/native/CMakeLists.txt does not ask for {}.{}", parts[0], parts[1]);
+}
+
+#[test]
+fn a_regular_expression_has_a_match_timeout() {
+    let pattern = r"^(?:(a+)\1*)+$";
+    let mut re = std::ptr::null_mut();
+    let status = unsafe { cre_regex_new_with_timeout(ptr(pattern), pattern.len(), ptr("u"), 1, 30, &mut re) };
+    assert_eq!(status, CRE_OK);
+    assert_eq!(unsafe { cre_regex_match_timeout(re) }, 30);
+    assert_eq!(unsafe { cre_regex_match_timeout(std::ptr::null()) }, 0);
+    let text = "a".repeat(60) + "b";
+    let (p, n) = (ptr(&text), text.len());
+    // Every function that matches gives its match the timeout.
+    let mut matched = true;
+    assert_eq!(unsafe { cre_regex_is_match(re, p, n, &mut matched) }, CRE_MATCH_LIMIT);
+    assert!(string(cre_last_error_message()).contains("30 ms"), "{}", string(cre_last_error_message()));
+    assert_eq!(unsafe { cre_regex_is_match_at(re, p, n, 0, &mut matched) }, CRE_MATCH_LIMIT);
+    let (mut m, mut found) = (unset(), true);
+    assert_eq!(unsafe { cre_regex_find(re, p, n, 0, &mut m, &mut found) }, CRE_MATCH_LIMIT);
+    let mut groups = [unset(); 2];
+    assert_eq!(unsafe { cre_regex_captures_read(re, p, n, 0, groups.as_mut_ptr(), 2, &mut found) }, CRE_MATCH_LIMIT);
+    let mut result = cre_string { ptr: std::ptr::null_mut(), len: 0 };
+    assert_eq!(unsafe { cre_regex_replace(re, p, n, ptr("x"), 1, &mut result) }, CRE_MATCH_LIMIT);
+    assert!(result.ptr.is_null());
+    let mut pieces = cre_pieces { items: std::ptr::null(), len: 0, internal: std::ptr::null_mut() };
+    assert_eq!(unsafe { cre_regex_split(re, p, n, CRE_SPLIT_ALL, &mut pieces) }, CRE_MATCH_LIMIT);
+    for captures in [false, true] {
+        let mut it = std::ptr::null_mut();
+        let status = unsafe {
+            if captures { cre_regex_captures_iter(re, p, n, &mut it) } else { cre_regex_find_iter(re, p, n, &mut it) }
+        };
+        assert_eq!(status, CRE_OK);
+        assert_eq!(unsafe { cre_matches_next(it, &mut m, &mut found) }, CRE_MATCH_LIMIT);
+        unsafe { cre_matches_reset(it) };
+        let (mut place, mut count) = ([unset(); 4], 9);
+        assert_eq!(unsafe { cre_matches_next_batch(it, place.as_mut_ptr(), 4, &mut count) }, CRE_MATCH_LIMIT);
+        assert_eq!(count, 0);
+        unsafe { cre_matches_free(it) };
+    }
+    // A _limit function with a limit of its own uses it, and with 0 the regular expression's timeout.
+    assert_eq!(unsafe { cre_regex_is_match_limit(re, ptr("aaaa"), 4, 0, &mut matched) }, CRE_OK);
+    assert!(matched);
+    assert_eq!(unsafe { cre_regex_is_match_limit(re, p, n, 0, &mut matched) }, CRE_MATCH_LIMIT);
+    assert_eq!(unsafe { cre_regex_is_match_limit(re, p, n, 15, &mut matched) }, CRE_MATCH_LIMIT);
+    assert!(string(cre_last_error_message()).contains("15 ms"), "{}", string(cre_last_error_message()));
+    unsafe { cre_regex_free(re) };
+    // A timeout of 0 is none, and flags that are not valid are refused before the pattern is read.
+    let mut re = std::ptr::null_mut();
+    assert_eq!(unsafe { cre_regex_new_with_timeout(ptr("a"), 1, std::ptr::null(), 0, 0, &mut re) }, CRE_OK);
+    assert_eq!(unsafe { cre_regex_match_timeout(re) }, 0);
+    unsafe { cre_regex_free(re) };
+    let mut re = std::ptr::null_mut();
+    assert_eq!(unsafe { cre_regex_new_with_timeout(ptr("a**"), 3, ptr("gg"), 2, 5, &mut re) }, CRE_INVALID_FLAGS);
+    assert!(re.is_null());
 }

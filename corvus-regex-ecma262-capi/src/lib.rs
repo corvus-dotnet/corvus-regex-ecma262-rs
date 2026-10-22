@@ -22,7 +22,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
-use corvus::{CaptureLocations, CaptureMatches, Captures, Error, Haystack, MatchError, Matches, Regex};
+use corvus::{CaptureLocations, CaptureMatches, Captures, Error, Flags, Haystack, MatchError, Matches, Regex};
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Types and constants
@@ -50,8 +50,8 @@ pub const CRE_PANIC: cre_status = 7;
 
 /// The header's version: compare with `cre_version()`, the library's.
 pub const CRE_VERSION_MAJOR: u32 = 0;
-pub const CRE_VERSION_MINOR: u32 = 1;
-pub const CRE_VERSION_PATCH: u32 = 3;
+pub const CRE_VERSION_MINOR: u32 = 2;
+pub const CRE_VERSION_PATCH: u32 = 0;
 
 /// The start and the end of a group that did not take part in a match.
 pub const CRE_UNSET: usize = usize::MAX;
@@ -217,6 +217,12 @@ impl cre_matches {
 
     fn captures(&self) -> bool {
         matches!(self.iter, Iter::Captures8(_) | Iter::Captures16(_))
+    }
+
+    /// The failure of a match of the search that reached the pattern's timeout.
+    fn limited(&self, e: MatchError) -> Failure {
+        // SAFETY: a handle this library created that the caller keeps alive while the search lives.
+        limited(e, unsafe { &(*self.regex).inner }, 0)
     }
 }
 
@@ -394,13 +400,20 @@ unsafe fn groups_out<'a>(ptr: *mut cre_match, len: usize) -> Result<&'a mut [cre
     Ok(groups)
 }
 
-fn limited(e: MatchError, limit: Duration) -> Failure {
-    Failure::new(CRE_MATCH_LIMIT, format!("{e} ({} ms)", limit.as_millis()))
+/// The failure of a match that reached its limit: `limit_ms`, or with 0 the pattern's timeout.
+fn limited(e: MatchError, re: &Regex, limit_ms: u64) -> Failure {
+    let ms = if limit_ms == 0 { re.match_timeout().map_or(0, |t| t.as_millis()) } else { u128::from(limit_ms) };
+    Failure::new(CRE_MATCH_LIMIT, format!("{e} ({ms} ms)"))
 }
 
-/// A limit in milliseconds, 0 for none, as the crate takes it.
-fn limit_of(ms: u64) -> Duration {
-    Duration::from_millis(ms)
+/// A match with a limit of `limit_ms` milliseconds, or with 0 the pattern's timeout: the member `$plain` with the
+/// arguments, or `$within` with them and the limit.
+macro_rules! within {
+    ($re:expr, $plain:ident, $within:ident, $ms:expr, $($arg:expr),+) => {{
+        let re: &Regex = &$re;
+        let found = if $ms == 0 { re.$plain($($arg),+) } else { re.$within($($arg),+, Duration::from_millis($ms)) };
+        found.map_err(|e| limited(e, re, $ms))
+    }};
 }
 
 /// A start position: within the text, and over UTF-8 on a character boundary or, without the u or v flag, between
@@ -523,10 +536,29 @@ pub extern "C" fn cre_last_error_offset() -> usize {
 // ---------------------------------------------------------------------------------------------------------------------
 // Compiling
 
+/// Sets the match timeout of every regular expression compiled from now on by `cre_regex_new`, in milliseconds (0 for
+/// none, the default): the time each match may take before it is abandoned with `CRE_MATCH_LIMIT`. A program that
+/// matches patterns or texts from outside should set it when it starts (see `cre_regex_new_with_timeout`).
+#[unsafe(no_mangle)]
+pub extern "C" fn cre_set_default_match_timeout(timeout_ms: u64) {
+    corvus::set_default_match_timeout(Some(Duration::from_millis(timeout_ms)));
+}
+
+/// The match timeout a regular expression compiled now by `cre_regex_new` takes, in milliseconds (0 for none).
+#[unsafe(no_mangle)]
+pub extern "C" fn cre_default_match_timeout() -> u64 {
+    millis(corvus::default_match_timeout())
+}
+
+/// A timeout in whole milliseconds, 0 for none.
+fn millis(timeout: Option<Duration>) -> u64 {
+    timeout.map_or(0, |t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Compiles a pattern with the flags `new RegExp(pattern, flags)` takes (`flags` may be NULL with a length of 0 for
-/// none). On success `*out_regex` is a handle to free with `cre_regex_free`; on failure it is NULL and the status says
-/// why: `CRE_INVALID_PATTERN`, `CRE_INVALID_FLAGS`, `CRE_PATTERN_TOO_LARGE`, `CRE_INVALID_UTF8` or
-/// `CRE_INVALID_ARGUMENT`.
+/// none), and the match timeout of `cre_default_match_timeout`. On success `*out_regex` is a handle to free with
+/// `cre_regex_free`; on failure it is NULL and the status says why: `CRE_INVALID_PATTERN`, `CRE_INVALID_FLAGS`,
+/// `CRE_PATTERN_TOO_LARGE`, `CRE_INVALID_UTF8` or `CRE_INVALID_ARGUMENT`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cre_regex_new(
     pattern: *const c_char,
@@ -535,12 +567,31 @@ pub unsafe extern "C" fn cre_regex_new(
     flags_len: usize,
     out_regex: *mut *mut cre_regex,
 ) -> cre_status {
+    let timeout_ms = cre_default_match_timeout();
+    unsafe { cre_regex_new_with_timeout(pattern, pattern_len, flags, flags_len, timeout_ms, out_regex) }
+}
+
+/// `cre_regex_new` with a match timeout in milliseconds (0 for none): the time each match may take before it is
+/// abandoned with `CRE_MATCH_LIMIT`, which brings a cap on the memory of its backtracking with it. Every function that
+/// matches gives its match this timeout, except where a `_limit` function is given a limit of its own. Without one a
+/// match has no limit of time or of memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_new_with_timeout(
+    pattern: *const c_char,
+    pattern_len: usize,
+    flags: *const c_char,
+    flags_len: usize,
+    timeout_ms: u64,
+    out_regex: *mut *mut cre_regex,
+) -> cre_status {
     guard(|| {
         let slot = unsafe { out(out_regex, "out_regex") }?;
         *slot = std::ptr::null_mut();
         let pattern = unsafe { text(pattern, pattern_len, "pattern") }?;
         let flags = unsafe { text(flags, flags_len, "flags") }?;
-        let regex = Regex::new(pattern, flags).map_err(|e| match &e {
+        let flags = Flags::parse(flags).map_err(|e| Failure::new(CRE_INVALID_FLAGS, e.to_string()))?;
+        let timeout = Some(Duration::from_millis(timeout_ms));
+        let regex = Regex::with_timeout(pattern, flags, timeout).map_err(|e| match &e {
             Error::Invalid(m) => Failure::new(CRE_INVALID_PATTERN, m.clone()),
             Error::Flags(m) => Failure::new(CRE_INVALID_FLAGS, m.clone()),
             Error::TooLarge(_) => Failure::new(CRE_PATTERN_TOO_LARGE, e.to_string()),
@@ -551,6 +602,13 @@ pub unsafe extern "C" fn cre_regex_new(
         *slot = Box::into_raw(Box::new(cre_regex { inner: regex, flags, names }));
         Ok(())
     })
+}
+
+/// The match timeout of the regular expression, in milliseconds (0 for none).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_match_timeout(regex: *const cre_regex) -> u64 {
+    // SAFETY: a handle this library created, or NULL.
+    quietly(0, || unsafe { regex.as_ref() }.map_or(0, |r| millis(r.inner.match_timeout())))
 }
 
 /// Frees a regular expression. NULL is allowed and does nothing.
@@ -633,7 +691,7 @@ pub unsafe extern "C" fn cre_utf8_check(text_ptr: *const c_char, text_len: usize
 }
 
 /// Whether the pattern matches anywhere in the UTF-8 text (at its start alone with the y flag): `*out_matched`. With
-/// no limit on the time the match takes.
+/// the regular expression's match timeout.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cre_regex_is_match(
     regex: *const cre_regex,
@@ -655,8 +713,9 @@ pub unsafe extern "C" fn cre_regex_is_match_unchecked(
     unsafe { cre_regex_is_match_limit_unchecked(regex, text_ptr, text_len, 0, out_matched) }
 }
 
-/// `cre_regex_is_match` with a limit on the time the match may take, in milliseconds (0 for none). A match that
-/// reaches it, or whose backtracking memory reaches its cap, is `CRE_MATCH_LIMIT`, and `*out_matched` is false.
+/// `cre_regex_is_match` with a limit on the time the match may take, in milliseconds (0 for the regular expression's
+/// match timeout). A match that reaches it, or whose backtracking memory reaches its cap, is `CRE_MATCH_LIMIT`, and
+/// `*out_matched` is false.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cre_regex_is_match_limit(
     regex: *const cre_regex,
@@ -693,8 +752,7 @@ unsafe fn is_match_limit8(
         *slot = false;
         let regex = unsafe { handle(regex, "regex") }?;
         let text = unsafe { haystack(text_ptr, text_len, mode) }?;
-        let limit = limit_of(limit_ms);
-        *slot = regex.inner.try_is_match(text, limit).map_err(|e| limited(e, limit))?;
+        *slot = within!(regex.inner, is_match, is_match_within, limit_ms, text)?;
         Ok(())
     })
 }
@@ -738,7 +796,7 @@ unsafe fn is_match_at8(
         let regex = unsafe { handle(regex, "regex") }?;
         let text = unsafe { haystack(text_ptr, text_len, mode) }?;
         start_in(regex, text, start)?;
-        *slot = regex.inner.is_match_at(text, start);
+        *slot = regex.inner.is_match_at(text, start).map_err(|e| limited(e, &regex.inner, 0))?;
         Ok(())
     })
 }
@@ -772,8 +830,8 @@ pub unsafe extern "C" fn cre_regex_find_unchecked(
     unsafe { cre_regex_find_limit_unchecked(regex, text_ptr, text_len, start, 0, out_match, out_found) }
 }
 
-/// `cre_regex_find` with a limit on the time the match may take, in milliseconds (0 for none): `CRE_MATCH_LIMIT`
-/// when it is reached.
+/// `cre_regex_find` with a limit on the time the match may take, in milliseconds (0 for the regular expression's match
+/// timeout): `CRE_MATCH_LIMIT` when it is reached.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cre_regex_find_limit(
     regex: *const cre_regex,
@@ -821,8 +879,7 @@ unsafe fn find_limit8(
         let regex = unsafe { handle(regex, "regex") }?;
         let text = unsafe { haystack(text_ptr, text_len, mode) }?;
         start_in(regex, text, start)?;
-        let limit = limit_of(limit_ms);
-        if let Some(m) = regex.inner.try_find_at(text, start, limit).map_err(|e| limited(e, limit))? {
+        if let Some(m) = within!(regex.inner, find_at, find_at_within, limit_ms, text, start)? {
             *place = cre_match { start: m.start(), end: m.end() };
             *found = true;
         }
@@ -883,19 +940,20 @@ unsafe fn captures_read8(
         LOCATIONS.with(|cell| {
             let mut cell = cell.borrow_mut();
             let locs = cell.get_or_insert_with(|| regex.inner.capture_locations());
-            if regex.inner.captures_read_at(locs, text, start).is_some() {
+            let got = regex.inner.captures_read_at(locs, text, start).map_err(|e| limited(e, &regex.inner, 0))?;
+            if got.is_some() {
                 *found = true;
                 for (k, g) in groups.iter_mut().enumerate() {
                     *g = cre_match::of(locs.get(k));
                 }
             }
-        });
-        Ok(())
+            Ok(())
+        })
     })
 }
 
-/// `cre_regex_captures_read` with a limit on the time the match may take, in milliseconds (0 for none):
-/// `CRE_MATCH_LIMIT` when it is reached. It allocates for each match.
+/// `cre_regex_captures_read` with a limit on the time the match may take, in milliseconds (0 for the regular
+/// expression's match timeout): `CRE_MATCH_LIMIT` when it is reached. It allocates for each match.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cre_regex_captures_read_limit(
     regex: *const cre_regex,
@@ -949,8 +1007,7 @@ unsafe fn captures_read_limit8(
         let regex = unsafe { handle(regex, "regex") }?;
         let text = unsafe { haystack(text_ptr, text_len, mode) }?;
         start_in(regex, text, start)?;
-        let limit = limit_of(limit_ms);
-        if let Some(caps) = regex.inner.try_captures_at(text, start, limit).map_err(|e| limited(e, limit))? {
+        if let Some(caps) = within!(regex.inner, captures_at, captures_at_within, limit_ms, text, start)? {
             *found = true;
             for (g, m) in groups.iter_mut().zip(caps.iter()) {
                 *g = cre_match::of(m.map(|m| (m.start(), m.end())));
@@ -987,8 +1044,8 @@ pub unsafe extern "C" fn cre_regex_captures_unchecked(
     unsafe { cre_regex_captures_limit_unchecked(regex, text_ptr, text_len, start, 0, captures, out_found) }
 }
 
-/// `cre_regex_captures` with a limit on the time the match may take, in milliseconds (0 for none):
-/// `CRE_MATCH_LIMIT` when it is reached.
+/// `cre_regex_captures` with a limit on the time the match may take, in milliseconds (0 for the regular expression's
+/// match timeout): `CRE_MATCH_LIMIT` when it is reached.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cre_regex_captures_limit(
     regex: *const cre_regex,
@@ -1036,8 +1093,7 @@ unsafe fn captures_limit8(
         let regex = unsafe { handle(regex, "regex") }?;
         let text = unsafe { haystack(text_ptr, text_len, mode) }?;
         start_in(regex, text, start)?;
-        let limit = limit_of(limit_ms);
-        let got = regex.inner.try_captures_at(text, start, limit).map_err(|e| limited(e, limit))?;
+        let got = within!(regex.inner, captures_at, captures_at_within, limit_ms, text, start)?;
         caps.fill(got.as_ref());
         *found = got.is_some();
         Ok(())
@@ -1187,6 +1243,7 @@ unsafe fn replace8(
         let replacement = unsafe { self::text(replacement, replacement_len, "replacement") }?;
         let result =
             if all { regex.inner.replace_all(text, replacement) } else { regex.inner.replace(text, replacement) };
+        let result = result.map_err(|e| limited(e, &regex.inner, 0))?;
         *slot = string_of(result.as_bytes());
         Ok(())
     })
@@ -1232,7 +1289,7 @@ unsafe fn split8(
         *slot = cre_pieces { items: std::ptr::null(), len: 0, internal: std::ptr::null_mut() };
         let regex = unsafe { handle(regex, "regex") }?;
         let text = unsafe { haystack(text_ptr, text_len, mode) }?;
-        let parts = regex.inner.splitn(text, limit as usize);
+        let parts = regex.inner.splitn(text, limit as usize).map_err(|e| limited(e, &regex.inner, 0))?;
         let parts: Vec<Option<Cow<'_, [u8]>>> = parts
             .into_iter()
             .map(|p| {
@@ -1287,8 +1344,7 @@ pub unsafe extern "C" fn cre_regex_is_match_limit_utf16(
         *slot = false;
         let regex = unsafe { handle(regex, "regex") }?;
         let text = unsafe { units(text_ptr, text_len, "text") }?;
-        let limit = limit_of(limit_ms);
-        *slot = regex.inner.try_is_match_utf16(text, limit).map_err(|e| limited(e, limit))?;
+        *slot = within!(regex.inner, is_match_utf16, is_match_within_utf16, limit_ms, text)?;
         Ok(())
     })
 }
@@ -1308,7 +1364,7 @@ pub unsafe extern "C" fn cre_regex_is_match_at_utf16(
         let regex = unsafe { handle(regex, "regex") }?;
         let text = unsafe { units(text_ptr, text_len, "text") }?;
         start_in16(text, start)?;
-        *slot = regex.inner.is_match_at_utf16(text, start);
+        *slot = regex.inner.is_match_at_utf16(text, start).map_err(|e| limited(e, &regex.inner, 0))?;
         Ok(())
     })
 }
@@ -1345,8 +1401,7 @@ pub unsafe extern "C" fn cre_regex_find_limit_utf16(
         let regex = unsafe { handle(regex, "regex") }?;
         let text = unsafe { units(text_ptr, text_len, "text") }?;
         start_in16(text, start)?;
-        let limit = limit_of(limit_ms);
-        if let Some(m) = regex.inner.try_find_at_utf16(text, start, limit).map_err(|e| limited(e, limit))? {
+        if let Some(m) = within!(regex.inner, find_at_utf16, find_at_within_utf16, limit_ms, text, start)? {
             *place = cre_match { start: m.start(), end: m.end() };
             *found = true;
         }
@@ -1375,14 +1430,15 @@ pub unsafe extern "C" fn cre_regex_captures_read_utf16(
         LOCATIONS.with(|cell| {
             let mut cell = cell.borrow_mut();
             let locs = cell.get_or_insert_with(|| regex.inner.capture_locations());
-            if regex.inner.captures_read_at_utf16(locs, text, start).is_some() {
+            let got = regex.inner.captures_read_at_utf16(locs, text, start).map_err(|e| limited(e, &regex.inner, 0))?;
+            if got.is_some() {
                 *found = true;
                 for (k, g) in groups.iter_mut().enumerate() {
                     *g = cre_match::of(locs.get(k));
                 }
             }
-        });
-        Ok(())
+            Ok(())
+        })
     })
 }
 
@@ -1405,8 +1461,7 @@ pub unsafe extern "C" fn cre_regex_captures_read_limit_utf16(
         let regex = unsafe { handle(regex, "regex") }?;
         let text = unsafe { units(text_ptr, text_len, "text") }?;
         start_in16(text, start)?;
-        let limit = limit_of(limit_ms);
-        if let Some(caps) = regex.inner.try_captures_at_utf16(text, start, limit).map_err(|e| limited(e, limit))? {
+        if let Some(caps) = within!(regex.inner, captures_at_utf16, captures_at_within_utf16, limit_ms, text, start)? {
             *found = true;
             for (g, m) in groups.iter_mut().zip(caps.iter()) {
                 *g = cre_match::of(m.map(|m| (m.start(), m.end())));
@@ -1448,8 +1503,7 @@ pub unsafe extern "C" fn cre_regex_captures_limit_utf16(
         let regex = unsafe { handle(regex, "regex") }?;
         let text = unsafe { units(text_ptr, text_len, "text") }?;
         start_in16(text, start)?;
-        let limit = limit_of(limit_ms);
-        let got = regex.inner.try_captures_at_utf16(text, start, limit).map_err(|e| limited(e, limit))?;
+        let got = within!(regex.inner, captures_at_utf16, captures_at_within_utf16, limit_ms, text, start)?;
         caps.fill(got.as_ref());
         *found = got.is_some();
         Ok(())
@@ -1545,6 +1599,7 @@ unsafe fn replace16(
         } else {
             regex.inner.replace_utf16(text, replacement)
         };
+        let result = result.map_err(|e| limited(e, &regex.inner, 0))?;
         *slot = string16_of(&result);
         Ok(())
     })
@@ -1564,7 +1619,7 @@ pub unsafe extern "C" fn cre_regex_split_utf16(
         *slot = cre_pieces16 { items: std::ptr::null(), len: 0, internal: std::ptr::null_mut() };
         let regex = unsafe { handle(regex, "regex") }?;
         let text = unsafe { units(text_ptr, text_len, "text") }?;
-        let parts = regex.inner.splitn_utf16(text, limit as usize);
+        let parts = regex.inner.splitn_utf16(text, limit as usize).map_err(|e| limited(e, &regex.inner, 0))?;
         let (buffer, spans) = pieces_of(&parts);
         let items: Vec<cre_str16> = spans
             .iter()
@@ -1683,11 +1738,12 @@ pub unsafe extern "C" fn cre_matches_next(
         *place = cre_match::UNSET;
         let m = unsafe { handle_mut(matches, "matches") }?;
         let span = match &mut m.iter {
-            Iter::Find8(it) => it.next().map(|m| (m.start(), m.end())),
-            Iter::Find16(it) => it.next().map(|m| (m.start(), m.end())),
-            Iter::Captures8(it) => it.next().map(|c| (c.get_match().start(), c.get_match().end())),
-            Iter::Captures16(it) => it.next().map(|c| (c.get_match().start(), c.get_match().end())),
+            Iter::Find8(it) => it.next().map(|r| r.map(|m| (m.start(), m.end()))),
+            Iter::Find16(it) => it.next().map(|r| r.map(|m| (m.start(), m.end()))),
+            Iter::Captures8(it) => it.next().map(|r| r.map(|c| (c.get_match().start(), c.get_match().end()))),
+            Iter::Captures16(it) => it.next().map(|r| r.map(|c| (c.get_match().start(), c.get_match().end()))),
         };
+        let span = span.transpose().map_err(|e| m.limited(e))?;
         if let Some(span) = span {
             *place = cre_match::of(Some(span));
             *found = true;
@@ -1718,12 +1774,13 @@ pub unsafe extern "C" fn cre_matches_next_batch(
         }
         // SAFETY: the caller passes `capacity` writable entries at `out_matches`.
         let place = unsafe { std::slice::from_raw_parts_mut(out_matches, capacity) };
-        *count = match &mut m.iter {
+        let got = match &mut m.iter {
             Iter::Find8(it) => it.next_batch(place),
             Iter::Find16(it) => it.next_batch(place),
-            Iter::Captures8(it) => fill(place, it.map(|c| (c.get_match().start(), c.get_match().end()))),
-            Iter::Captures16(it) => fill(place, it.map(|c| (c.get_match().start(), c.get_match().end()))),
+            Iter::Captures8(it) => fill(place, it.map(|c| c.map(|c| (c.get_match().start(), c.get_match().end())))),
+            Iter::Captures16(it) => fill(place, it.map(|c| c.map(|c| (c.get_match().start(), c.get_match().end())))),
         };
+        *count = got.map_err(|e| m.limited(e))?;
         Ok(())
     })
 }
@@ -1761,24 +1818,30 @@ pub unsafe extern "C" fn cre_matches_next_captures_batch(
         }
         // SAFETY: the caller passes `capacity` writable entries at `out_groups`.
         let place = unsafe { std::slice::from_raw_parts_mut(out_groups, capacity) };
-        *count = match &mut m.iter {
+        let got = match &mut m.iter {
             Iter::Captures8(it) => it.next_batch(place),
             Iter::Captures16(it) => it.next_batch(place),
             _ => unreachable!(),
         };
+        *count = got.map_err(|e| m.limited(e))?;
         Ok(())
     })
 }
 
-/// Writes the spans `spans` gives into `place` in order, asking for no more than `place` holds: how many.
-fn fill(place: &mut [cre_match], spans: impl Iterator<Item = (usize, usize)>) -> usize {
+/// Writes the spans `spans` gives into `place` in order, asking for no more than `place` holds: how many, or the
+/// error of a match that reached its limit.
+fn fill(
+    place: &mut [cre_match],
+    spans: impl Iterator<Item = Result<(usize, usize), MatchError>>,
+) -> Result<usize, MatchError> {
     let mut n = 0;
     // `zip` asks `place` first, so no match is taken from the search once `place` is full.
-    for (slot, (start, end)) in place.iter_mut().zip(spans) {
+    for (slot, span) in place.iter_mut().zip(spans) {
+        let (start, end) = span?;
         *slot = cre_match { start, end };
         n += 1;
     }
-    n
+    Ok(n)
 }
 
 /// The next match of a global search made by `cre_regex_captures_iter` (or its UTF-16 form), with its groups written
@@ -1800,12 +1863,12 @@ pub unsafe extern "C" fn cre_matches_next_captures(
         }
         match &mut m.iter {
             Iter::Captures8(it) => {
-                let got = it.next();
+                let got = it.next().transpose().map_err(|e| limited(e, unsafe { &(*m.regex).inner }, 0))?;
                 caps.fill(got.as_ref());
                 *found = got.is_some();
             }
             Iter::Captures16(it) => {
-                let got = it.next();
+                let got = it.next().transpose().map_err(|e| limited(e, unsafe { &(*m.regex).inner }, 0))?;
                 caps.fill(got.as_ref());
                 *found = got.is_some();
             }

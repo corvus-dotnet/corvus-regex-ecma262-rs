@@ -59,16 +59,16 @@ fn a_warm_match_allocates_nothing() {
         let re = Regex::new(pattern, flags).unwrap();
         let mut locs = re.capture_locations();
         let n = allocations(|| {
-            assert!(re.is_match(&text));
-            assert!(re.find(&text).is_some());
-            assert!(re.find_iter(&text).count() > 0);
-            assert!(re.is_match_utf16(&text16));
-            assert!(re.find_iter_utf16(&text16).count() > 0);
+            assert!(re.is_match(&text).unwrap());
+            assert!(re.find(&text).unwrap().is_some());
+            assert!(re.find_iter(&text).map(Result::unwrap).count() > 0);
+            assert!(re.is_match_utf16(&text16).unwrap());
+            assert!(re.find_iter_utf16(&text16).map(Result::unwrap).count() > 0);
         });
         assert_eq!(n, 0, "/{pattern}/{flags}: {n} allocations");
         let n = allocations(|| {
             let mut at = 0;
-            while let Some(m) = re.captures_read_at(&mut locs, &text, at) {
+            while let Some(m) = re.captures_read_at(&mut locs, &text, at).unwrap() {
                 at = if m.is_empty() { m.end() + 1 } else { m.end() };
                 if at > text.len() {
                     break;
@@ -81,13 +81,13 @@ fn a_warm_match_allocates_nothing() {
         let n = allocations(|| {
             for _ in 0..2 {
                 let mut it = re.find_iter(&text);
-                while it.next_batch(&mut spans) == spans.len() {}
+                while it.next_batch(&mut spans).unwrap() == spans.len() {}
                 let mut it = re.find_iter_utf16(&text16);
-                while it.next_batch(&mut spans) == spans.len() {}
+                while it.next_batch(&mut spans).unwrap() == spans.len() {}
                 let mut it = re.captures_iter(&text);
-                while it.next_batch(&mut groups) > 0 {}
+                while it.next_batch(&mut groups).unwrap() > 0 {}
                 let mut it = re.captures_iter_utf16(&text16);
-                while it.next_batch(&mut groups) > 0 {}
+                while it.next_batch(&mut groups).unwrap() > 0 {}
             }
         });
         assert_eq!(n, 0, "/{pattern}/{flags}: {n} allocations in batches");

@@ -232,11 +232,11 @@ impl Engine for Corvus {
     }
 
     fn test_utf16(re: &Regex, text: &[u16]) -> Result<bool, String> {
-        re.try_is_match_utf16(text, LIMIT).map_err(limit_name)
+        re.is_match_within_utf16(text, LIMIT).map_err(limit_name)
     }
 
     fn test_utf8(re: &Regex, text: &str) -> Result<bool, String> {
-        re.try_is_match(text, LIMIT).map_err(limit_name)
+        re.is_match_within(text, LIMIT).map_err(limit_name)
     }
 }
 
@@ -480,7 +480,7 @@ fn judge_captures(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<Stri
 
             // exec
             let exec = exec_of(a.get("exec").unwrap());
-            let got = re.try_captures_at_utf16(text, 0, LIMIT);
+            let got = re.captures_at_within_utf16(text, 0, LIMIT);
             let Ok(got) = got else {
                 counts.limited.fetch_add(1, Ordering::Relaxed);
                 wrong.push(format!("LIMIT\tcaptures.jsonl\t{where_}"));
@@ -488,7 +488,7 @@ fn judge_captures(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<Stri
             };
             check("exec", same_slots(&exec, got.as_ref().map(groups_of).as_deref(), &identity));
             if !lone {
-                let got8 = re.captures(&utf8);
+                let got8 = re.captures(&utf8).unwrap();
                 check("exec-utf8", same_slots(&exec, got8.as_ref().map(groups_of).as_deref(), &to_byte));
             }
 
@@ -512,7 +512,7 @@ fn judge_captures(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<Stri
             // The groups of each match too, over UTF-16.
             let mut all_ok = true;
             let mut n = 0;
-            for caps in g.captures_iter_utf16(text) {
+            for caps in g.captures_iter_utf16(text).map(Result::unwrap) {
                 if n >= all.len() {
                     break;
                 }
@@ -525,18 +525,28 @@ fn judge_captures(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<Stri
             if (all.len() < 20 && n != all.len()) || (all.len() == 20 && n < 20) {
                 all_ok = false;
             }
-            check("all", all_ok && judge_all(&mut g.find_iter_utf16(text).map(|m| (m.start(), m.end())), &identity));
+            check(
+                "all",
+                all_ok
+                    && judge_all(
+                        &mut g.find_iter_utf16(text).map(Result::unwrap).map(|m| (m.start(), m.end())),
+                        &identity,
+                    ),
+            );
             if !lone {
-                check("all-utf8", judge_all(&mut g.find_iter(&utf8).map(|m| (m.start(), m.end())), &to_byte));
+                check(
+                    "all-utf8",
+                    judge_all(&mut g.find_iter(&utf8).map(Result::unwrap).map(|m| (m.start(), m.end())), &to_byte),
+                );
             }
 
             // sticky at 1
             if !text.is_empty() {
                 let sticky = exec_of(a.get("sticky").unwrap());
-                let got = y.captures_at_utf16(text, 1);
+                let got = y.captures_at_utf16(text, 1).unwrap();
                 check("sticky", same_slots(&sticky, got.as_ref().map(groups_of).as_deref(), &identity));
                 if !lone && utf8.is_char_boundary(byte_at[1]) {
-                    let got8 = y.captures_at(&utf8, byte_at[1]);
+                    let got8 = y.captures_at(&utf8, byte_at[1]).unwrap();
                     check("sticky-utf8", same_slots(&sticky, got8.as_ref().map(groups_of).as_deref(), &to_byte));
                 }
             }
@@ -544,14 +554,17 @@ fn judge_captures(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<Stri
             // replace
             let template: Vec<u16> = REPLACEMENT.encode_utf16().collect();
             let replace = a.get("replace").and_then(Json::as_units).unwrap();
-            check("replace", *re.replace_utf16(text, &template) == *replace);
+            check("replace", *re.replace_utf16(text, &template).unwrap() == *replace);
             let replace_all = a.get("replaceAll").and_then(Json::as_units).unwrap();
-            check("replaceAll", *g.replace_utf16(text, &template) == *replace_all);
+            check("replaceAll", *g.replace_utf16(text, &template).unwrap() == *replace_all);
             if !lone {
                 // Over UTF-8 a half character is written as U+FFFD, which is what a lossy conversion of V8's answer
                 // writes for it.
-                check("replace-utf8", re.replace(&utf8, REPLACEMENT) == String::from_utf16_lossy(replace));
-                check("replaceAll-utf8", g.replace(&utf8, REPLACEMENT) == String::from_utf16_lossy(replace_all));
+                check("replace-utf8", re.replace(&utf8, REPLACEMENT).unwrap() == String::from_utf16_lossy(replace));
+                check(
+                    "replaceAll-utf8",
+                    g.replace(&utf8, REPLACEMENT).unwrap() == String::from_utf16_lossy(replace_all),
+                );
             }
 
             // split
@@ -564,8 +577,8 @@ fn judge_captures(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<Stri
                         _ => false,
                     })
             };
-            check("split", same_split(a.get("split").unwrap(), re.split_utf16(text)));
-            check("split3", same_split(a.get("split3").unwrap(), re.splitn_utf16(text, 3)));
+            check("split", same_split(a.get("split").unwrap(), re.split_utf16(text).unwrap()));
+            check("split3", same_split(a.get("split3").unwrap(), re.splitn_utf16(text, 3).unwrap()));
         }
     }
 }

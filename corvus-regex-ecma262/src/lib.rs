@@ -4,9 +4,9 @@
 //! use corvus_regex_ecma262::Regex;
 //!
 //! let re = Regex::new(r"(?<word>\p{L}+)(?=!)", "gu").unwrap();
-//! let words: Vec<&str> = re.find_iter("Hej! Grüß dich!").map(|m| m.as_str()).collect();
-//! assert_eq!(words, ["Hej", "dich"]);
-//! assert_eq!(re.replace("Hej! Grüß dich!", "<$<word>>"), "<Hej>! Grüß <dich>!");
+//! let words: Result<Vec<&str>, _> = re.find_iter("Hej! Grüß dich!").map(|m| m.map(|m| m.as_str())).collect();
+//! assert_eq!(words.unwrap(), ["Hej", "dich"]);
+//! assert_eq!(re.replace("Hej! Grüß dich!", "<$<word>>").unwrap(), "<Hej>! Grüß <dich>!");
 //! ```
 //!
 //! [`Regex`] has `is_match`, `find`, `find_iter`, `captures`, `captures_iter`, `replace`, `replace_all` and
@@ -57,7 +57,12 @@
 //!
 //! # Limits
 //!
-//! [`Regex::try_is_match`] gives a match a limit of time, and with it a cap on the memory of its backtracking.
+//! A pattern has a match timeout, as a `Regex` of `System.Text.RegularExpressions` has: the time each match may take
+//! before it is abandoned, which brings with it a cap on the memory of its backtracking. Every member that matches
+//! returns `Result`, and a match that reaches either is an [`Err`] of [`MatchError`], never an answer.
+//! [`Regex::with_timeout`] gives a pattern one, and [`set_default_match_timeout`] gives one to every pattern compiled
+//! after it. Without one (the default) a match has no limit of time or of memory, so a program that matches patterns
+//! or texts from outside should set one. The members that end in `_within` give one match a limit of its own.
 //! [`Regex::new`] refuses a pattern over a limit of size ([`MAX_PATTERN_LENGTH`], [`MAX_NESTING`], [`MAX_SIZE`])
 //! with [`Error::TooLarge`], so that reading and compiling a pattern take bounded time and memory whatever the
 //! pattern holds.
@@ -98,6 +103,8 @@ mod units;
 mod vm;
 
 use std::fmt::{self, Write as _};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 pub use parse::{Limit, MAX_NESTING, MAX_PATTERN_LENGTH, MAX_SIZE, TooLargeError};
 pub(crate) use re2::MAX_RE2_COST;
@@ -107,6 +114,37 @@ pub use vm::{MAX_STACK, MatchError};
 /// A code point, or a UTF-16 code unit of a pattern read without the u flag. It is signed, as the `rune` of the Go
 /// source is, and -1 stands for "none".
 pub(crate) type Rune = i32;
+
+/// The match timeout every pattern compiled without one of its own takes, in nanoseconds; 0 for none.
+static DEFAULT_MATCH_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+
+/// Sets the match timeout of every pattern compiled from now on by [`Regex::new`] and [`Regex::with_flags`]: the time
+/// each match may take before it is abandoned with [`MatchError::Time`], or `None` (or zero) for no limit, which is
+/// the default. It is the process-wide default of `System.Text.RegularExpressions` (`REGEX_DEFAULT_MATCH_TIMEOUT`),
+/// and a program that matches patterns or texts from outside should set it when it starts (see
+/// [`Regex::with_timeout`]). A pattern already compiled keeps the timeout it was compiled with.
+///
+/// ```
+/// use std::time::Duration;
+/// use corvus_regex_ecma262::{Regex, default_match_timeout, set_default_match_timeout};
+///
+/// set_default_match_timeout(Some(Duration::from_secs(1)));
+/// assert_eq!(Regex::new("a+", "").unwrap().match_timeout(), Some(Duration::from_secs(1)));
+/// set_default_match_timeout(None);
+/// assert_eq!(default_match_timeout(), None);
+/// ```
+pub fn set_default_match_timeout(timeout: Option<Duration>) {
+    let nanos = timeout.map_or(0, |t| u64::try_from(t.as_nanos()).unwrap_or(u64::MAX));
+    DEFAULT_MATCH_TIMEOUT.store(nanos, Ordering::Relaxed);
+}
+
+/// The match timeout a pattern compiled now by [`Regex::new`] takes (see [`set_default_match_timeout`]).
+pub fn default_match_timeout() -> Option<Duration> {
+    match DEFAULT_MATCH_TIMEOUT.load(Ordering::Relaxed) {
+        0 => None,
+        nanos => Some(Duration::from_nanos(nanos)),
+    }
+}
 
 /// Why a pattern does not compile.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -321,7 +359,7 @@ pub(crate) fn compile(pattern: &str) -> Result<Regex, Error> {
     on_a_deep_stack(pattern, false, || {
         let (root, facts, ps) = read(pattern)?;
         let flags = Flags { unicode: facts.unicode, ..Flags::default() };
-        Ok(Regex::from_tree(pattern, flags, root, facts, &ps))
+        Ok(Regex::from_tree(pattern, flags, None, root, facts, &ps))
     })
     .unwrap_or(Err(NO_DEEP_STACK))
 }
