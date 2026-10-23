@@ -102,6 +102,14 @@ if facts.get("protocol") == "interleaved":
 else:
     job = f"each figure the median of {facts.get('passes')} passes after a warm-up, {facts.get('seconds')} s for each workload of each engine, each in a process of its own"
     spread = ""
+
+# The encodings each engine's runner answers in, which the central benchmark page's compliance figure is a share of:
+# every answer the test data asks in those encodings, so an answer the runner did not ask counts against the engine.
+ENCODINGS = {"quickjs": ["utf16"], "v8": ["utf16"]}
+for key, _, _, _, counts in ENGINES:
+    if isinstance(counts, dict):
+        counts["encodings"] = ENCODINGS.get(key, ["utf16", "utf8"])
+
 data = {
     "meta": {
         "title": "corvus-regex-ecma262 from C: the Industry benchmarks",
