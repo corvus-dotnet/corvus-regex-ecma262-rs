@@ -22,12 +22,10 @@ const seconds = Number((one ? args[2] : args[1]) ?? 1.5);
 const passes = Number((one ? args[3] : args[2]) ?? 5);
 const dir = process.env.CORVUS_REGEX_TEXTS ?? join(homedir(), ".local", "share", "corvus-regex-benchmarks");
 const texts = new Map();
+// The texts as they were downloaded, never a harness's own unzipped copies (CORVUS_REGEX_PLAIN): V8's count is the one
+// every engine of the harness is held to, so it must not depend on how the harness reads a text. With the copies, a
+// harness that dropped the carriage returns gave V8 the same text, and the count gate passed.
 function text(file) {
-  if (!texts.has(file) && process.env.CORVUS_REGEX_PLAIN) {
-    try {
-      texts.set(file, readFileSync(join(process.env.CORVUS_REGEX_PLAIN, file.replace(/\.gz$/, "")), "utf8"));
-    } catch { /* unzipped below */ }
-  }
   if (!texts.has(file)) {
     let bytes = gunzipSync(readFileSync(join(dir, file)));
     if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) bytes = bytes.subarray(3);
