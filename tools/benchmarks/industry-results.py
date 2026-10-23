@@ -20,6 +20,18 @@ tools/benchmarks/v8/dataset.mjs. regex does not claim it, and carries "not ECMA-
 """
 import argparse, json, os, re
 
+
+def failure(r):
+    """A figure the harness gave no time for, as the data file carries it: stopped at the harness's limit
+    ({"limit": s}), a count of matches that differs from V8's ({"wrongCount": {"counted": n, "v8": m}}), or another
+    failure with what the harness said ({"error": "..."})."""
+    if "limit" in r:
+        return {"limit": r["limit"]}
+    m = re.match(r"counted (\d+) where V8 counts (\d+)", str(r.get("error", "")))
+    if m:
+        return {"wrongCount": {"counted": int(m.group(1)), "v8": int(m.group(2))}}
+    return {"error": r["error"]} if "error" in r else None
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--run", required=True)
 ap.add_argument("--v8", help="the V8 harness's own results, for a run whose harness did not run V8 itself")
@@ -76,14 +88,14 @@ for key, name, _, _, _ in ENGINES:
         r = rows.get(w)
         if r is None:
             continue
-        results[name][w] = ({"limit": r["limit"]} if "limit" in r else None) if "error" in r else {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}}
+        results[name][w] = failure(r) if "error" in r else {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}}
 if v8:
     v8_name = "V8"
     ENGINES.append(("v8", v8_name, "V8", v8["engine"], compliance(args.compliance_v8)))
     results[v8_name] = {}
     for w in ids:
         r = v8["results"].get(w)
-        results[v8_name][w] = {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}} if r and "error" not in r else ({"limit": r["limit"]} if r and "limit" in r else None)
+        results[v8_name][w] = {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}} if r and "error" not in r else (failure(r) if r else None)
 # Where regex counts otherwise than V8 (the oracle), the row says so; an ECMA-262 engine that does is an error above.
 differs = {w: r["differs"] for w, r in run["results"].get("regex", {}).items() if isinstance(r, dict) and "differs" in r}
 

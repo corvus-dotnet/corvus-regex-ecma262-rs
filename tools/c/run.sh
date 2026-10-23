@@ -34,6 +34,15 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
   cmake -S tools/c -B build/c-harness -DCRE_LIB_DIR="$here/target/release" -DCRE_BENCH=ON -DCMAKE_BUILD_TYPE=Release
   cmake --build build/c-harness -j 4
 fi
+# COUNT_GATE=1 (the harness-image job): every workload counted by this library's engines beside V8, one round of the
+# least timing, each count checked against V8's by count-gate.py; nothing else runs.
+if [ "${COUNT_GATE:-0}" = 1 ]; then
+  export CORVUS_REGEX_TEXTS="$texts"
+  "$bin/industry" "$workloads" --engines corvus-utf8,corvus-utf16,v8 --v8 tools/benchmarks/v8/industry.mjs --rounds 1 --seconds 0.01 \
+    --passes 1 --out "$work/counts.json" 2> "$work/counts.log" || true
+  python3 tools/benchmarks/count-gate.py "$workloads" "$work/counts.json" corvus-utf8 corvus-utf16
+  exit $?
+fi
 "$bin/dataset" "$data" "$work/wrong-corvus.tsv" > "$work/compliance-corvus.txt" 2>&1 || true
 # V8=0 (the central run, for every image but one): no V8, whose counts the workloads carry (v8Count).
 v8=(--v8 tools/benchmarks/v8/industry.mjs)
