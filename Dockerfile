@@ -1,5 +1,5 @@
-# The benchmark harness as an image: this crate built in release, its competitors (regex, regress) and Node 24 for the
-# V8 rows, with tools/benchmarks/run.sh as the entry point. The whole invocation is
+# The benchmark harness as an image: this crate built in release, the other Rust engines (regex, regress) and Node
+# 24 for the V8 rows, with tools/benchmarks/run.sh as the entry point. The whole invocation is
 #
 #   docker run --rm -v <workloads.json>:/workloads.json:ro -v <texts dir>:/texts:ro -v <out dir>:/out <image>
 #
@@ -7,7 +7,7 @@
 # at depth 1 inside the container unless its data/ directory is mounted at /data. JOB=short, SECONDS_EACH, PASSES,
 # CORES, SETTLE and RUN_URL pass through (see tools/benchmarks/run.sh). The central benchmark site runs this image each
 # night; .github/workflows/harness-image.yml builds, smoke-runs and publishes it.
-FROM node:24.11.0-bookworm-slim AS node
+FROM node:24.22.0-bookworm-slim AS node
 
 FROM rust:1.98-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends python3 git curl ca-certificates util-linux \

@@ -14,8 +14,10 @@
 //! another's figures; it warms for two fifths of its seconds, then times `passes` passes of as many counts as fit
 //! the rest and reports their median. A workload's figure for an engine is the median of its rounds, with the
 //! fastest and the slowest round as its spread. Where the spread, (slowest - fastest) / median, is over `--spread`,
-//! the figure is listed in the run's facts (`spread_over`) and on stderr: it is not a clean figure. A child that does
-//! not finish in two minutes is stopped and recorded as such. A count is the global search of ECMA-262: after an
+//! the figure is listed in the run's facts (`spread_over`) and on stderr: it is not a clean figure. A figure that does
+//! not finish in 30 s is stopped and recorded as giving no result within 30 s, and is not run in the workload's later
+//! rounds, so that an engine that cannot count a workload in time costs the run 30 s rather than a minute a round. A
+//! count is the global search of ECMA-262: after an
 //! empty match the search goes on one code point later.
 //!
 //! The engines: this crate over UTF-8 (`&str`) and over UTF-16 (`&[u16]`), with the workload's flags and `u`, as
@@ -257,6 +259,9 @@ fn facts(seconds: &str, passes: &str, extra: &[(&str, String)]) -> String {
     format!("{{{}}}", body.join(","))
 }
 
+/// The line of a figure stopped at the limit, which the page shows as giving no result within 30 s.
+const STOPPED: &str = "{\"error\":\"did not produce a result within 30 s\",\"limit\":30}";
+
 /// One figure: `engine` over workload `index` in a child process. The child's line of JSON, or one with the error.
 fn figure(
     exe: &std::path::Path,
@@ -295,10 +300,10 @@ fn figure(
         let line = BufReader::new(stdout).lines().next().and_then(Result::ok);
         let _ = tx.send(line);
     });
-    let line = match rx.recv_timeout(Duration::from_secs(120)) {
+    let line = match rx.recv_timeout(Duration::from_secs(30)) {
         Ok(Some(line)) => line,
         Ok(None) => "{\"error\":\"the process ended without figures\"}".to_string(),
-        Err(_) => "{\"error\":\"did not finish in two minutes\"}".to_string(),
+        Err(_) => STOPPED.to_string(),
     };
     let _ = child.kill();
     let _ = child.wait();
@@ -363,6 +368,10 @@ fn main() {
         for round in 0..rounds {
             for turn in 0..engines.len() {
                 let e = (turn + round) % engines.len();
+                // A figure stopped at the limit in an earlier round is not run again.
+                if lines[e][k].as_deref() == Some(STOPPED) {
+                    continue;
+                }
                 let line = figure(&exe, v8.as_deref(), path, k, &engines[e], &seconds, &passes);
                 let parsed = json::parse(&line).ok();
                 match parsed.as_ref().and_then(|j| j.get("median")).and_then(Json::as_f64) {

@@ -26,6 +26,11 @@ changes on the host during a run (its clock, its heat, its other work) falls on 
   slowest round are kept as its spread. Where (slowest - fastest) / median is over 5%, the run says so on its output
   (`SPREAD` lines) and lists the figure in the data's facts (`spread_over`, and the page's Spread fact): such a figure
   is not a clean one.
+- **A limit on each figure.** A figure that has not finished in 30 s is stopped, and is recorded as giving no result
+  within 30 s. It is not run again in the workload's later rounds, so an engine that cannot count a workload in time
+  costs the run 30 s rather than a limit in every round. The page shows such a figure as "> 30 s": the engine did not
+  produce a result within 30 s. (The limit was two minutes in every round until 2026-10-23, when R's PCRE2 row spent
+  78 minutes of a nightly run on 13 workloads that never gave a figure.)
 - **The counts.** Every engine's count is compared with V8's, the oracle of the test data. An ECMA-262 engine that
   counts otherwise is an error on that workload; regex, which does not claim ECMA-262, keeps its figure and the
   workload carries "counts differ" with both counts.
@@ -47,6 +52,8 @@ For the central results contract, every port's image follows the same protocol:
 > A run measures every engine on every workload in rounds: workloads are the outer loop, each workload's rounds the
 > next and engines the innermost, with the engine order turned by one each round, and each figure timed in a process
 > of its own after a warm-up. A workload's figure is the median over the rounds, and its spread is the fastest and the slowest round.
+> A figure that does not finish in 30 s is stopped, recorded as `{"error": "did not produce a result within 30 s",
+> "limit": 30}` (in the data file, `{"limit": 30}`), and not run in the workload's later rounds.
 > A figure whose spread, (slowest - fastest) / median, is over the run's limit (5% unless the run says otherwise) is
 > listed in the run's facts and is never presented as a clean figure. Every engine's match count is compared with
 > V8's: an ECMA-262 engine whose count differs is an error on that workload, and any other engine's differing count

@@ -54,6 +54,15 @@ jobs:
             assert c == "not ECMA-262" or {"right", "wrong", "refused", "acceptedInvalid", "limited"} <= set(c), (i["name"], c)
         print("smoke run wrote", len(impls), "engines over", len(schemas), "workloads")
         PY
+    - name: "Count gate: every workload counted by this library beside V8, each count V8's"
+      # A count that differs from V8's is a wrong answer, which the central page shows as a wrong count: it fails here,
+      # on the pull request (tools/benchmarks/count-gate.py, run by run.sh with COUNT_GATE=1).
+      run: |
+        mkdir -p texts out && chmod 777 out
+        for f in sherlock 3200 mariomka opensubtitles-ru opensubtitles-zh; do
+          [ -f "texts/$f.txt.gz" ] || curl -sSfL -o "texts/$f.txt.gz" "https://raw.githubusercontent.com/dotnet/performance/main/src/benchmarks/micro/libraries/System.Text.RegularExpressions/TestData/$f.txt.gz"
+        done
+        docker run --rm -e COUNT_GATE=1 -v "$PWD/tools/benchmarks/workloads.json:/workloads.json:ro" -v "$PWD/texts:/texts:ro" -v "$PWD/out:/out" harness
     - name: Publish the image
       if: github.ref == 'refs/heads/main' || github.event_name == 'release'
       run: |

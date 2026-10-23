@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The benchmark harness, which the central benchmark site runs each night (as the image, Dockerfile) and anyone can run: it
-# builds the engine and its competitors, works out the compliance of each ECMA-262 engine over the test data, runs
+# builds this engine and the other Rust engines, works out the compliance of each ECMA-262 engine over the test data, runs
 # every engine over the Industry workloads, and writes the run's one data file in the results page's shape.
 #
 #   tools/benchmarks/run.sh <workloads.json> <texts directory> <out.json> [test data directory]
@@ -39,6 +39,15 @@ if [ -z "$data" ]; then
 fi
 # The image (Dockerfile) has them built already.
 if [ "${SKIP_BUILD:-0}" != 1 ]; then cargo build --release -j 4 --bin industry --bin dataset; fi
+# COUNT_GATE=1 (the harness-image job): every workload counted by this library's engines beside V8, one round of the
+# least timing, each count checked against V8's by count-gate.py; nothing else runs.
+if [ "${COUNT_GATE:-0}" = 1 ]; then
+  export CORVUS_REGEX_TEXTS="$texts"
+  ./target/release/industry "$workloads" --engines corvus-utf8,corvus-utf16,v8 --v8 tools/benchmarks/v8/industry.mjs --rounds 1 --seconds 0.01 \
+    --passes 1 --out "$work/counts.json" 2> "$work/counts.log" || true
+  python3 tools/benchmarks/count-gate.py "$workloads" "$work/counts.json" corvus-utf8 corvus-utf16
+  exit $?
+fi
 ./target/release/dataset "$data" "$work/wrong-corvus.tsv" > "$work/compliance-corvus.txt" 2>&1 || true
 # V8=0 (the central run, for every image but one): no V8, whose counts the workloads carry (v8Count).
 v8=(--v8 tools/benchmarks/v8/industry.mjs)
