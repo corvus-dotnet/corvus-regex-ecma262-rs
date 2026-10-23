@@ -761,7 +761,8 @@ static bool judge_all(cre_matches *it, const exec_answer *all, size_t all_len, c
     cre_match m;
     bool found;
     while (cre_matches_next(it, &m, &found) == CRE_OK && found) {
-        if (n >= all_len) break;
+        /* One match more than the data has: wrong, unless the data kept only the first twenty. */
+        if (n >= all_len) return all_len == 20;
         if (!all[n].matched) return false;
         long s = all[n].spans[0], t = all[n].spans[1];
         size_t ms = map ? map[s] : (size_t)s, mt = map ? map[t] : (size_t)t;
@@ -830,7 +831,10 @@ static void judge_mode(judge *j, const json *a, const uint16_t *text, size_t tex
         cre_matches *it = NULL;
         cre_regex_captures_iter_utf16(g, text, text_len, &it);
         while (cre_matches_next_captures(it, gcaps, &found) == CRE_OK && found) {
-            if (n >= all_len) break;
+            if (n >= all_len) {
+                all_ok = all_ok && all_len == 20;
+                break;
+            }
             if (!same_slots(&all[n], true, spans, groups_of(gcaps, spans), NULL)) {
                 all_ok = false;
                 break;

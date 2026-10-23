@@ -551,7 +551,8 @@ fn judge_captures(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<Stri
                 let mut n = 0;
                 for (from, to) in found {
                     if n >= all.len() {
-                        break;
+                        // One match more than the data has: wrong, unless the data kept only the first twenty.
+                        return all.len() == 20;
                     }
                     let Some(e) = &all[n] else { return false };
                     let (s, t) = e[0].unwrap();
@@ -567,6 +568,7 @@ fn judge_captures(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<Stri
             let mut n = 0;
             for caps in g.captures_iter_utf16(text).map(Result::unwrap) {
                 if n >= all.len() {
+                    all_ok &= all.len() == 20;
                     break;
                 }
                 if !same_slots(&all[n], Some(&groups_of(&caps)), &identity) {
