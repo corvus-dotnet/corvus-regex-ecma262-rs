@@ -29,8 +29,9 @@ concurrency:
 jobs:
   version:
     name: The release to attach to
-    # A manual run from another branch must not publish that branch.
-    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
+    # A manual run from another branch must not publish that branch, and a harness release (a tag starting harness-)
+    # publishes the harness images alone.
+    if: (github.event_name == 'release' && !startsWith(github.event.release.tag_name, 'harness-')) || (github.event_name != 'release' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.check.outputs.tag }}

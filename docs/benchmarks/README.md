@@ -112,6 +112,13 @@ split written over its exec, each match given 2 seconds and 256 MB. QuickJS's co
 `tools/c/compliance-quickjs.txt`, since many patterns take libregexp to its limit and the run takes some tens of
 minutes (`QUICKJS_COMPLIANCE=1` works it out again).
 
+Both checked-in files, `tools/c/compliance-quickjs.txt` and `tools/benchmarks/compliance-regress.txt`, start with the
+commit of the test data they were made at (`data <commit>`), which the results scripts give the page as the
+compliance's `dataCommit`: the page judges the counts against what that commit asks, and says so when it is not the
+commit the night's run judged the other engines at. CI fails when a file's commit is not the one CI checks the data
+out at, so moving CI's pin means working both out again (a run with the data cloned writes the line itself), and
+releasing them as a harness release.
+
 The C image, `ghcr.io/corvus-dotnet/corvus-regex-ecma262-c` (`tools/c/Dockerfile`, published by
 `.github/workflows/c-harness-image.yml` as the Rust image is), has the same entry point contract, and the central site
 runs it as a source of its own:

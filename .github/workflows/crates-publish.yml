@@ -22,6 +22,8 @@ concurrency:
 
 jobs:
   publish:
+    # A harness release (a tag starting harness-) publishes the harness images alone.
+    if: ${{ !startsWith(github.event.release.tag_name, 'harness-') }}
     name: Publish corvus-regex-ecma262
     runs-on: ubuntu-latest
     timeout-minutes: 60

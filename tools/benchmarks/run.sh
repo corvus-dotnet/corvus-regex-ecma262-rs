@@ -60,7 +60,9 @@ else
 fi
 if [ "${REGRESS_COMPLIANCE:-0}" = 1 ]; then
   cp target/release/dataset "$work/dataset-regress"
-  "$work/dataset-regress" "$data" "$work/wrong-regress.tsv" --engine regress > "$work/compliance-regress.txt" 2>&1 || true
+  # The commit of the data, when it is a checkout, heads the counts ("data <commit>"), as the checked-in file's does.
+  { commit=$(git -C "$data/.." rev-parse HEAD 2>/dev/null) && echo "data $commit"
+    "$work/dataset-regress" "$data" "$work/wrong-regress.tsv" --engine regress 2>&1 || true; } > "$work/compliance-regress.txt"
 else
   cp tools/benchmarks/compliance-regress.txt "$work/compliance-regress.txt"
 fi
