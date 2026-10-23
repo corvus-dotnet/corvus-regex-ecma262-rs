@@ -882,7 +882,11 @@ impl Program {
     }
 
     /// The search of a pattern each of whose matches is runs of the loops' sets, then the literal: the runs before
-    /// each occurrence are walked back to the earliest start, the only one tried for it.
+    /// each occurrence are walked back to the earliest start, which is tried. From that start the loops reach every
+    /// place a later start of the run could, so the later starts fail with it; the occurrence itself is not in the run
+    /// and may start a match, so it is tried next where every loop may be empty, and is the floor for the walk back
+    /// from later occurrences otherwise. A start before an occurrence can reach a later one through it (the literal
+    /// can be in a loop's set), so an occurrence ruled out does not move the floor.
     #[allow(clippy::too_many_arguments)]
     fn search_after_loops<T: Text>(
         &self,
@@ -899,15 +903,18 @@ impl Program {
         let bytes = T::bytes(input);
         let units = self.units;
         let mut next = start;
-        let mut tried: Option<usize> = None;
+        // The floor below which no start is tried again.
+        let mut low = start;
+        let all_empty = mins.iter().all(|&m| m == 0);
         'occurrences: loop {
             let q = literals.find(bytes, next, T::UTF8)?;
-            next = q + T::read(input, q, units).1;
+            let width = T::read(input, q, units).1;
+            next = q + width;
             // A loop that needs a member must have one just before the occurrence: a test of one character, made
             // before the rest is checked.
             let last = sets.len() - 1;
             if mins[last] == 1
-                && (q <= start || {
+                && (q <= low || {
                     let c: u32 = input[q - 1].into();
                     let r = if c < 0x80 { c as Rune } else { T::read_last(input, q, units).0 };
                     !sets[last].contains(r)
@@ -921,10 +928,10 @@ impl Program {
             let mut s = q;
             for k in (0..sets.len()).rev() {
                 let run_end = s;
-                while s > start {
+                while s > low {
                     let c: u32 = input[s - 1].into();
                     let (r, w) = if c < 0x80 { (c as Rune, 1) } else { T::read_last(input, s, units) };
-                    if !sets[k].contains(r) || s - w < start {
+                    if !sets[k].contains(r) || s - w < low {
                         break;
                     }
                     s -= w;
@@ -932,9 +939,6 @@ impl Program {
                 if mins[k] == 1 && s == run_end {
                     continue 'occurrences;
                 }
-            }
-            if tried.is_some_and(|t| s <= t) {
-                continue;
             }
             if len - s < need {
                 return None;
@@ -945,7 +949,24 @@ impl Program {
             if st.stop != STOP_NONE {
                 return None;
             }
-            tried = Some(s);
+            if s < q {
+                // The occurrence itself (\b[0-9a-f]*\u{e9}t over "0a\u{e9}t", where the walk back gives 0).
+                low = q;
+                if all_empty {
+                    if len - q < need {
+                        return None;
+                    }
+                    if self.try_at::<T>(st, input, q) {
+                        return Some((q, st.end));
+                    }
+                    if st.stop != STOP_NONE {
+                        return None;
+                    }
+                    low = next;
+                }
+            } else {
+                low = next;
+            }
             if sets.len() == 1 {
                 // Every occurrence in the rest of the loop's run walks back to the start just tried.
                 next = next.max(self.end_of_run::<T>(&sets[0], input, q));

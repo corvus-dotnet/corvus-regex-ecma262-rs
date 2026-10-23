@@ -1233,7 +1233,9 @@ pub(crate) fn plan(root: &Node, backrefs: bool, first: Option<&CharSet>, units: 
     if backrefs {
         return search;
     }
-    // Loops with no upper bound, then a literal: leading \b allowed when the first loop's set is of word characters.
+    // Loops with no upper bound, then a literal: leading \b allowed when every loop's set is of word characters (a
+    // later start of the runs can be in any loop's run, where \b holds after a word character before a member that
+    // is not one: \b\d*\s*a over " a"), and the sets must share no character, any two of them.
     let mut k = usize::from(boundary);
     let mut sets: Vec<Arc<CharSet>> = Vec::new();
     let mut mins = Vec::new();
@@ -1243,9 +1245,10 @@ pub(crate) fn plan(root: &Node, backrefs: bool, first: Option<&CharSet>, units: 
         k += 1;
     }
     if !sets.is_empty() {
-        let word_set = sets[0].ranges.last().is_some_and(|&l| l < 0x80)
-            && (0..0x80u8).all(|c| !sets[0].has_ascii(c) || is_word_byte(c));
-        let disjoint = sets.windows(2).all(|w| w[0].intersect(&w[1]).is_empty());
+        let word_set = sets.iter().all(|set| {
+            set.ranges.last().is_some_and(|&l| l < 0x80) && (0..0x80u8).all(|c| !set.has_ascii(c) || is_word_byte(c))
+        });
+        let disjoint = sets.iter().enumerate().all(|(a, x)| sets[a + 1..].iter().all(|y| x.intersect(y).is_empty()));
         let mut chars = Vec::new();
         let literal_at = k;
         while let Some(f) = ts.get(k).and_then(|t| forms(t)) {
