@@ -13,6 +13,7 @@
  * is matched as UTF-16 alone. Records marked v8_deviation are left out. Any difference from V8 is a wrong answer; a
  * refusal of a valid pattern, an acceptance of an invalid one, and a match that reaches its limit are counted apart
  * and listed too. captures.jsonl is judged on exec, the global search, the sticky flag, replace and split.
+ * ill-formed-utf8.jsonl holds bytes that are not UTF-8, which the C library must refuse with CRE_INVALID_UTF8.
  *
  * The C library is judged through its own functions for each of them, over UTF-16 and UTF-8. libregexp has exec
  * alone, over UTF-16 alone (it has no UTF-8 interface), so for it the runner is the caller, as QuickJS's own
@@ -227,7 +228,8 @@ static bool same_split(const json *expected, const piece16 *got, size_t n) {
 /* ------------------------------------------------------------------------------------------------------------------
  * The engine judged on the answers of test: compile, and test over UTF-16 and (where it has it) UTF-8. */
 
-typedef enum { TEST_NO = 0, TEST_YES = 1, TEST_LIMIT = -1, TEST_ERROR = -2 } test_result;
+/* TEST_REFUSED: the text is not UTF-8, and the engine said so (the right answer in ill-formed-utf8.jsonl). */
+typedef enum { TEST_NO = 0, TEST_YES = 1, TEST_LIMIT = -1, TEST_ERROR = -2, TEST_REFUSED = -3 } test_result;
 
 #ifndef DATASET_QUICKJS
 
@@ -273,6 +275,7 @@ static void engine_free(engine_re *re) { cre_regex_free(re); }
 
 static test_result test_status(cre_status status, bool matched, const char **why) {
     if (status == CRE_OK) return matched ? TEST_YES : TEST_NO;
+    if (status == CRE_INVALID_UTF8) return TEST_REFUSED;
     if (status == CRE_MATCH_LIMIT) {
         char *m = message_copy();
         *why = strstr(m, "memory") ? "memory" : "time";
@@ -612,6 +615,85 @@ static void judge_tests(const char *name, const json *r, const json *pattern, co
                 }
                 lines_push(w, &b);
             }
+        }
+        engine_free(re);
+    }
+    free(shown.p);
+    free(flags);
+}
+
+/* A record of ill-formed-utf8.jsonl: under each grammar the pattern is valid in, each test's bytes, which are not
+ * UTF-8, are one answer over UTF-8, and the right one is a refusal (CRE_INVALID_UTF8). An engine with no UTF-8
+ * interface is asked nothing. */
+static void judge_ill_formed(const json *r, const json *pattern, const options *o, counts *c, lines *w) {
+    if (!o->utf8 || !ENGINE_HAS_UTF8) return;
+    const char *name = "ill-formed-utf8.jsonl";
+    const json *flags_j = json_string(json_get(r, "flags"));
+    size_t flags_len;
+    char *flags = utf16_to_utf8_lossy(flags_j ? flags_j->units : NULL, flags_j ? flags_j->len : 0, &flags_len);
+    sbuf shown = {0};
+    sb_shown(&shown, pattern);
+    mode modes[3];
+    size_t mode_count = modes_of(r, modes);
+    const json *tests = json_get(r, "tests");
+    for (size_t m = 0; m < mode_count; m++) {
+        char mode_flags[32];
+        snprintf(mode_flags, sizeof mode_flags, "%s%s", flags, modes[m].suffix);
+        bool is_error;
+        char *message;
+        engine_re *re = engine_compile(pattern->units, pattern->len, mode_flags, &is_error, &message);
+        sbuf b = {0};
+        if (!re) {
+            if (is_error) c->errors++;
+            if (modes[m].valid) {
+                c->refused++;
+                sb_printf(&b, "REFUSED\t%s\t/%s/%s\t", name, shown.p ? shown.p : "", mode_flags);
+                sb_first_line(&b, message);
+                lines_push(w, &b);
+            }
+            free(message);
+            continue;
+        }
+        if (!modes[m].valid) {
+            c->accepted++;
+            sb_printf(&b, "ACCEPTED-INVALID\t%s\t/%s/%s", name, shown.p ? shown.p : "", mode_flags);
+            lines_push(w, &b);
+            engine_free(re);
+            continue;
+        }
+        for (size_t t = 0; tests && tests->kind == JSON_ARRAY && t < tests->len; t++) {
+            const json *hex = json_string(json_get(&tests->items[t], "bytes"));
+            if (!hex) continue;
+            size_t len = hex->len / 2;
+            char *bytes = malloc(len + 1);
+            for (size_t k = 0; k < len; k++) {
+                char pair[3] = {(char)hex->units[2 * k], (char)hex->units[2 * k + 1], 0};
+                bytes[k] = (char)strtol(pair, NULL, 16);
+            }
+            const char *why = "";
+            test_result result = engine_test8(re, bytes, len, &why);
+            free(bytes);
+            if (result == TEST_REFUSED) {
+                c->right++;
+                continue;
+            }
+            if (result == TEST_YES || result == TEST_NO) {
+                c->wrong++;
+                sb_printf(&b, "WRONG\t%s\t/%s/%s\t", name, shown.p ? shown.p : "", mode_flags);
+                sb_escape(&b, hex->units, hex->len);
+                sb_printf(&b, "\tutf8\tread as UTF-8 (%s), not refused", result == TEST_YES ? "matched" : "no match");
+            } else if (result == TEST_ERROR) {
+                c->errors++;
+                sb_printf(&b, "ERROR\t%s\t/%s/%s\t", name, shown.p ? shown.p : "", mode_flags);
+                sb_escape(&b, hex->units, hex->len);
+                sb_printf(&b, "\tutf8\t%s", why);
+            } else {
+                c->limited++;
+                sb_printf(&b, "LIMIT\t%s\t/%s/%s\t", name, shown.p ? shown.p : "", mode_flags);
+                sb_escape(&b, hex->units, hex->len);
+                sb_printf(&b, "\tutf8\t%s", why);
+            }
+            lines_push(w, &b);
         }
         engine_free(re);
     }
@@ -1156,6 +1238,10 @@ static void judge_record(const char *name, const json *r, const options *o, coun
     if (!pattern) return;
     if (strcmp(name, "captures.jsonl") == 0) {
         if (o->utf16) judge_captures(r, pattern, c, w);
+        return;
+    }
+    if (strcmp(name, "ill-formed-utf8.jsonl") == 0) {
+        judge_ill_formed(r, pattern, o, c, w);
         return;
     }
     judge_tests(name, r, pattern, o, c, w);

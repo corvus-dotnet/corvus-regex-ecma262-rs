@@ -8,7 +8,9 @@
 //! UTF-8 form and is matched as UTF-16 alone. Records marked v8_deviation are left out. Any difference from V8 is a
 //! wrong answer; a refusal of a valid pattern, an acceptance of an invalid one, and a match that reaches its limit are
 //! counted apart and listed too. `captures.jsonl` is judged on exec, the global search, the sticky flag, replace and
-//! split, as the .NET runner of the reference engine judges it.
+//! split, as the .NET runner of the reference engine judges it. `ill-formed-utf8.jsonl` holds bytes that are not
+//! UTF-8, whose right answer over UTF-8 is a refusal: a `str` cannot hold them, so the bytes are refused where they
+//! would become one, before the engine, as a program that uses it refuses them (both engines take a `str`).
 //!
 //! The judging rules are those of `Corvus.Regex.Ecma262.DatasetRunner`, the runner of the .NET engine.
 //!
@@ -279,6 +281,15 @@ impl Engine for Regress {
 
 fn judge_record(name: &str, r: &Json, options: &Options, counts: &Counts, wrong: &mut Vec<String>) {
     let pattern = r.get("pattern").and_then(Json::as_string).unwrap();
+    if name == "ill-formed-utf8.jsonl" {
+        if options.utf8 {
+            match options.engine {
+                EngineKind::Corvus => judge_ill_formed::<Corvus>(r, &pattern, counts, wrong),
+                EngineKind::Regress => judge_ill_formed::<Regress>(r, &pattern, counts, wrong),
+            }
+        }
+        return;
+    }
     if name == "captures.jsonl" {
         if options.utf16 {
             match options.engine {
@@ -362,6 +373,48 @@ fn judge_tests<E: Engine>(
             if options.utf8 && !has_lone_surrogate(text) {
                 let s = String::from_utf16(text).unwrap();
                 check("utf8", E::test_utf8(&re, &s));
+            }
+        }
+    }
+}
+
+/// Judges a record of `ill-formed-utf8.jsonl`: under each grammar the pattern is valid in, each test's bytes are one
+/// answer over UTF-8, and the right one is a refusal of them as UTF-8.
+fn judge_ill_formed<E: Engine>(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<String>) {
+    let name = "ill-formed-utf8.jsonl";
+    let flags = r.get("flags").and_then(Json::as_string).unwrap();
+    let shown = escape(&pattern.encode_utf16().collect::<Vec<u16>>());
+    for (suffix, _, expected_valid) in modes(r) {
+        let mode_flags = format!("{flags}{suffix}");
+        let re = match std::panic::catch_unwind(|| E::compile(pattern, &mode_flags)) {
+            Ok(Ok(re)) => re,
+            _ => {
+                if expected_valid {
+                    counts.refused.fetch_add(1, Ordering::Relaxed);
+                    wrong.push(format!("REFUSED\t{name}\t/{shown}/{mode_flags}"));
+                }
+                continue;
+            }
+        };
+        if !expected_valid {
+            counts.accepted.fetch_add(1, Ordering::Relaxed);
+            wrong.push(format!("ACCEPTED-INVALID\t{name}\t/{shown}/{mode_flags}"));
+            continue;
+        }
+        for t in r.get("tests").and_then(Json::as_array).unwrap_or(&[]) {
+            let hex = t.get("bytes").and_then(Json::as_string).unwrap();
+            let bytes: Vec<u8> =
+                (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+            match std::str::from_utf8(&bytes) {
+                Err(_) => {
+                    counts.right.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(s) => {
+                    // Not reached with the data, whose bytes are never UTF-8; were they, the engine would answer.
+                    let got = E::test_utf8(&re, s);
+                    counts.wrong.fetch_add(1, Ordering::Relaxed);
+                    wrong.push(format!("WRONG\t{name}\t/{shown}/{mode_flags}\t{hex}\tutf8\tread as UTF-8: {got:?}"));
+                }
             }
         }
     }
@@ -732,6 +785,11 @@ fn answers_of(name: &str, r: &Json, utf8: bool) -> i64 {
     }
     let Some(tests) = r.get("tests").and_then(Json::as_array) else { return 0 };
     let valid = r.get("valid").unwrap();
+    if name == "ill-formed-utf8.jsonl" {
+        let grammars =
+            modes(r).iter().filter(|(_, mode, _)| valid.get(mode).and_then(Json::as_bool) == Some(true)).count();
+        return if utf8 { (grammars * tests.len()) as i64 } else { 0 };
+    }
     let mut n = 0;
     for t in tests {
         if t.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
