@@ -18,7 +18,7 @@ Each engine that claims ECMA-262 carries its compliance over the ECMA-262 test d
 data-set runner: the C library's and QuickJS's by tools/c/dataset.c (built as dataset and dataset-quickjs), V8's by
 tools/benchmarks/v8/dataset.mjs. PCRE2 does not claim it, and carries "not ECMA-262".
 """
-import argparse, json, os, re
+import argparse, json, os, re, sys
 
 
 def failure(r):
@@ -58,15 +58,36 @@ workloads = json.load(open(args.workloads or os.path.join(root, "tools", "benchm
 ids = [w["id"] for w in workloads]
 
 
+def read_counts(path):
+    """The lines of a data-set runner's output and the counts of its last line of counts, or None, with a warning on
+    stderr, when the output cannot be read or that line is missing or lacks a count. That happens when the runner
+    failed, or when a checked-in file is missing or malformed. The engine is then written without a compliance, so a
+    fault in the compliance step costs that engine its compliance and never costs the run its figures, which have all
+    been timed by the time this runs."""
+    try:
+        text = open(path, encoding="utf-8").read().splitlines()
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"warning: {path} could not be read ({e}), so its engine is written without a compliance", file=sys.stderr)
+        return None
+    lines = [l for l in text if l.startswith("records ")]
+    c = {k: int(v) for k, v in re.findall(r"(right|wrong|refused-valid|accepted-invalid|limit|errors) (\d+)", lines[-1])} \
+        if lines else {}
+    missing = [k for k in ("right", "wrong", "refused-valid", "accepted-invalid") if k not in c]
+    if missing:
+        what = "has no line of counts" if not lines else f"has no {', '.join(missing)} in its line of counts"
+        print(f"warning: {path} {what}, so its engine is written without a compliance", file=sys.stderr)
+        return None
+    return text, c
+
+
 def compliance(path, note=None):
     """The counts of a data-set runner's last line of counts. Every answer the engine never gave (a limit, a crash, a
     hang or a worker that gave up) is in `limited`, as the judging rule of the test data counts it: the runner's
-    limit and errors."""
-    text = open(path, encoding="utf-8").read().splitlines()
-    lines = [l for l in text if l.startswith("records ")]
-    if not lines:
-        raise SystemExit(f"{path} has no line of counts")
-    c = {k: int(v) for k, v in re.findall(r"(right|wrong|refused-valid|accepted-invalid|limit|errors) (\d+)", lines[-1])}
+    limit and errors. None when the counts cannot be read (read_counts)."""
+    read = read_counts(path)
+    if read is None:
+        return None
+    text, c = read
     out = {"right": c["right"], "wrong": c["wrong"], "refused": c["refused-valid"], "acceptedInvalid": c["accepted-invalid"],
            "limited": c.get("limit", 0) + c.get("errors", 0)}
     # Counts checked in beside the harness name the commit of the test data they were made at on their first line
@@ -156,7 +177,8 @@ data = {
         "barLegend": "median of the passes", "whiskerLegend": "whisker: the fastest and the slowest pass",
     },
     "measures": {"time": {"label": "Time", "long": "time per count", "parts": ["time"]}},
-    "impls": [{"id": name, "name": name, "group": group, "version": version, "compliance": c} for _, name, group, version, c in ENGINES],
+    "impls": [{"id": name, "name": name, "group": group, "version": version, **({"compliance": c} if c is not None else {})}
+              for _, name, group, version, c in ENGINES],
     "schemas": [{"name": w, "note": ("counts differ: " + differs[w]) if w in differs else "",
                  "meta": [["text", TEXTS.get(w.split(":")[0], w.split(":")[0])]]} for w in ids],
     "results": results,

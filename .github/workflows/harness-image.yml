@@ -54,6 +54,33 @@ jobs:
             assert c == "not ECMA-262" or {"right", "wrong", "refused", "acceptedInvalid", "limited"} <= set(c), (i["name"], c)
         print("smoke run wrote", len(impls), "engines over", len(schemas), "workloads")
         PY
+    - name: "Night run: the same two workloads with V8=0, each count checked against the workloads' v8Count"
+      # The central site runs this image with V8=0, so that V8 is timed once a night, and each engine's count is checked
+      # against the v8Count it writes into the workloads. The steps above never take that path. Here zqj carries its true
+      # count (0) and aei a wrong one (999), since no engine finds aei in the text and every engine counts 0 there. The data
+      # file must have no V8 row, every ECMA-262 engine must time zqj and give aei as a wrong count, and every engine of
+      # another dialect keeps its figure on aei.
+      run: |
+        python3 -c "import json; w=json.load(open('workloads.json')); [x.update(v8Count={'sherlock: zqj': 0, 'sherlock: aei': 999}[x['id']]) for x in w]; json.dump(w, open('workloads-night.json','w'), ensure_ascii=False)"
+        mkdir -p out-night && chmod 777 out-night
+        docker run --rm -e JOB=short -e V8=0 -v "$PWD/workloads-night.json:/workloads.json:ro" -v "$PWD/texts:/texts:ro" -v "$PWD/out-night:/out" harness
+        python3 - <<'PY'
+        import json
+        d = json.load(open("out-night/industry.json"))
+        names = [i["name"] for i in d["impls"]]
+        assert not any(i.get("group") == "V8" or i["name"] == "V8" for i in d["impls"]), names
+        ecma = [i["name"] for i in d["impls"] if isinstance(i.get("compliance"), dict)]
+        others = [i["name"] for i in d["impls"] if i.get("compliance") == "not ECMA-262"]
+        assert ecma and len(ecma) + len(others) == len(names), names
+        for name in ecma:
+            zqj, aei = d["results"][name].get("sherlock: zqj"), d["results"][name].get("sherlock: aei")
+            assert isinstance(zqj, dict) and "time" in zqj, (name, zqj)
+            assert aei == {"wrongCount": {"counted": 0, "v8": 999}}, (name, aei)
+        for name in others:
+            aei = d["results"][name].get("sherlock: aei")
+            assert isinstance(aei, dict) and "time" in aei, (name, aei)
+        print("night run: no V8 row;", len(ecma), "ECMA-262 engines held to v8Count;", len(others), "others kept their figures")
+        PY
     - name: "Count gate: every workload counted by this library beside V8, each count V8's"
       # A count that differs from V8's is a wrong answer, which the central page shows as a wrong count: it fails here,
       # on the pull request (tools/benchmarks/count-gate.py, run by run.sh with COUNT_GATE=1).
