@@ -64,9 +64,21 @@ if [ "${REGRESS_COMPLIANCE:-0}" = 1 ]; then
   { commit=$(git -C "$data/.." rev-parse HEAD 2>/dev/null) && echo "data $commit"
     "$work/dataset-regress" "$data" "$work/wrong-regress.tsv" --engine regress 2>&1 || true; } > "$work/compliance-regress.txt"
 else
-  cp tools/benchmarks/compliance-regress.txt "$work/compliance-regress.txt"
+  cp tools/benchmarks/compliance-regress.txt "$work/compliance-regress.txt" 2>/dev/null || true
 fi
-tail -n 1 "$work/compliance-corvus.txt" $([ -f "$work/compliance-v8.txt" ] && echo "$work/compliance-v8.txt") "$work/compliance-regress.txt"
+# Each runner's line of counts, as the results script reads it. A runner that failed, or a checked-in count file that is
+# missing or malformed, has none. The timing still runs and the results script writes that engine without a compliance,
+# so the night keeps every figure, and this says in its log why the engine has no compliance.
+for name in corvus regress $([ -f "$work/compliance-v8.txt" ] && echo v8); do
+  f="$work/compliance-$name.txt"
+  last="$(tail -n 1 "$f" 2>/dev/null || true)"
+  if [[ "$last" == records\ * ]]; then
+    echo "$name: $last"
+  else
+    echo "WARNING: compliance-$name.txt $([ -f "$f" ] && echo 'has no line of counts' || echo 'is missing'), so $name has no compliance in this run's data file"
+    if [ -f "$f" ]; then tail -n 20 "$f" | sed 's/^/  /'; fi
+  fi
+done
 if [ "${SETTLE:-0}" -gt 0 ]; then
   echo "settling for $SETTLE s"
   sleep "$SETTLE"
