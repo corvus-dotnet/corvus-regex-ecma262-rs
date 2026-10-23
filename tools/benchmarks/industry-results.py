@@ -62,12 +62,17 @@ def compliance(path, note=None):
     """The counts of a data-set runner's last line of counts. Every answer the engine never gave (a limit, a crash, a
     hang or a worker that gave up) is in `limited`, as the judging rule of the test data counts it: the runner's
     limit and errors."""
-    lines = [l for l in open(path, encoding="utf-8").read().splitlines() if l.startswith("records ")]
+    text = open(path, encoding="utf-8").read().splitlines()
+    lines = [l for l in text if l.startswith("records ")]
     if not lines:
         raise SystemExit(f"{path} has no line of counts")
     c = {k: int(v) for k, v in re.findall(r"(right|wrong|refused-valid|accepted-invalid|limit|errors) (\d+)", lines[-1])}
     out = {"right": c["right"], "wrong": c["wrong"], "refused": c["refused-valid"], "acceptedInvalid": c["accepted-invalid"],
            "limited": c.get("limit", 0) + c.get("errors", 0)}
+    # Counts checked in beside the harness name the commit of the test data they were made at on their first line
+    # ("data <commit>"): the page judges them against what that commit asks.
+    if text and text[0].startswith("data ") and len(text[0].split()) == 2:
+        out["dataCommit"] = text[0].split()[1]
     if note:
         out["note"] = note
     return out

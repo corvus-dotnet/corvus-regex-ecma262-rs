@@ -52,6 +52,22 @@ jobs:
         ref: 2b32a261928e80e830d9db9587c675a336989689
         path: ecma262-regex-test-data
         persist-credentials: false
+    - name: The checked-in counts were made at this commit of the test data
+      # The counts of an engine too slow to judge every night are checked in beside the harness, their first line the
+      # commit of the data they were made at; the benchmark page judges them against that commit. Moving the pin above
+      # means working them out again (docs/benchmarks/README.md), so they cannot fall behind it unnoticed.
+      if: runner.os == 'Linux'
+      run: |
+        pin=$(git -C ecma262-regex-test-data rev-parse HEAD)
+        fail=0
+        for f in $(git ls-files | grep -E '(^|/)compliance-[^/]*\.txt$'); do
+          first=$(head -n 1 "$f")
+          if [ "$first" != "data $pin" ]; then
+            echo "::error file=$f::$f says '$first', not the data CI checks out ($pin): work its counts out again at that commit."
+            fail=1
+          fi
+        done
+        exit $fail
     - name: Probe for stack overflows
       # Deep, wide and long patterns in every grammar through every member, each in a process of its own on stacks
       # of 8 MB, 1 MB and 256 KB: none may end the process (tools/src/bin/stack-probe.rs).

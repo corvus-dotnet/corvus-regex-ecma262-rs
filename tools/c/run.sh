@@ -54,7 +54,9 @@ else
   node tools/benchmarks/v8/dataset.mjs "$data" > "$work/compliance-v8.txt" 2>&1 || true
 fi
 if [ "${QUICKJS_COMPLIANCE:-0}" = 1 ]; then
-  "$bin/dataset-quickjs" "$data" "$work/wrong-quickjs.tsv" > "$work/compliance-quickjs.txt" 2>&1 || true
+  # The commit of the data, when it is a checkout, heads the counts ("data <commit>"), as the checked-in file's does.
+  { commit=$(git -C "$data/.." rev-parse HEAD 2>/dev/null) && echo "data $commit"
+    "$bin/dataset-quickjs" "$data" "$work/wrong-quickjs.tsv" 2>&1 || true; } > "$work/compliance-quickjs.txt"
 else
   cp tools/c/compliance-quickjs.txt "$work/compliance-quickjs.txt"
 fi

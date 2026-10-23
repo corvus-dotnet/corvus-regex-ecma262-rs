@@ -201,6 +201,12 @@ release's tag, which the central benchmark page runs from that night. A tag that
 publish. `capi-publish.yml` can also be run by hand with a tag, to attach the archives to a release made before it
 existed; it refuses when the engine's sources have changed since that tag.
 
+A change to the benchmark harness alone (the harness, a Dockerfile, a runner, or another engine's checked-in counts)
+needs no version: it is a harness release, `gh release create harness-<version>.<n> --latest=false` (for example
+`harness-0.2.1.1`). Only the two image workflows run for it; `crates-publish.yml` and `capi-publish.yml` skip a tag
+that starts `harness-`, and the repository's Latest stays the crate's release. The central page takes each image at
+the newest release of either kind.
+
 ## Licence
 
 Apache-2.0. See [LICENSE](LICENSE).
