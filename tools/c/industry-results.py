@@ -76,14 +76,14 @@ for key, name, _, _, _ in ENGINES:
         r = rows.get(w)
         if r is None:
             continue
-        results[name][w] = None if "error" in r else {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}}
+        results[name][w] = ({"limit": r["limit"]} if "limit" in r else None) if "error" in r else {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}}
 if v8:
     v8_name = "V8"
     ENGINES.append(("v8", v8_name, "V8", v8["engine"], compliance(args.compliance_v8)))
     results[v8_name] = {}
     for w in ids:
         r = v8["results"].get(w)
-        results[v8_name][w] = {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}} if r and "error" not in r else None
+        results[v8_name][w] = {"time": {"median": r["median"], "min": r["min"], "max": r["max"]}} if r and "error" not in r else ({"limit": r["limit"]} if r and "limit" in r else None)
 # Where PCRE2 counts otherwise than V8 (the oracle), the row says so; an ECMA-262 engine that does is an error above.
 differs = {w: r["differs"] for w, r in run["results"].get("pcre2", {}).items() if isinstance(r, dict) and "differs" in r}
 
