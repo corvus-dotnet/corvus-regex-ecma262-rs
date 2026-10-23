@@ -1,8 +1,8 @@
 # The C benchmark harness image (tools/c/Dockerfile): built and smoke-run on every pull request, every push to main and
 # every release, and published to ghcr.io/corvus-dotnet/corvus-regex-ecma262-c (`:latest` from main, the release's tag
 # from a release). This repository publishes no benchmark results of its own: the central benchmark site
-# (https://corvus-oss.org/corvus-regex-ecma262-benchmarks/) runs this image each night on its runner, beside every other
-# Corvus ECMA-262 engine, and is the one page of figures.
+# (https://corvus-oss.org/corvus-regex-ecma262-benchmarks/) runs this image each night on its runner, beside
+# the engines of every other source, and is the one page of figures.
 name: c-harness-image
 on:
   push:
