@@ -20,8 +20,8 @@ its C library, for any language that calls C.
   hang.
 
 **Compliance.** Over the [ECMA-262 test data](https://github.com/corvus-dotnet/ecma262-regex-test-data) (what V8
-says about 117,889 patterns and 5,884,566 texts, test262's and `exec`, the global search, `replace` and `split` among
-them, and texts of bytes that are not UTF-8), the crate gives 26,953,709 right answers and none wrong, refuses no
+says about 123,087 patterns and 6,056,699 texts, test262's and `exec`, the global search, `replace` and `split` among
+them, and texts of bytes that are not UTF-8), the crate gives 29,289,554 right answers and none wrong, refuses no
 valid pattern, accepts no invalid one and reaches no limit, over UTF-8 and over UTF-16. (A `str` cannot hold bytes
 that are not UTF-8, so those are refused before they reach the crate, as the data asks.) CI runs the whole data on every change.
 
