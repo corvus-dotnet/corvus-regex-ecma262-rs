@@ -49,7 +49,7 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         repository: corvus-dotnet/ecma262-regex-test-data
-        ref: e3aca31c962f81602daaad5abd38a1ed80e263ac
+        ref: 2b32a261928e80e830d9db9587c675a336989689
         path: ecma262-regex-test-data
         persist-credentials: false
     - name: Probe for stack overflows
