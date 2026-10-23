@@ -1933,3 +1933,49 @@ fn a_literal_with_a_rare_byte_is_found_as_any_other() {
         }
     }
 }
+
+/// The faults the start-searches family of the test data and its fuzzer (fuzz.js there) found, each pattern over the
+/// text that showed it: the search must find the matches the plain search finds, over UTF-8 and over UTF-16.
+#[test]
+fn searches_find_the_starts_the_fuzzer_found() {
+    let cases: &[(&str, &str, &str)] = &[
+        (r"\b\w+n\b", "", "a nation"),
+        (r"\b\w+n\b", "", "an nation nn nan noon"),
+        (r"\w+\s+Holmes", "", "Holmes Holmes"),
+        (r"\b\d*\s*a\b", "", " a"),
+        (r"\b\d*\W*x\b", "s", " \u{e9}\u{e9}x"),
+        (r"\b\d*\W*x", "", "a1 x"),
+        (r"\b\d*\W+\w+ab", "", "ab0 aab"),
+        (r"\b\w*[\u{1F600}-\u{1F64F}]*S\B", "u", "\u{1F600}S_n\u{1F600}S"),
+        (r"\W+[a-z]*\W*a", "m", " a"),
+        (r"[a-zéè]+\d*[a-z]+on", "i", " ONaON"),
+        (r"\w+?[^\w\s]*\d+?n", "im", "000n"),
+        (r"\w*\W+-$", "", " a\u{a0}-a--"),
+        (r"\w*[^\w\s]+k$", "", "---_-ka.k"),
+        (r"\b[0-9a-f]*ét", "", "\n\u{e9}t0a\u{e9}t"),
+        (r".{1,3}(?:on|\.).", "", "\u{1F600}\u{1F600}\u{1F600}ona on"),
+        (r"\b[^\n]{1,3}(?:k|\.)\b", "im", "k \u{1F600}nk"),
+        (r"[^\n]{1,3}(?:é|a)", "", "\u{4e2d}\u{4e2d}\u{4e2d}a"),
+        (r"\B[^\w\s]{1,3}(?:a|n)", "", "a\u{1F600}a"),
+    ];
+    for &(pattern, flags, text) in cases {
+        for mode in ["", "u"] {
+            let flags = format!("{flags}{mode}");
+            let Ok(searched) = Regex::new(pattern, &flags) else { continue };
+            super::search::NO_SEARCH.with(|n| n.set(true));
+            let plain = Regex::new(pattern, &flags).unwrap();
+            super::search::NO_SEARCH.with(|n| n.set(false));
+            let f: Vec<(usize, usize)> =
+                searched.find_iter(text).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
+            let g: Vec<(usize, usize)> =
+                plain.find_iter(text).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
+            assert_eq!(f, g, "/{pattern}/{flags} on {text:?} over UTF-8");
+            let t16: Vec<u16> = text.encode_utf16().collect();
+            let f: Vec<(usize, usize)> =
+                searched.find_iter_utf16(&t16).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
+            let g: Vec<(usize, usize)> =
+                plain.find_iter_utf16(&t16).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
+            assert_eq!(f, g, "/{pattern}/{flags} on {text:?} over UTF-16");
+        }
+    }
+}
