@@ -1,0 +1,20 @@
+version: 2
+updates:
+# The harness image's base images, pinned by digest: one grouped pull request a month moves them, so that an engine's
+# version (a compiler, a runtime, a library from the base image) changes only by a merge.
+- package-ecosystem: docker
+  directory: /
+  schedule:
+    interval: monthly
+  groups:
+    base-images:
+      patterns: ["*"]
+# The harness image's base images, pinned by digest: one grouped pull request a month moves them, so that an engine's
+# version (a compiler, a runtime, a library from the base image) changes only by a merge.
+- package-ecosystem: docker
+  directory: /tools/c
+  schedule:
+    interval: monthly
+  groups:
+    base-images:
+      patterns: ["*"]
