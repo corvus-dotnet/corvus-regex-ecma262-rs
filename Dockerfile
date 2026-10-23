@@ -1,5 +1,5 @@
-# The benchmark harness as an image: this crate built in release, its competitors (regex, regress) and Node 24 for the
-# V8 rows, with tools/benchmarks/run.sh as the entry point. The whole invocation is
+# The benchmark harness as an image: this crate built in release, the other Rust engines (regex, regress) and Node
+# 24 for the V8 rows, with tools/benchmarks/run.sh as the entry point. The whole invocation is
 #
 #   docker run --rm -v <workloads.json>:/workloads.json:ro -v <texts dir>:/texts:ro -v <out dir>:/out <image>
 #

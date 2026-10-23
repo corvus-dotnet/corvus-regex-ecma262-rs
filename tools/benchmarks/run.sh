@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The benchmark harness, which the central benchmark site runs each night (as the image, Dockerfile) and anyone can run: it
-# builds the engine and its competitors, works out the compliance of each ECMA-262 engine over the test data, runs
+# builds this engine and the other Rust engines, works out the compliance of each ECMA-262 engine over the test data, runs
 # every engine over the Industry workloads, and writes the run's one data file in the results page's shape.
 #
 #   tools/benchmarks/run.sh <workloads.json> <texts directory> <out.json> [test data directory]
