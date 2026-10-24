@@ -380,6 +380,7 @@ static WRITTEN: Mutex<([i64; 6], usize)> = Mutex::new(([0; 6], 0));
 
 /// The clock answers are timed by: the CPU time of the thread that runs regress where the system gives it (set by
 /// `use_thread_clock` on that thread), else the time since BASE; in nanoseconds plus one.
+#[cfg(target_os = "linux")]
 static CLOCK: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 #[cfg(target_os = "linux")]
