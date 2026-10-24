@@ -51,7 +51,7 @@ jobs:
                 assert d["results"][name].get(w), (name, w)
         for i in d["impls"]:
             c = i["compliance"]
-            assert c == "not ECMA-262" or {"right", "wrong", "refused", "acceptedInvalid", "limited"} <= set(c), (i["name"], c)
+            assert c == "not ECMA-262" or {"right", "wrong", "refused", "acceptedInvalid", "limited", "judge", "excludes"} <= set(c), (i["name"], c)
         print("smoke run wrote", len(impls), "engines over", len(schemas), "workloads")
         PY
     - name: "Night run: the same two workloads with V8=0, each count checked against the workloads' v8Count"

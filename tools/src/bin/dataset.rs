@@ -1,6 +1,7 @@
 //! Runs an engine over the ECMA-262 regular expression test data (github.com/corvus-dotnet/ecma262-regex-test-data).
 //!
 //!   dataset <data directory> <wrong-cases output file> [file filter] [utf16|utf8|both] [--engine corvus|regress]
+//!           [--compliance <file>]
 //!
 //! Each record is asked about under each grammar V8 found it valid in: the record's flags with u added (the
 //! `unicode` answers), the record's flags alone (the `legacy` answers) and, in the file that has them, the flags with
@@ -16,23 +17,42 @@
 //!
 //! With `--engine regress` the `regress` crate is judged instead: over UTF-16 by its UTF-16 search with the u or v
 //! flag and its UCS-2 search without, which is how ECMA-262 reads the text, and over UTF-8 by its search of a `str`.
-//! On `captures.jsonl` it is judged over UTF-16 alone (exec, the global search, the sticky flag, replace, replaceAll,
-//! split and split3), since it has no UTF-8 interface for them. regress has no limit on a match, so each file is run
-//! in child processes that report each record as they go, each with its address space capped at 2 GB; a record that
-//! makes no progress for ten seconds, or whose child dies, is counted at the limit once for every answer it would have
-//! had, and the child is started again after it.
+//! `exec/test262.jsonl`, the exec calls of test262 (in a directory of its own), is judged last: each call one exec
+//! with the record's flags from its lastIndex, right when the positions of the match and of every group, the named
+//! groups and, with g or y, the lastIndex after are V8's; one answer over UTF-16 and, when the text holds no lone
+//! surrogate and lastIndex is not between the halves of a pair, one over UTF-8 with positions in bytes. regress has
+//! no g or y flag: it searches from lastIndex, and with y a match counts only where it starts at lastIndex.
+//!
+//! regress has no global search, sticky flag, replace or split of its own, so on `captures.jsonl` the runner writes
+//! them over its exec, as a JavaScript engine's String methods are written, in both encodings. regress has no limit on
+//! a match, so each file is run in child processes (each with its address space capped at 2 GB) that report each
+//! answer as they give it. In the child a watchdog thread times each answer by the CPU time of the thread that runs
+//! regress, from just before regress is called, and ends the process when one passes the 2 seconds every runner gives
+//! a match; that answer, or one whose child dies, is unanswered, and a new child goes on from the next answer. Once
+//! three answers of a record have reached the limit, its other answers are unanswered without being asked, so that a
+//! pattern regress cannot answer on any text costs seconds, not one limit for each of its answers.
+//!
+//! With `--compliance <file>`, the engine's compliance object is written to the file, as the benchmark page reads it
+//! (docs/implementing-a-source.md in corvus-regex-ecma262-benchmarks): the counts, this runner and the calls it makes
+//! in each encoding, and what it leaves out (nothing for this crate; for regress, the operations written over its
+//! exec).
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use corvus_regex_ecma262::{Error, MatchError, Regex};
 use corvus_regex_ecma262_tools::json::{self, Json, escape};
 
 const LIMIT: Duration = Duration::from_secs(2);
+/// How long a child that runs regress may go without a word before it is taken for lost (its watchdog ends it within
+/// LIMIT of an answer that does not finish; this catches a child stuck anywhere else).
+const SILENCE: Duration = Duration::from_secs(60);
+/// The answers of a record that may reach the limit before its other answers are unanswered without being asked.
+const LIMITS_PER_RECORD: usize = 3;
 const REPLACEMENT: &str = "<$&|$1|$2|$10|$<a>|$$|$`|$'>";
 
 #[derive(Default)]
@@ -80,10 +100,16 @@ struct Options {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--worker") {
-        // dataset --worker <file> <first record> <utf16|utf8|both>
-        worker(&args[1], args[2].parse().unwrap(), &args[3]);
+        // dataset --worker <file> <first record> <first answer of it> <spent: 0|1> <utf16|utf8|both>
+        worker(&args[1], args[2].parse().unwrap(), args[3].parse().unwrap(), args[4] == "1", &args[5]);
         return;
     }
+    let mut args = args;
+    let compliance = args.iter().position(|a| a == "--compliance").map(|k| {
+        let path = args[k + 1].clone();
+        args.drain(k..k + 2);
+        path
+    });
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let engine = match args.iter().position(|a| a == "--engine").map(|k| args[k + 1].as_str()) {
         None | Some("corvus") => EngineKind::Corvus,
@@ -104,12 +130,17 @@ fn main() {
         .filter(|p| glob(filter, &p.file_name().unwrap().to_string_lossy()))
         .collect();
     files.sort();
+    // The exec calls of test262, in a directory of their own: with the default filter, or one that names them.
+    let exec = std::path::Path::new(directory).join(EXEC);
+    if (filter == "*.jsonl" || filter.starts_with("exec")) && exec.is_file() {
+        files.push(exec);
+    }
     let total = Counts::default();
     let wrong_cases = Mutex::new(Vec::<String>::new());
     let (records, skipped) = (AtomicI64::new(0), AtomicI64::new(0));
     let clock = Instant::now();
     for file in &files {
-        let name = file.file_name().unwrap().to_string_lossy().to_string();
+        let name = data_name(file);
         let counts = Counts::default();
         if engine == EngineKind::Regress {
             supervise(file.to_str().unwrap(), encodings, &counts, &wrong_cases, &records, &skipped);
@@ -148,6 +179,9 @@ fn main() {
     cases.sort();
     std::fs::write(wrong_path, cases.join("\n") + if cases.is_empty() { "" } else { "\n" }).unwrap();
     let [right, wrong, refused, accepted, limited, errors] = total.get();
+    if let Some(path) = compliance {
+        write_compliance(&path, engine, &options, [right, wrong, refused, accepted, limited + errors]);
+    }
     println!();
     println!(
         "records {} (skipped {} deviations)  right {right}  wrong {wrong}  refused-valid {refused}  accepted-invalid {accepted}  limit {limited}  errors {errors}  in {:.1}s",
@@ -156,6 +190,45 @@ fn main() {
         clock.elapsed().as_secs_f64()
     );
     std::process::exit(if wrong + refused + accepted + errors + limited == 0 { 0 } else { 1 });
+}
+
+/// Writes the engine's compliance as the benchmark page reads it: the counts (right, wrong, refused, accepted invalid,
+/// unanswered), this runner and the calls it makes in each encoding it asked in, and what it leaves out.
+fn write_compliance(path: &str, engine: EngineKind, options: &Options, counts: [i64; 5]) {
+    let (utf16, utf8, excludes): (&[&str], &[&str], &str) = match engine {
+        EngineKind::Corvus => (
+            &[
+                "Regex::is_match_utf16",
+                "Regex::captures_at_within_utf16",
+                "Regex::find_iter_utf16",
+                "Regex::replace_utf16",
+                "Regex::split_utf16",
+            ],
+            &["Regex::is_match", "Regex::captures_at_within", "Regex::find_iter", "Regex::replace"],
+            "[]",
+        ),
+        EngineKind::Regress => (
+            &["Regex::find_from_utf16", "Regex::find_from_ucs2"],
+            &["Regex::find_from"],
+            r#"[{"class":"operations","leaves":["global","sticky","replace","split"]}]"#,
+        ),
+    };
+    let list = |calls: &[&str]| calls.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",");
+    let mut calls = Vec::new();
+    if options.utf16 {
+        calls.push(format!("\"utf16\":[{}]", list(utf16)));
+    }
+    if options.utf8 {
+        calls.push(format!("\"utf8\":[{}]", list(utf8)));
+    }
+    let [right, wrong, refused, accepted, limited] = counts;
+    let json = format!(
+        "{{\"right\":{right},\"wrong\":{wrong},\"refused\":{refused},\"acceptedInvalid\":{accepted},\"limited\":{limited},\
+         \"judge\":{{\"runner\":\"https://github.com/corvus-dotnet/corvus-regex-ecma262-rs/blob/main/tools/src/bin/dataset.rs\",\
+         \"calls\":{{{}}}}},\"excludes\":{excludes}}}\n",
+        calls.join(",")
+    );
+    std::fs::write(path, json).unwrap();
 }
 
 /// Whether a file name matches a filter with `*` wildcards.
@@ -279,8 +352,188 @@ impl Engine for Regress {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Answers in a child process that runs regress.
+//
+// regress cannot be stopped in a match, so its supervisor runs it in child processes. In a child, `answer` wraps each
+// answer the data asks: it writes the counts that changed before it (a verdict) and after it (the answer itself, then
+// "." or, for one right answer and nothing else, "+"), so that the supervisor has every answer given when a child
+// ends; and it notes when regress is about to be called, so that the child's watchdog thread can end the process when
+// one answer passes LIMIT of the CPU time of the thread that runs regress (which the load of the machine does not
+// lengthen). The supervisor counts that answer unanswered and starts a child at the next one, which skips the answers
+// before it (`answer` does not run them, and drops the verdicts among them, which were written); when the record has
+// had LIMITS_PER_RECORD answers at the limit, the child counts its other answers unanswered without running them.
+// Outside a child, `answer` runs the answer and nothing else.
+
+/// Whether this process is a child of the supervisor.
+static WORKER: AtomicBool = AtomicBool::new(false);
+/// The number of the next answer of the record being judged, and the first that this child gives.
+static NEXT_ANSWER: AtomicUsize = AtomicUsize::new(0);
+static FIRST_ANSWER: AtomicUsize = AtomicUsize::new(0);
+/// Whether the first record of this child has had LIMITS_PER_RECORD answers at the limit.
+static SPENT: AtomicBool = AtomicBool::new(false);
+/// When the answer being given began, in nanoseconds since BASE plus one; 0 when none is being given.
+static STARTED: AtomicU64 = AtomicU64::new(0);
+static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+/// The counts and the number of wrong cases already written for the record being judged.
+static WRITTEN: Mutex<([i64; 6], usize)> = Mutex::new(([0; 6], 0));
+
+/// The clock answers are timed by: the CPU time of the thread that runs regress where the system gives it (set by
+/// `use_thread_clock` on that thread), else the time since BASE; in nanoseconds plus one.
+#[cfg(target_os = "linux")]
+static CLOCK: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(target_os = "linux")]
+mod thread_clock {
+    #[repr(C)]
+    pub struct Timespec {
+        pub sec: i64,
+        pub nsec: i64,
+    }
+    unsafe extern "C" {
+        pub fn pthread_self() -> usize;
+        pub fn pthread_getcpuclockid(thread: usize, clock: *mut i32) -> i32;
+        pub fn clock_gettime(clock: i32, time: *mut Timespec) -> i32;
+    }
+}
+
+/// Marks the process as one that dumps no core when it dies. A match that passes the cap on the child's memory aborts
+/// it, which is counted as unanswered; where the system pipes cores to a program (WSL does), writing the core of a
+/// child of over a gigabyte would hold the child for a minute.
+fn no_core_dump() {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn prctl(option: i32, ...) -> i32;
+        }
+        const PR_SET_DUMPABLE: i32 = 4;
+        // SAFETY: PR_SET_DUMPABLE takes one integer argument and changes nothing but whether the process dumps core.
+        unsafe {
+            prctl(PR_SET_DUMPABLE, 0u64);
+        }
+    }
+}
+
+/// Times answers by the CPU time of the calling thread from now on.
+fn use_thread_clock() {
+    #[cfg(target_os = "linux")]
+    {
+        let mut clock = 0;
+        // SAFETY: pthread_self names the calling thread, and clock is a valid place for the clock's id.
+        if unsafe { thread_clock::pthread_getcpuclockid(thread_clock::pthread_self(), &mut clock) } == 0 {
+            CLOCK.store(clock, Ordering::SeqCst);
+        }
+    }
+}
+
+fn now_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let clock = CLOCK.load(Ordering::SeqCst);
+        if clock >= 0 {
+            let mut t = thread_clock::Timespec { sec: 0, nsec: 0 };
+            // SAFETY: clock is the id pthread_getcpuclockid gave, and t is a valid place for the time.
+            if unsafe { thread_clock::clock_gettime(clock, &mut t) } == 0 {
+                return (t.sec as u64) * 1_000_000_000 + t.nsec as u64 + 1;
+            }
+        }
+    }
+    BASE.get_or_init(Instant::now).elapsed().as_nanos() as u64 + 1
+}
+
+/// Gives one answer: `f` counts it into `counts` and `wrong`.
+fn answer(counts: &Counts, wrong: &mut Vec<String>, f: impl FnOnce(&Counts, &mut Vec<String>)) {
+    if !WORKER.load(Ordering::Relaxed) {
+        f(counts, wrong);
+        return;
+    }
+    if NEXT_ANSWER.fetch_add(1, Ordering::Relaxed) < FIRST_ANSWER.load(Ordering::Relaxed) {
+        // Given by the child before this one, with whatever was counted before it.
+        *WRITTEN.lock().unwrap() = (counts.get(), wrong.len());
+        return;
+    }
+    if SPENT.load(Ordering::Relaxed) {
+        // The record has had LIMITS_PER_RECORD answers at the limit: this one is unanswered, not asked.
+        write_counts(counts, wrong, false);
+        counts.limited.fetch_add(1, Ordering::Relaxed);
+        write_counts(counts, wrong, true);
+        return;
+    }
+    write_counts(counts, wrong, false);
+    STARTED.store(now_ns(), Ordering::SeqCst);
+    f(counts, wrong);
+    STARTED.store(0, Ordering::SeqCst);
+    write_counts(counts, wrong, true);
+}
+
+/// Writes what was counted since the last write: "D" and the six changes, then each new wrong case as "W"; with `done`,
+/// the end of an answer, "." (or "+" alone for one right answer and nothing else).
+fn write_counts(counts: &Counts, wrong: &[String], done: bool) {
+    let mut written = WRITTEN.lock().unwrap();
+    let now = counts.get();
+    let delta: Vec<i64> = now.iter().zip(written.0).map(|(a, b)| a - b).collect();
+    let mut out = std::io::stdout().lock();
+    if done && delta == [1, 0, 0, 0, 0, 0] && wrong.len() == written.1 {
+        writeln!(out, "+").unwrap();
+    } else {
+        if delta.iter().any(|&d| d != 0) {
+            writeln!(out, "D {} {} {} {} {} {}", delta[0], delta[1], delta[2], delta[3], delta[4], delta[5]).unwrap();
+        }
+        for w in &wrong[written.1..] {
+            writeln!(out, "W {w}").unwrap();
+        }
+        if done {
+            writeln!(out, ".").unwrap();
+        }
+    }
+    out.flush().unwrap();
+    *written = (now, wrong.len());
+}
+
+/// The child's watchdog: ends the process, writing "L", when an answer has run for LIMIT.
+fn watchdog() {
+    std::thread::spawn(|| {
+        let limit = LIMIT.as_nanos() as u64;
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+            let started = STARTED.load(Ordering::SeqCst);
+            if started != 0 && now_ns().saturating_sub(started) > limit {
+                end_at_limit();
+            }
+        }
+    });
+}
+
+/// Writes "L" and ends the process at once: regress is in a match on the other thread, holding what it holds, so
+/// nothing that could take a lock (the standard output's, the allocator's) is run.
+#[cfg(unix)]
+fn end_at_limit() -> ! {
+    unsafe extern "C" {
+        fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+        fn _exit(status: i32) -> !;
+    }
+    // SAFETY: write and _exit take no lock and allocate nothing; the buffer is a static string.
+    unsafe {
+        write(1, b"\nL\n".as_ptr(), 3);
+        _exit(0)
+    }
+}
+
+#[cfg(not(unix))]
+fn end_at_limit() -> ! {
+    let _ = std::io::stdout().write_all(b"\nL\n");
+    std::process::exit(0)
+}
+
 fn judge_record(name: &str, r: &Json, options: &Options, counts: &Counts, wrong: &mut Vec<String>) {
     let pattern = r.get("pattern").and_then(Json::as_string).unwrap();
+    if name == EXEC {
+        match options.engine {
+            EngineKind::Corvus => judge_exec(r, &pattern, options, counts, wrong),
+            EngineKind::Regress => judge_exec_regress(r, &pattern, options, counts, wrong),
+        }
+        return;
+    }
     if name == "ill-formed-utf8.jsonl" {
         if options.utf8 {
             match options.engine {
@@ -291,11 +544,10 @@ fn judge_record(name: &str, r: &Json, options: &Options, counts: &Counts, wrong:
         return;
     }
     if name == "captures.jsonl" {
-        if options.utf16 {
-            match options.engine {
-                EngineKind::Corvus => judge_captures(r, &pattern, counts, wrong),
-                EngineKind::Regress => judge_captures_regress(r, &pattern, counts, wrong),
-            }
+        match options.engine {
+            EngineKind::Corvus if options.utf16 => judge_captures(r, &pattern, counts, wrong),
+            EngineKind::Corvus => {}
+            EngineKind::Regress => judge_captures_regress(r, &pattern, options, counts, wrong),
         }
         return;
     }
@@ -347,32 +599,35 @@ fn judge_tests<E: Engine>(
         for t in tests {
             let Some(expected) = t.get(answer_name).and_then(Json::as_bool) else { continue };
             let text = t.get("text").and_then(Json::as_units).unwrap();
-            let mut check = |encoding: &str, result: Result<bool, String>| match result {
-                Ok(actual) if actual == expected => {
-                    counts.right.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(_) => {
-                    counts.wrong.fetch_add(1, Ordering::Relaxed);
-                    wrong.push(format!(
-                        "WRONG\t{name}\t/{shown}/{mode_flags}\t{}\t{encoding}\texpected {expected}",
-                        escape(text)
-                    ));
-                }
-                Err(why) if why == "panic" => {
-                    counts.errors.fetch_add(1, Ordering::Relaxed);
-                    wrong.push(format!("ERROR\t{name}\t/{shown}/{mode_flags}\t{}\t{encoding}\tpanic", escape(text)));
-                }
-                Err(why) => {
-                    counts.limited.fetch_add(1, Ordering::Relaxed);
-                    wrong.push(format!("LIMIT\t{name}\t/{shown}/{mode_flags}\t{}\t{encoding}\t{why}", escape(text)));
-                }
-            };
+            let check =
+                |counts: &Counts, wrong: &mut Vec<String>, encoding: &str, result: Result<bool, String>| match result {
+                    Ok(actual) if actual == expected => {
+                        counts.right.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(_) => {
+                        counts.wrong.fetch_add(1, Ordering::Relaxed);
+                        wrong.push(format!(
+                            "WRONG\t{name}\t/{shown}/{mode_flags}\t{}\t{encoding}\texpected {expected}",
+                            escape(text)
+                        ));
+                    }
+                    Err(why) if why == "panic" => {
+                        counts.errors.fetch_add(1, Ordering::Relaxed);
+                        wrong
+                            .push(format!("ERROR\t{name}\t/{shown}/{mode_flags}\t{}\t{encoding}\tpanic", escape(text)));
+                    }
+                    Err(why) => {
+                        counts.limited.fetch_add(1, Ordering::Relaxed);
+                        wrong
+                            .push(format!("LIMIT\t{name}\t/{shown}/{mode_flags}\t{}\t{encoding}\t{why}", escape(text)));
+                    }
+                };
             if options.utf16 {
-                check("utf16", E::test_utf16(&re, text));
+                answer(counts, wrong, |counts, wrong| check(counts, wrong, "utf16", E::test_utf16(&re, text)));
             }
             if options.utf8 && !has_lone_surrogate(text) {
                 let s = String::from_utf16(text).unwrap();
-                check("utf8", E::test_utf8(&re, &s));
+                answer(counts, wrong, |counts, wrong| check(counts, wrong, "utf8", E::test_utf8(&re, &s)));
             }
         }
     }
@@ -405,7 +660,7 @@ fn judge_ill_formed<E: Engine>(r: &Json, pattern: &str, counts: &Counts, wrong: 
             let hex = t.get("bytes").and_then(Json::as_string).unwrap();
             let bytes: Vec<u8> =
                 (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
-            match std::str::from_utf8(&bytes) {
+            answer(counts, wrong, |counts, wrong| match std::str::from_utf8(&bytes) {
                 Err(_) => {
                     counts.right.fetch_add(1, Ordering::Relaxed);
                 }
@@ -415,7 +670,7 @@ fn judge_ill_formed<E: Engine>(r: &Json, pattern: &str, counts: &Counts, wrong: 
                     counts.wrong.fetch_add(1, Ordering::Relaxed);
                     wrong.push(format!("WRONG\t{name}\t/{shown}/{mode_flags}\t{hex}\tutf8\tread as UTF-8: {got:?}"));
                 }
-            }
+            });
         }
     }
 }
@@ -638,41 +893,239 @@ fn judge_captures(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<Stri
     }
 }
 
+// exec/test262.jsonl
+
+/// The file of the exec calls of test262, in a directory of its own.
+const EXEC: &str = "exec/test262.jsonl";
+
+/// A file's name as the runner gives it: its own, or `exec/<name>` for one in the exec directory, whose name would
+/// otherwise be that of a file of records (`test262.jsonl`).
+fn data_name(path: &std::path::Path) -> String {
+    let name = path.file_name().unwrap().to_string_lossy().to_string();
+    if path.parent().and_then(|p| p.file_name()).is_some_and(|d| d == "exec") { format!("exec/{name}") } else { name }
+}
+
+/// A call's lastIndex. Past the end of the text exec gives null; test262 sets it as far as 2^53 - 1 and
+/// Number.MAX_VALUE, so anything past the end reads as the text's length plus one.
+fn last_index_of(t: &Json, len: usize) -> usize {
+    let v = t.get("lastIndex").and_then(Json::as_f64).unwrap();
+    if v > len as f64 { len + 1 } else { v as usize }
+}
+
+/// Whether a position is between the halves of a surrogate pair, where UTF-8 has no position.
+fn inside_pair(s: &[u16], at: usize) -> bool {
+    at > 0 && at < s.len() && (0xDC00..=0xDFFF).contains(&s[at]) && (0xD800..=0xDBFF).contains(&s[at - 1])
+}
+
+/// An engine's match for a call: the bounds of the match and of each group, and the named groups by name.
+struct Got {
+    groups: Vec<Option<(usize, usize)>>,
+    names: Vec<(String, Option<(usize, usize)>)>,
+}
+
+/// Whether an engine's match is the call's answer, through `map` from the answer's UTF-16 positions to the engine's:
+/// both null, or the same groups, the same named groups (present exactly when the pattern has names) and, with g or y,
+/// a lastIndex after at the match's end.
+fn same_exec(answer: &Json, got: Option<&Got>, carries: bool, map: &dyn Fn(usize) -> usize) -> bool {
+    let Some(g) = got else { return answer.is_null() };
+    if answer.is_null() || !same_slots(&exec_of(answer.get("captures").unwrap()), Some(&g.groups), map) {
+        return false;
+    }
+    let names_ok = match answer.get("groups") {
+        None => g.names.is_empty(),
+        Some(Json::Object(members)) => {
+            members.len() == g.names.len()
+                && members.iter().all(|(name, v)| {
+                    g.names.iter().find(|(n, _)| n == name).is_some_and(|(_, span)| match (v.as_array(), span) {
+                        (None, None) => true,
+                        (Some(b), Some((s, t))) => {
+                            map(b[0].as_f64().unwrap() as usize) == *s && map(b[1].as_f64().unwrap() as usize) == *t
+                        }
+                        _ => false,
+                    })
+                })
+        }
+        Some(_) => false,
+    };
+    names_ok
+        && (!carries
+            || answer.get("lastIndex").and_then(Json::as_f64).map(|v| map(v as usize)) == g.groups[0].map(|(_, e)| e))
+}
+
+/// Counts one answer of a call.
+fn count_exec(counts: &Counts, wrong: &mut Vec<String>, where_: &str, encoding: &str, outcome: Result<bool, String>) {
+    match outcome {
+        Ok(true) => {
+            counts.right.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(false) => {
+            counts.wrong.fetch_add(1, Ordering::Relaxed);
+            wrong.push(format!("WRONG\t{EXEC}\t{where_}\t{encoding}"));
+        }
+        Err(e) => {
+            counts.limited.fetch_add(1, Ordering::Relaxed);
+            wrong.push(format!("LIMIT\t{EXEC}\t{where_}\t{encoding}\t{e}"));
+        }
+    }
+}
+
+/// Where a call is, for the wrong cases: the pattern with its flags, the text and the lastIndex as the data has it.
+fn exec_where(shown: &str, flags: &str, text: &[u16], t: &Json) -> String {
+    format!("/{shown}/{flags}\t{}\t{}", escape(text), t.get("lastIndex").and_then(Json::as_f64).unwrap())
+}
+
+/// Judges this crate on a record of `exec/test262.jsonl`: its own g, y and d flags, from each call's lastIndex.
+fn judge_exec(r: &Json, pattern: &str, options: &Options, counts: &Counts, wrong: &mut Vec<String>) {
+    let flags = r.get("flags").and_then(Json::as_string).unwrap();
+    let shown = escape(&pattern.encode_utf16().collect::<Vec<u16>>());
+    let Ok(re) = Regex::new(pattern, &flags) else {
+        counts.refused.fetch_add(1, Ordering::Relaxed);
+        wrong.push(format!("REFUSED\t{EXEC}\t/{shown}/{flags}"));
+        return;
+    };
+    let carries = flags.contains('g') || flags.contains('y');
+    let names: Vec<String> = re.group_names().map(str::to_string).collect();
+    let Some(tests) = r.get("tests").and_then(Json::as_array) else { return };
+    for t in tests {
+        if t.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
+            continue;
+        }
+        let text = t.get("text").and_then(Json::as_units).unwrap();
+        let start = if carries { last_index_of(t, text.len()) } else { 0 };
+        let answer = t.get("answer").unwrap();
+        let where_ = exec_where(&shown, &flags, text, t);
+        if options.utf16 {
+            let found = if start > text.len() { Ok(None) } else { re.captures_at_within_utf16(text, start, LIMIT) };
+            let outcome = found.map_err(limit_name).map(|c| {
+                let got = c.map(|c| Got {
+                    groups: groups_of(&c),
+                    names: names.iter().map(|n| (n.clone(), c.name(n).map(|m| (m.start(), m.end())))).collect(),
+                });
+                same_exec(answer, got.as_ref(), carries, &|k| k)
+            });
+            count_exec(counts, wrong, &where_, "utf16", outcome);
+        }
+        if options.utf8 && !has_lone_surrogate(text) && !inside_pair(text, start) {
+            let utf8 = String::from_utf16(text).unwrap();
+            let byte_at = byte_offsets(text);
+            let found = if start > text.len() { Ok(None) } else { re.captures_at_within(&utf8, byte_at[start], LIMIT) };
+            let outcome = found.map_err(limit_name).map(|c| {
+                let got = c.map(|c| Got {
+                    groups: groups_of(&c),
+                    names: names.iter().map(|n| (n.clone(), c.name(n).map(|m| (m.start(), m.end())))).collect(),
+                });
+                same_exec(answer, got.as_ref(), carries, &|k| byte_at[k])
+            });
+            count_exec(counts, wrong, &where_, "utf8", outcome);
+        }
+    }
+}
+
+/// Judges regress on a record of `exec/test262.jsonl`. regress has no g, y or d flag: the pattern is compiled
+/// without them, the search starts at lastIndex with g or y, and with y a match counts only where it starts there.
+fn judge_exec_regress(r: &Json, pattern: &str, options: &Options, counts: &Counts, wrong: &mut Vec<String>) {
+    let flags = r.get("flags").and_then(Json::as_string).unwrap();
+    let shown = escape(&pattern.encode_utf16().collect::<Vec<u16>>());
+    let compile: String = flags.chars().filter(|c| !"gyd".contains(*c)).collect();
+    let unicode = flags.contains('u') || flags.contains('v');
+    let Ok(Ok(re)) = std::panic::catch_unwind(|| regress::Regex::with_flags(pattern, compile.as_str())) else {
+        counts.refused.fetch_add(1, Ordering::Relaxed);
+        wrong.push(format!("REFUSED\t{EXEC}\t/{shown}/{flags}"));
+        return;
+    };
+    let (carries, sticky) = (flags.contains('g') || flags.contains('y'), flags.contains('y'));
+    let Some(tests) = r.get("tests").and_then(Json::as_array) else { return };
+    for t in tests {
+        if t.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
+            continue;
+        }
+        let text = t.get("text").and_then(Json::as_units).unwrap();
+        let start = if carries { last_index_of(t, text.len()) } else { 0 };
+        let answer = t.get("answer").unwrap();
+        let where_ = exec_where(&shown, &flags, text, t);
+        if options.utf16 {
+            self::answer(counts, wrong, |counts, wrong| {
+                let outcome = std::panic::catch_unwind(|| {
+                    let got = regress_exec(&re, unicode, text, start)
+                        .filter(|(g, _)| !sticky || g[0].is_some_and(|(s, _)| s == start))
+                        .map(|(groups, names)| Got { groups, names });
+                    same_exec(answer, got.as_ref(), carries, &|k| k)
+                })
+                .map_err(|_| "panic".to_string());
+                count_exec(counts, wrong, &where_, "utf16", outcome);
+            });
+        }
+        if options.utf8 && !has_lone_surrogate(text) && !inside_pair(text, start) {
+            let utf8 = String::from_utf16(text).unwrap();
+            let byte_at = byte_offsets(text);
+            self::answer(counts, wrong, |counts, wrong| {
+                let outcome = std::panic::catch_unwind(|| {
+                    let from = if start > text.len() { None } else { Some(byte_at[start]) };
+                    let got = from
+                        .and_then(|from| re.find_from(&utf8, from).next().map(|m| (from, m)))
+                        .filter(|(from, m)| !sticky || m.range.start == *from)
+                        .map(|(_, m)| Got {
+                            groups: (0..m.captures.len() + 1).map(|i| m.group(i).map(|r| (r.start, r.end))).collect(),
+                            names: m
+                                .named_groups()
+                                .map(|(n, r)| (n.to_string(), r.map(|r| (r.start, r.end))))
+                                .collect(),
+                        });
+                    same_exec(answer, got.as_ref(), carries, &|k| byte_at[k])
+                })
+                .map_err(|_| "panic".to_string());
+                count_exec(counts, wrong, &where_, "utf8", outcome);
+            });
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // The child processes that run regress.
 
-/// Runs the records of a file from `first` on, and writes `R <index>` before each and its counts and wrong cases
-/// after it.
-fn worker(file: &str, first: usize, encodings: &str) {
+/// Runs the records of a file from answer `first_answer` of record `first` on (an earlier answer of that record was
+/// given by the child before; with `spent`, the record has had LIMITS_PER_RECORD answers at the limit), writing
+/// `R <index>` before each record, `S` for one left out, its answers and counts as `answer` writes them, `E` after it,
+/// and `DONE` at the end. The watchdog ends the process at an answer that passes LIMIT.
+fn worker(file: &str, first: usize, first_answer: usize, spent: bool, encodings: &str) {
     let options = Options {
         utf16: matches!(encodings, "both" | "utf16"),
         utf8: matches!(encodings, "both" | "utf8"),
         engine: EngineKind::Regress,
     };
-    let name = std::path::Path::new(file).file_name().unwrap().to_string_lossy().to_string();
+    WORKER.store(true, Ordering::Relaxed);
+    no_core_dump();
+    use_thread_clock();
+    watchdog();
+    let name = data_name(std::path::Path::new(file));
     let text = std::fs::read_to_string(file).unwrap();
-    let mut out = std::io::stdout().lock();
     for (k, line) in text.lines().enumerate().skip(first) {
-        writeln!(out, "R {k}").unwrap();
-        out.flush().unwrap();
+        {
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "R {k}").unwrap();
+            out.flush().unwrap();
+        }
         let r = json::parse(line).unwrap();
         if r.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
-            writeln!(out, "S").unwrap();
+            println!("S");
             continue;
         }
         let counts = Counts::default();
         let mut wrong = Vec::new();
+        *WRITTEN.lock().unwrap() = ([0; 6], 0);
+        NEXT_ANSWER.store(0, Ordering::Relaxed);
+        FIRST_ANSWER.store(if k == first { first_answer } else { 0 }, Ordering::Relaxed);
+        SPENT.store(k == first && spent, Ordering::Relaxed);
         judge_record(&name, &r, &options, &counts, &mut wrong);
-        let c = counts.get();
-        writeln!(out, "C {} {} {} {} {} {}", c[0], c[1], c[2], c[3], c[4], c[5]).unwrap();
-        for w in wrong {
-            writeln!(out, "W {w}").unwrap();
-        }
+        write_counts(&counts, &wrong, false);
+        println!("E");
     }
-    writeln!(out, "DONE").unwrap();
+    println!("DONE");
 }
 
-/// Runs a file through child processes, counting a record that makes no progress for ten seconds at the limit.
+/// Runs a file through child processes (`worker`), four at a time over its quarters. An answer that a child's watchdog
+/// stops at LIMIT, or that a child dies in, is unanswered, and a new child goes on from the next answer; after
+/// LIMITS_PER_RECORD of a record, the child counts the record's other answers unanswered without asking them.
 fn supervise(
     file: &str,
     encodings: &str,
@@ -682,26 +1135,24 @@ fn supervise(
     skipped: &AtomicI64,
 ) {
     let text = std::fs::read_to_string(file).unwrap();
-    let all_lines: Vec<&str> = text.lines().collect();
-    let lines = all_lines.len();
-    let utf8 = matches!(encodings, "both" | "utf8");
-    let name = std::path::Path::new(file).file_name().unwrap().to_string_lossy().to_string();
-    // Four children, each over a quarter of the file.
+    let lines = text.lines().count();
+    let name = data_name(std::path::Path::new(file));
     let quarter = lines.div_ceil(4);
     std::thread::scope(|scope| {
         for part in 0..4 {
             let (from, to) = (part * quarter, ((part + 1) * quarter).min(lines));
             let name = &name;
-            let all_lines = &all_lines;
             scope.spawn(move || {
-                let mut next = from;
-                while next < to {
+                let (mut record, mut first_answer) = (from, 0);
+                // The answers of `record` at the limit so far.
+                let mut at_limit = 0;
+                while record < to {
                     let exe = std::env::current_exe().unwrap();
-                    let next_text = next.to_string();
-                    let worker_args = ["--worker", file, &next_text, encodings];
+                    let (record_text, answer_text) = (record.to_string(), first_answer.to_string());
+                    let spent = if at_limit >= LIMITS_PER_RECORD { "1" } else { "0" };
+                    let worker_args = ["--worker", file, &record_text, &answer_text, spent, encodings];
                     // regress has no limit on a match, and some patterns take memory until the process is stopped:
-                    // the child's address space is capped (2 GB), and a child that dies counts its record at the
-                    // limit.
+                    // the child's address space is capped (2 GB), and an answer whose child dies is unanswered.
                     let mut command = if cfg!(unix) {
                         let mut c = Command::new("sh");
                         c.arg("-c").arg("ulimit -v 2097152 && exec \"$0\" \"$@\"").arg(&exe).args(worker_args);
@@ -722,90 +1173,87 @@ fn supervise(
                             }
                         }
                     });
-                    let mut current = next;
-                    let mut finished = false;
-                    loop {
-                        match rx.recv_timeout(Duration::from_secs(10)) {
+                    // The record being judged and the number of its answers given so far.
+                    let (mut current, mut given) = (record, first_answer);
+                    let mut pending: Vec<String> = Vec::new();
+                    let why = loop {
+                        match rx.recv_timeout(SILENCE) {
                             Ok(line) => {
                                 if let Some(k) = line.strip_prefix("R ") {
                                     current = k.parse().unwrap();
+                                    given = if current == record { first_answer } else { 0 };
                                     if current >= to {
-                                        finished = true;
-                                        break;
+                                        break None;
                                     }
                                 } else if line == "S" {
                                     skipped.fetch_add(1, Ordering::Relaxed);
-                                } else if let Some(c) = line.strip_prefix("C ") {
-                                    records.fetch_add(1, Ordering::Relaxed);
-                                    let v: Vec<i64> = c.split(' ').map(|x| x.parse().unwrap()).collect();
-                                    counts.right.fetch_add(v[0], Ordering::Relaxed);
-                                    counts.wrong.fetch_add(v[1], Ordering::Relaxed);
-                                    counts.refused.fetch_add(v[2], Ordering::Relaxed);
-                                    counts.accepted.fetch_add(v[3], Ordering::Relaxed);
-                                    counts.limited.fetch_add(v[4], Ordering::Relaxed);
-                                    counts.errors.fetch_add(v[5], Ordering::Relaxed);
+                                } else if line == "+" {
+                                    counts.right.fetch_add(1, Ordering::Relaxed);
+                                    given += 1;
+                                } else if line == "." {
+                                    given += 1;
+                                } else if let Some(d) = line.strip_prefix("D ") {
+                                    let v: Vec<i64> = d.split(' ').map(|x| x.parse().unwrap()).collect();
+                                    for (c, x) in [
+                                        &counts.right,
+                                        &counts.wrong,
+                                        &counts.refused,
+                                        &counts.accepted,
+                                        &counts.limited,
+                                        &counts.errors,
+                                    ]
+                                    .into_iter()
+                                    .zip(v)
+                                    {
+                                        c.fetch_add(x, Ordering::Relaxed);
+                                    }
                                 } else if let Some(w) = line.strip_prefix("W ") {
-                                    wrong_cases.lock().unwrap().push(w.to_string());
+                                    pending.push(w.to_string());
+                                } else if line == "E" {
+                                    records.fetch_add(1, Ordering::Relaxed);
+                                } else if line == "L" {
+                                    break Some(format!("no answer in {} s", LIMIT.as_secs()));
                                 } else if line == "DONE" {
-                                    finished = true;
-                                    break;
+                                    break None;
                                 }
                             }
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                break Some(format!("nothing written in {} s", SILENCE.as_secs()));
+                            }
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                // The child died (a stack overflow, or an abort): the record it was on is an error.
-                                break;
+                                // The child died (a stack overflow, or an abort at the cap on its memory).
+                                break Some("the process died".to_string());
                             }
                         }
-                    }
+                    };
                     let _ = child.kill();
                     let _ = child.wait();
-                    if finished {
-                        break;
+                    wrong_cases.lock().unwrap().append(&mut pending);
+                    let Some(why) = why else { break };
+                    // The answer being given is unanswered (the judging rule of the test data); the next child goes
+                    // on from the one after it.
+                    counts.limited.fetch_add(1, Ordering::Relaxed);
+                    wrong_cases.lock().unwrap().push(format!(
+                        "LIMIT\t{name}\trecord {} answer {}\t{why}",
+                        current + 1,
+                        given + 1
+                    ));
+                    if current != record {
+                        at_limit = 0;
                     }
-                    // The record `current` made no progress or killed the child: every answer it would have had is
-                    // unanswered (the judging rule of the test data).
-                    records.fetch_add(1, Ordering::Relaxed);
-                    let answers = json::parse(all_lines[current]).map_or(1, |r| answers_of(name, &r, utf8).max(1));
-                    counts.limited.fetch_add(answers, Ordering::Relaxed);
-                    wrong_cases
-                        .lock()
-                        .unwrap()
-                        .push(format!("LIMIT\t{name}\trecord {}\tno answer in 10 s, or the process died", current + 1));
-                    next = current + 1;
+                    at_limit += 1;
+                    if at_limit == LIMITS_PER_RECORD {
+                        wrong_cases.lock().unwrap().push(format!(
+                            "LIMIT\t{name}\trecord {}\tits answers after answer {} not asked: {LIMITS_PER_RECORD} at the limit",
+                            current + 1,
+                            given + 1
+                        ));
+                    }
+                    (record, first_answer) = (current, given + 1);
                 }
             });
         }
     });
-}
-
-/// The answers a record would have had from an engine that answers over UTF-16 and, with `utf8`, over UTF-8 (on
-/// `captures.jsonl`, seven over UTF-16 for each test and grammar, as regress, which has no UTF-8 interface, gives them).
-fn answers_of(name: &str, r: &Json, utf8: bool) -> i64 {
-    if r.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
-        return 0;
-    }
-    let Some(tests) = r.get("tests").and_then(Json::as_array) else { return 0 };
-    let valid = r.get("valid").unwrap();
-    if name == "ill-formed-utf8.jsonl" {
-        let grammars =
-            modes(r).iter().filter(|(_, mode, _)| valid.get(mode).and_then(Json::as_bool) == Some(true)).count();
-        return if utf8 { (grammars * tests.len()) as i64 } else { 0 };
-    }
-    let mut n = 0;
-    for t in tests {
-        if t.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
-            continue;
-        }
-        let text = t.get("text").and_then(Json::as_units).unwrap_or(&[]);
-        for (_, mode, _) in modes(r) {
-            if valid.get(mode).and_then(Json::as_bool) != Some(true) || t.get(mode).is_none() {
-                continue;
-            }
-            n += if name == "captures.jsonl" { 7 } else { 1 + i64::from(utf8 && !has_lone_surrogate(text)) };
-        }
-    }
-    n
 }
 
 /// One match of regress over UTF-16, as the groups' bounds (`None` for a group that did not take part).
@@ -909,20 +1357,29 @@ fn substitute16(out: &mut Vec<u16>, text: &[u16], groups: &Groups16, names: &Nam
     }
 }
 
-/// Judges regress on `captures.jsonl` over UTF-16 (it has no UTF-8 interface): exec, the global search, the sticky
-/// flag (a match at 1, which regress has no flag for, is its leftmost match from 1 when that starts at 1), replace,
-/// replaceAll, split and split3, each one answer. A panic is an error.
-fn judge_captures_regress(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<String>) {
+/// Judges regress on `captures.jsonl`: exec, the global search, the sticky flag (a match at 1, which regress has no
+/// flag for, is its leftmost match from 1 when that starts at 1), replace, replaceAll, split and split3 over UTF-16,
+/// and the same but the splits over UTF-8, each one answer. regress has none of them but exec, so they are written
+/// over its exec as a JavaScript engine's String methods are (`regress_answers`). A panic is an error for the answer
+/// it happens in.
+fn judge_captures_regress(r: &Json, pattern: &str, options: &Options, counts: &Counts, wrong: &mut Vec<String>) {
     let flags = r.get("flags").and_then(Json::as_string).unwrap();
     let valid = r.get("valid").unwrap();
     let shown = escape(&pattern.encode_utf16().collect::<Vec<u16>>());
     let Some(tests) = r.get("tests").and_then(Json::as_array) else { return };
-    let template: Vec<u16> = REPLACEMENT.encode_utf16().collect();
     for t in tests {
         if t.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
             continue;
         }
         let text = t.get("text").and_then(Json::as_units).unwrap();
+        let utf8 = if has_lone_surrogate(text) { None } else { Some(String::from_utf16(text).unwrap()) };
+        let byte_at = byte_offsets(text);
+        // The UTF-16 position of each byte offset that is one (a character's first byte, or the third of four, which
+        // is the position between the halves of a pair).
+        let mut unit_at = HashMap::new();
+        for (k, &b) in byte_at.iter().enumerate() {
+            unit_at.insert(b, k);
+        }
         for mode in ["unicode", "legacy"] {
             if valid.get(mode).and_then(Json::as_bool) != Some(true) {
                 continue;
@@ -937,115 +1394,191 @@ fn judge_captures_regress(r: &Json, pattern: &str, counts: &Counts, wrong: &mut 
                 wrong.push(format!("REFUSED\tcaptures.jsonl\t{where_}"));
                 continue;
             };
-            let judged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut results: Vec<(&str, bool)> = Vec::new();
-                let same = |e: &Exec, g: &Option<Groups16>| -> bool {
-                    match (e, g) {
-                        (None, None) => true,
-                        (Some(e), Some(g)) => e == g,
-                        _ => false,
+            // Each answer, its failure (a panic) an error.
+            let mut ask = |encoding: &str, what: &str, judged: &dyn Fn() -> bool| {
+                answer(counts, wrong, |counts, wrong| {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(judged)) {
+                        Ok(true) => {
+                            counts.right.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(false) => {
+                            counts.wrong.fetch_add(1, Ordering::Relaxed);
+                            wrong.push(format!("WRONG\tcaptures.jsonl\t{where_}\t{what}{encoding}"));
+                        }
+                        Err(_) => {
+                            counts.errors.fetch_add(1, Ordering::Relaxed);
+                            wrong.push(format!("ERROR\tcaptures.jsonl\t{where_}\t{what}{encoding}\tpanic"));
+                        }
+                    }
+                });
+            };
+            if options.utf16 {
+                let exec16 = |pos: usize| regress_exec(&re, unicode, text, pos);
+                for (what, judged) in regress_answers(a, text, unicode, true, true, &exec16) {
+                    ask("", what, &*judged);
+                }
+            }
+            if let (true, Some(utf8)) = (options.utf8, &utf8) {
+                // regress over a str from the byte offset of a UTF-16 position, its bounds taken back to UTF-16
+                // positions; a bound at a byte that is no position makes the answer wrong, and ends the operation.
+                let bad = std::cell::Cell::new(false);
+                let exec8 = |pos: usize| -> Option<(Groups16, Names16)> {
+                    if pos > text.len() || bad.get() {
+                        return None;
+                    }
+                    let m = re.find_from(utf8, byte_at[pos]).next()?;
+                    let unit = |r: Option<std::ops::Range<usize>>| -> Option<Option<(usize, usize)>> {
+                        match r {
+                            None => Some(None),
+                            Some(r) => Some(Some((*unit_at.get(&r.start)?, *unit_at.get(&r.end)?))),
+                        }
+                    };
+                    let groups: Option<Groups16> = (0..m.captures.len() + 1).map(|i| unit(m.group(i))).collect();
+                    let names: Option<Names16> =
+                        m.named_groups().map(|(n, r)| unit(r).map(|g| (n.to_string(), g))).collect();
+                    match (groups, names) {
+                        (Some(g), Some(n)) => Some((g, n)),
+                        _ => {
+                            bad.set(true);
+                            None
+                        }
                     }
                 };
-                let exec = regress_exec(&re, unicode, text, 0);
-                results.push(("exec", same(&exec_of(a.get("exec").unwrap()), &exec.as_ref().map(|x| x.0.clone()))));
-                // The global search.
-                let all: Vec<Exec> = a.get("all").and_then(Json::as_array).unwrap().iter().map(exec_of).collect();
-                let mut found: Vec<Groups16> = Vec::new();
-                let mut pos = 0;
-                while found.len() < 20 {
-                    let Some((g, _)) = regress_exec(&re, unicode, text, pos) else { break };
-                    let (s, e) = g[0].unwrap();
-                    pos = if s == e { advance16(text, e, unicode) } else { e };
-                    found.push(g);
-                }
-                let ok_all = if all.len() < 20 { found.len() == all.len() } else { found.len() >= 20 }
-                    && all.iter().zip(&found).all(|(e, g)| e.as_ref() == Some(g));
-                results.push(("all", ok_all));
-                if !text.is_empty() {
-                    let sticky = regress_exec(&re, unicode, text, 1).filter(|(g, _)| g[0].unwrap().0 == 1).map(|x| x.0);
-                    results.push(("sticky", same(&exec_of(a.get("sticky").unwrap()), &sticky)));
-                }
-                // replace and replaceAll.
-                for (what, global) in [("replace", false), ("replaceAll", true)] {
-                    let mut out = Vec::new();
-                    let (mut last, mut pos) = (0, 0);
-                    while let Some((g, names)) = regress_exec(&re, unicode, text, pos) {
-                        let (s, e) = g[0].unwrap();
-                        out.extend_from_slice(&text[last..s]);
-                        substitute16(&mut out, text, &g, &names, &template);
-                        last = e;
-                        if !global {
-                            break;
-                        }
-                        pos = if s == e { advance16(text, e, unicode) } else { e };
-                    }
-                    out.extend_from_slice(&text[last..]);
-                    results.push((what, a.get(what).and_then(Json::as_units).unwrap() == out));
-                }
-                // split and split3.
-                for (what, limit) in [("split", u32::MAX as usize), ("split3", 3)] {
-                    let mut out: Vec<Option<Vec<u16>>> = Vec::new();
-                    let size = text.len();
-                    if size == 0 {
-                        if regress_exec(&re, unicode, text, 0).is_none() {
-                            out.push(Some(Vec::new()));
-                        }
-                    } else {
-                        let (mut p, mut q) = (0, 0);
-                        'split: while q < size {
-                            let Some((g, _)) = regress_exec(&re, unicode, text, q) else { break };
-                            let (s, e) = g[0].unwrap();
-                            if s >= size {
-                                break;
-                            }
-                            if e.min(size) == p {
-                                q = advance16(text, s, unicode);
-                                continue;
-                            }
-                            out.push(Some(text[p..s].to_vec()));
-                            if out.len() == limit {
-                                break 'split;
-                            }
-                            p = e.min(size);
-                            for c in &g[1..] {
-                                out.push(c.map(|(x, y)| text[x..y].to_vec()));
-                                if out.len() == limit {
-                                    break 'split;
-                                }
-                            }
-                            q = p;
-                        }
-                        if out.len() < limit {
-                            out.push(Some(text[p..].to_vec()));
-                        }
-                    }
-                    let expected = a.get(what).and_then(Json::as_array).unwrap();
-                    let ok = expected.len() == out.len()
-                        && expected.iter().zip(&out).all(|(e, g)| match (e, g) {
-                            (Json::Null, None) => true,
-                            (Json::String(x), Some(y)) => x == y,
-                            _ => false,
-                        });
-                    results.push((what, ok));
-                }
-                results
-            }));
-            match judged {
-                Ok(results) => {
-                    for (what, ok) in results {
-                        if ok {
-                            counts.right.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            counts.wrong.fetch_add(1, Ordering::Relaxed);
-                            wrong.push(format!("WRONG\tcaptures.jsonl\t{where_}\t{what}"));
-                        }
-                    }
-                }
-                Err(_) => {
-                    counts.errors.fetch_add(1, Ordering::Relaxed);
-                    wrong.push(format!("ERROR\tcaptures.jsonl\t{where_}\tpanic"));
+                for (what, judged) in regress_answers(a, text, unicode, false, !inside_pair(text, 1), &exec8) {
+                    ask("-utf8", what, &|| {
+                        bad.set(false);
+                        judged() && !bad.get()
+                    });
                 }
             }
         }
     }
+}
+
+/// An answer of `captures.jsonl` written over regress's exec: its name and the judging of it.
+type Asked<'a> = (&'static str, Box<dyn Fn() -> bool + 'a>);
+
+/// The answers of one test of `captures.jsonl` under one grammar, from `exec` (the first match at or after a UTF-16
+/// position): exec, the global search, the sticky search (when `sticky` and the text is not empty), replace and
+/// replaceAll, and split and split3 when `splits`. Each is written over exec as ECMA-262 writes the String methods.
+fn regress_answers<'a>(
+    a: &'a Json,
+    text: &'a [u16],
+    unicode: bool,
+    splits: bool,
+    sticky: bool,
+    exec: &'a dyn Fn(usize) -> Option<(Groups16, Names16)>,
+) -> Vec<Asked<'a>> {
+    let same = |e: &Exec, g: &Option<Groups16>| -> bool {
+        match (e, g) {
+            (None, None) => true,
+            (Some(e), Some(g)) => e == g,
+            _ => false,
+        }
+    };
+    let mut out: Vec<Asked<'a>> = Vec::new();
+    out.push(("exec", Box::new(move || same(&exec_of(a.get("exec").unwrap()), &exec(0).map(|x| x.0)))));
+    // The global search.
+    out.push((
+        "all",
+        Box::new(move || {
+            let all: Vec<Exec> = a.get("all").and_then(Json::as_array).unwrap().iter().map(exec_of).collect();
+            let mut found: Vec<Groups16> = Vec::new();
+            let mut pos = 0;
+            while found.len() < 20 {
+                let Some((g, _)) = exec(pos) else { break };
+                let (s, e) = g[0].unwrap();
+                pos = if s == e { advance16(text, e, unicode) } else { e };
+                found.push(g);
+            }
+            (if all.len() < 20 { found.len() == all.len() } else { found.len() >= 20 })
+                && all.iter().zip(&found).all(|(e, g)| e.as_ref() == Some(g))
+        }),
+    ));
+    if sticky && !text.is_empty() {
+        out.push((
+            "sticky",
+            Box::new(move || {
+                let got = exec(1).filter(|(g, _)| g[0].unwrap().0 == 1).map(|x| x.0);
+                same(&exec_of(a.get("sticky").unwrap()), &got)
+            }),
+        ));
+    }
+    // replace and replaceAll.
+    for (what, global) in [("replace", false), ("replaceAll", true)] {
+        out.push((
+            what,
+            Box::new(move || {
+                let template: Vec<u16> = REPLACEMENT.encode_utf16().collect();
+                let mut out = Vec::new();
+                let (mut last, mut pos) = (0, 0);
+                while let Some((g, names)) = exec(pos) {
+                    let (s, e) = g[0].unwrap();
+                    out.extend_from_slice(&text[last..s]);
+                    substitute16(&mut out, text, &g, &names, &template);
+                    last = e;
+                    if !global {
+                        break;
+                    }
+                    pos = if s == e { advance16(text, e, unicode) } else { e };
+                }
+                out.extend_from_slice(&text[last..]);
+                a.get(what).and_then(Json::as_units).unwrap() == out
+            }),
+        ));
+    }
+    if !splits {
+        return out;
+    }
+    // split and split3.
+    for (what, limit) in [("split", u32::MAX as usize), ("split3", 3)] {
+        out.push((
+            what,
+            Box::new(move || {
+                let mut out: Vec<Option<Vec<u16>>> = Vec::new();
+                let size = text.len();
+                if size == 0 {
+                    if exec(0).is_none() {
+                        out.push(Some(Vec::new()));
+                    }
+                } else {
+                    let (mut p, mut q) = (0, 0);
+                    'split: while q < size {
+                        let Some((g, _)) = exec(q) else { break };
+                        let (s, e) = g[0].unwrap();
+                        if s >= size {
+                            break;
+                        }
+                        if e.min(size) == p {
+                            q = advance16(text, s, unicode);
+                            continue;
+                        }
+                        out.push(Some(text[p..s].to_vec()));
+                        if out.len() == limit {
+                            break 'split;
+                        }
+                        p = e.min(size);
+                        for c in &g[1..] {
+                            out.push(c.map(|(x, y)| text[x..y].to_vec()));
+                            if out.len() == limit {
+                                break 'split;
+                            }
+                        }
+                        q = p;
+                    }
+                    if out.len() < limit {
+                        out.push(Some(text[p..].to_vec()));
+                    }
+                }
+                let expected = a.get(what).and_then(Json::as_array).unwrap();
+                expected.len() == out.len()
+                    && expected.iter().zip(&out).all(|(e, g)| match (e, g) {
+                        (Json::Null, None) => true,
+                        (Json::String(x), Some(y)) => x == y,
+                        _ => false,
+                    })
+            }),
+        ));
+    }
+    out
 }
