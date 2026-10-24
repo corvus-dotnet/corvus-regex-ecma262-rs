@@ -5,8 +5,8 @@ central benchmark site (https://corvus-oss.org/corvus-regex-ecma262-benchmarks/)
 each night and builds the one page of figures from its data file; this repository publishes no results of its own.
 
 Usage: industry-results.py [--workloads <workloads.json>] --run <harness results json> --v8 <V8 results json> --out <data file>
-                           --compliance-corvus <runner output> --compliance-regress <runner output>
-                           --compliance-v8 <tools/benchmarks/v8/dataset.mjs output> [--run-url <url>]
+                           --compliance-corvus <compliance file> --compliance-regress <compliance file>
+                           --compliance-v8 <tools/benchmarks/v8/dataset.mjs's compliance file> [--run-url <url>]
 
 The run is the output of the harness (`cargo run --release --bin industry -- tools/benchmarks/workloads.json --out
 run.json`), whose facts are the run's own record of itself: the processor, the cores it was given, the system, the
@@ -14,9 +14,10 @@ load when it started, the runner when it is a GitHub-hosted one, the compiler, t
 seconds and passes of each figure, and the time it ended. V8's results are those of tools/benchmarks/v8/industry.mjs,
 which names its engine. Nothing is typed in: what is not in a record is not said.
 
-Each engine that claims ECMA-262 carries its compliance over the ECMA-262 test data, from the last line of its
-data-set runner: this crate's and regress's by `cargo run --release --bin dataset` (with `--engine regress`), V8's by
-tools/benchmarks/v8/dataset.mjs. regex does not claim it, and carries "not ECMA-262".
+Each engine that claims ECMA-262 carries its compliance over the ECMA-262 test data, the compliance file its data-set
+runner writes (--compliance: the counts, the runner and the calls it makes, and what it leaves out): this crate's and
+regress's by `cargo run --release --bin dataset` (with `--engine regress`), V8's by tools/benchmarks/v8/dataset.mjs.
+regex does not claim it, and carries "not ECMA-262".
 """
 import argparse, json, os, re, sys
 
@@ -58,53 +59,34 @@ workloads = json.load(open(args.workloads or os.path.join(root, "tools", "benchm
 ids = [w["id"] for w in workloads]
 
 
-def read_counts(path):
-    """The lines of a data-set runner's output and the counts of its last line of counts, or None, with a warning on
-    stderr, when the output cannot be read or that line is missing or lacks a count. That happens when the runner
-    failed, or when a checked-in file is missing or malformed. The engine is then written without a compliance, so a
-    fault in the compliance step costs that engine its compliance and never costs the run its figures, which have all
-    been timed by the time this runs."""
+def compliance(path):
+    """The compliance object a data-set runner wrote (its --compliance file), which the page reads as it is: the counts
+    (every answer the engine never gave, a limit, a crash, a hang or a worker that gave up, in `limited`, as the judging
+    rule of the test data counts it), `judge` and `excludes`, and for counts checked in beside the harness the commit
+    of the test data they were made at (`dataCommit`), which the page judges them against. None, with a warning on
+    stderr, when the file cannot be read or lacks one of them. That happens when the runner failed, or when a
+    checked-in file is missing or malformed. The engine is then written without a compliance, so a fault in the
+    compliance step costs that engine its compliance and never costs the run its figures, which have all been timed by
+    the time this runs."""
     try:
-        text = open(path, encoding="utf-8").read().splitlines()
-    except (OSError, UnicodeDecodeError) as e:
+        with open(path, encoding="utf-8") as f:
+            c = json.load(f)
+    except (OSError, ValueError) as e:
         print(f"warning: {path} could not be read ({e}), so its engine is written without a compliance", file=sys.stderr)
         return None
-    lines = [l for l in text if l.startswith("records ")]
-    c = {k: int(v) for k, v in re.findall(r"(right|wrong|refused-valid|accepted-invalid|limit|errors) (\d+)", lines[-1])} \
-        if lines else {}
-    missing = [k for k in ("right", "wrong", "refused-valid", "accepted-invalid") if k not in c]
+    missing = [k for k in ("right", "wrong", "refused", "acceptedInvalid", "limited", "judge", "excludes")
+               if not isinstance(c, dict) or k not in c]
     if missing:
-        what = "has no line of counts" if not lines else f"has no {', '.join(missing)} in its line of counts"
-        print(f"warning: {path} {what}, so its engine is written without a compliance", file=sys.stderr)
+        print(f"warning: {path} has no {', '.join(missing)}, so its engine is written without a compliance", file=sys.stderr)
         return None
-    return text, c
-
-
-def compliance(path, note=None):
-    """The counts of a data-set runner's last line of counts. Every answer the engine never gave (a limit, a crash, a
-    hang or a worker that gave up) is in `limited`, as the judging rule of the test data counts it: the runner's
-    limit and errors. None when the counts cannot be read (read_counts)."""
-    read = read_counts(path)
-    if read is None:
-        return None
-    text, c = read
-    out = {"right": c["right"], "wrong": c["wrong"], "refused": c["refused-valid"], "acceptedInvalid": c["accepted-invalid"],
-           "limited": c.get("limit", 0) + c.get("errors", 0)}
-    # Counts checked in beside the harness name the commit of the test data they were made at on their first line
-    # ("data <commit>"): the page judges them against what that commit asks.
-    if text and text[0].startswith("data ") and len(text[0].split()) == 2:
-        out["dataCommit"] = text[0].split()[1]
-    if note:
-        out["note"] = note
-    return out
+    return c
 
 
 ENGINES = [
     ("corvus-utf8", "corvus-regex-ecma262 UTF-8", "Rust", facts.get("corvus-regex-ecma262", ""), compliance(args.compliance_corvus)),
     ("corvus-utf16", "corvus-regex-ecma262 UTF-16", "Rust", facts.get("corvus-regex-ecma262", ""), compliance(args.compliance_corvus)),
     ("regex", "regex", "Rust", facts.get("regex", ""), "not ECMA-262"),
-    ("regress", "regress", "Rust", facts.get("regress", ""), compliance(args.compliance_regress,
-        "captures.jsonl is judged over UTF-16 only, since regress has no UTF-8 interface")),
+    ("regress", "regress", "Rust", facts.get("regress", ""), compliance(args.compliance_regress)),
 ]
 results = {}
 for key, name, _, _, _ in ENGINES:
@@ -140,13 +122,6 @@ if facts.get("protocol") == "interleaved":
 else:
     job = f"each figure the median of {facts.get('passes')} passes after a warm-up, {facts.get('seconds')} s for each workload of each engine, each in a process of its own"
     spread = ""
-
-# The encodings each engine's runner answers in, which the central benchmark page's compliance figure is a share of:
-# every answer the test data asks in those encodings, so an answer the runner did not ask counts against the engine.
-ENCODINGS = {"v8": ["utf16"]}
-for key, _, _, _, counts in ENGINES:
-    if isinstance(counts, dict):
-        counts["encodings"] = ENCODINGS.get(key, ["utf16", "utf8"])
 
 data = {
     "meta": {

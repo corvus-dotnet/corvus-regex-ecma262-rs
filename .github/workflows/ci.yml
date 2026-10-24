@@ -53,17 +53,17 @@ jobs:
         path: ecma262-regex-test-data
         persist-credentials: false
     - name: The checked-in counts were made at this commit of the test data
-      # The counts of an engine too slow to judge every night are checked in beside the harness, their first line the
-      # commit of the data they were made at; the benchmark page judges them against that commit. Moving the pin above
+      # The compliance of an engine too slow to judge every night is checked in beside the harness, with the commit of
+      # the data it was made at (dataCommit); the benchmark page judges it against that commit. Moving the pin above
       # means working them out again (docs/benchmarks/README.md), so they cannot fall behind it unnoticed.
       if: runner.os == 'Linux'
       run: |
         pin=$(git -C ecma262-regex-test-data rev-parse HEAD)
         fail=0
-        for f in $(git ls-files | grep -E '(^|/)compliance-[^/]*\.txt$'); do
-          first=$(head -n 1 "$f")
-          if [ "$first" != "data $pin" ]; then
-            echo "::error file=$f::$f says '$first', not the data CI checks out ($pin): work its counts out again at that commit."
+        for f in $(git ls-files | grep -E '(^|/)compliance-[^/]*\.json$'); do
+          made=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("dataCommit", "none"))' "$f")
+          if [ "$made" != "$pin" ]; then
+            echo "::error file=$f::$f was made at $made, not the data CI checks out ($pin): work its counts out again at that commit."
             fail=1
           fi
         done

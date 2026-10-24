@@ -62,9 +62,12 @@ For the central results contract, every port's image follows the same protocol:
 Beside its figures each engine carries its compliance with the
 [ECMA-262 test data](https://github.com/corvus-dotnet/ecma262-regex-test-data), judged by the data's own rule: the
 counts of right and wrong answers, of valid patterns refused, of invalid ones accepted, and of answers never given
-(`limited`: a limit, a crash or a hang, counted once for every answer the record would have had), or "not ECMA-262"
-for regex, which does not claim it. regress has no UTF-8 interface for captures, so `captures.jsonl` judges it over
-UTF-16 alone.
+(`limited`: an answer that passed the 2 seconds every runner gives one, or that the engine crashed or hung in), or
+"not ECMA-262" for regex, which does not claim it. regress is judged in both encodings, with the global search, the
+sticky search, replace and split written over its exec (it has none of them). It has no limit on a match, so it runs
+in child processes: a watchdog thread in each times every answer by the CPU time of the thread that runs regress, from
+just before regress is called, and ends the process at one that passes 2 seconds, and a new child goes on from the next
+answer. Once three answers of a record have reached the limit, its other answers are unanswered without being asked.
 
 **The results** are on one page, the central benchmark site,
 [corvus-oss.org/corvus-regex-ecma262-benchmarks](https://corvus-oss.org/corvus-regex-ecma262-benchmarks/), which runs
@@ -107,16 +110,19 @@ the workload's flags and `u`.
 
 Their compliance comes from the C data-set runner (`tools/c/dataset.c`), a C program that judges the C library through
 its header exactly as `tools/src/bin/dataset.rs` judges the crate, with the same counts, and judges `libregexp` the way
-the Rust runner judges regress: over UTF-16 alone (it has no UTF-8 interface), with the global search, replace and
-split written over its exec, each match given 2 seconds and 256 MB. QuickJS's compliance is worked out once and kept in
-`tools/c/compliance-quickjs.txt`, since many patterns take libregexp to its limit and the run takes some tens of
-minutes (`QUICKJS_COMPLIANCE=1` works it out again).
+the Rust runner judges regress: with the global search, replace and split written over its exec, each match given 2
+seconds and 256 MB. libregexp has no UTF-8 interface, so it is judged over UTF-16 alone. QuickJS's compliance is worked
+out once and kept in `tools/c/compliance-quickjs.json`, since many patterns take libregexp to its limit and the run
+takes some tens of minutes (`QUICKJS_COMPLIANCE=1` works it out again).
 
-Both checked-in files, `tools/c/compliance-quickjs.txt` and `tools/benchmarks/compliance-regress.txt`, start with the
-commit of the test data they were made at (`data <commit>`), which the results scripts give the page as the
-compliance's `dataCommit`: the page judges the counts against what that commit asks, and says so when it is not the
-commit the night's run judged the other engines at. CI fails when a file's commit is not the one CI checks the data
-out at, so moving CI's pin means working both out again (a run with the data cloned writes the line itself), and
+Every runner writes its engine's compliance file (`--compliance <file>`), which the results scripts give the central
+page as it is: the counts, `judge` (the runner and the calls it makes in each encoding) and `excludes` (what it leaves
+out, of the kinds the page allows: for libregexp, UTF-8 and the operations written over its exec; for regress, those
+operations). Both checked-in files,
+`tools/c/compliance-quickjs.json` and `tools/benchmarks/compliance-regress.json`, also give the commit of the test data
+they were made at (`dataCommit`): the page judges the counts against what that commit asks, and says so when it is not
+the commit the night's run judged the other engines at. CI fails when a file's commit is not the one CI checks the data
+out at, so moving CI's pin means working both out again (a run with the data cloned writes the commit itself), and
 releasing them as a harness release.
 
 The C image, `ghcr.io/corvus-dotnet/corvus-regex-ecma262-c` (`tools/c/Dockerfile`, published by

@@ -2,7 +2,7 @@
  * from C, judged by the data's own rule ("How a runner judges an engine" in its README) exactly as the Rust runner
  * (tools/src/bin/dataset.rs) judges the crate:
  *
- *   dataset <data directory> <wrong-cases output file> [file filter] [utf16|utf8|both]
+ *   dataset <data directory> <wrong-cases output file> [file filter] [utf16|utf8|both] [--compliance <file>]
  *
  * Built against the C library (corvus_regex_ecma262.h, linked as a consumer links it), it judges the library. Built
  * with DATASET_QUICKJS against QuickJS's libregexp (quickjs-ng), it judges that engine instead, as `dataset-quickjs`.
@@ -19,7 +19,17 @@
  * alone, over UTF-16 alone (it has no UTF-8 interface), so for it the runner is the caller, as QuickJS's own
  * String.prototype methods are: the global search, replace (GetSubstitution) and split are written over its exec as
  * the Rust runner writes them over regress's, and on captures.jsonl it gives the seven answers over UTF-16. A match is
- * given 2 seconds and, with libregexp, 256 MB of backtracking memory; reaching either is an answer never given. */
+ * given 2 seconds and, with libregexp, 256 MB of backtracking memory; reaching either is an answer never given.
+ *
+ * exec/test262.jsonl, the exec calls of test262 (in a directory of its own), is judged last: each call one exec with
+ * the record's flags from its lastIndex, right when the positions of the match and of every group, the named groups
+ * and, with g or y, the lastIndex after are V8's; one answer over UTF-16 and, when the text holds no lone surrogate and
+ * lastIndex is not between the halves of a pair, one over UTF-8 (the C library alone) with positions in bytes.
+ *
+ * With --compliance <file>, the engine's compliance object is written to the file, as the benchmark page reads it
+ * (docs/implementing-a-source.md in corvus-regex-ecma262-benchmarks): the counts, this runner and the calls it makes
+ * in each encoding, and what it leaves out (nothing for the C library; for libregexp, UTF-8 and the operations
+ * written over its exec). */
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -1237,9 +1247,289 @@ static void judge_captures(const json *r, const json *pattern, counts *c, lines 
     free(flags);
 }
 
+/* ------------------------------------------------------------------------------------------------------------------
+ * exec/test262.jsonl */
+
+static const char EXEC[] = "exec/test262.jsonl";
+
+/* An engine's match for a call: the bounds of the match and of each group ((size_t)-1 for a group that did not take
+ * part), and the bounds of each name's group (the one of that name that took part), the names as UTF-16. */
+typedef struct {
+    size_t groups_len;
+    size_t *groups;
+    size_t names_len;
+    const uint16_t **names;
+    size_t *name_lens;
+    size_t *named; /* 2 per name */
+} exec_got;
+
+static void exec_got_free(exec_got *g) {
+    free(g->groups);
+    free(g->names);
+    free(g->name_lens);
+    free(g->named);
+}
+
+/* A bound of the answer (a UTF-16 position) against the engine's, through map (NULL for none). */
+static bool same_bound(const json *b, size_t got, const size_t *map) {
+    size_t k = (size_t)b->number;
+    return (map ? map[k] : k) == got;
+}
+
+/* A span of the answer (null, or [start, end]) against the engine's. */
+static bool same_span(const json *e, size_t s, size_t t, const size_t *map) {
+    if (e->kind == JSON_NULL) return s == (size_t)-1;
+    if (e->kind != JSON_ARRAY || e->len != 2 || s == (size_t)-1) return false;
+    return same_bound(&e->items[0], s, map) && same_bound(&e->items[1], t, map);
+}
+
+/* Whether an engine's match (NULL for none) is the call's answer: both null, or the same groups, the same named groups
+ * (present exactly when the pattern has names) and, with g or y, a lastIndex after at the match's end. */
+static bool same_exec_answer(const json *answer, const exec_got *g, bool carries, const size_t *map) {
+    if (!g || answer->kind == JSON_NULL) return !g && answer->kind == JSON_NULL;
+    const json *captures = json_get(answer, "captures");
+    if (!captures || captures->kind != JSON_ARRAY || captures->len != g->groups_len) return false;
+    for (size_t k = 0; k < g->groups_len; k++) {
+        if (!same_span(&captures->items[k], g->groups[2 * k], g->groups[2 * k + 1], map)) return false;
+    }
+    const json *groups = json_get(answer, "groups");
+    if (!groups) {
+        if (g->names_len) return false;
+    } else {
+        if (groups->kind != JSON_OBJECT || groups->len != g->names_len) return false;
+        for (size_t k = 0; k < groups->len; k++) {
+            const json_member *m = &groups->members[k];
+            size_t name_len;
+            uint16_t *name = utf8_to_utf16(m->name, strlen(m->name), &name_len);
+            size_t found = g->names_len;
+            for (size_t n = 0; n < g->names_len; n++) {
+                if (units_equal(name, name_len, g->names[n], g->name_lens[n])) found = n;
+            }
+            free(name);
+            if (found == g->names_len || !same_span(&m->value, g->named[2 * found], g->named[2 * found + 1], map))
+                return false;
+        }
+    }
+    if (!carries) return true;
+    const json *last = json_get(answer, "lastIndex");
+    return last && last->kind == JSON_NUMBER && same_bound(last, g->groups[1], map);
+}
+
+/* A call's lastIndex. Past the end of the text exec gives null; test262 sets it as far as 2^53 - 1 and
+ * Number.MAX_VALUE, so anything past the end reads as the text's length plus one. */
+static size_t last_index_of(const json *t, size_t len) {
+    const json *v = json_get(t, "lastIndex");
+    double d = v && v->kind == JSON_NUMBER ? v->number : 0;
+    return d > (double)len ? len + 1 : (size_t)d;
+}
+
+#ifndef DATASET_QUICKJS
+/* Whether a position is between the halves of a surrogate pair, where UTF-8 has no position (libregexp has no UTF-8). */
+static bool inside_pair(const uint16_t *s, size_t len, size_t at) {
+    return at > 0 && at < len && s[at] >= 0xDC00 && s[at] <= 0xDFFF && s[at - 1] >= 0xD800 && s[at - 1] <= 0xDBFF;
+}
+#endif
+
+/* Counts one answer of a call: 1 right, 0 wrong, TEST_LIMIT or TEST_ERROR. */
+static void count_exec(counts *c, lines *w, const char *where, const char *encoding, int outcome, const char *why) {
+    sbuf b = {0};
+    switch (outcome) {
+    case 1: c->right++; return;
+    case 0:
+        c->wrong++;
+        sb_printf(&b, "WRONG\t%s\t%s\t%s", EXEC, where, encoding);
+        break;
+    case TEST_LIMIT:
+        c->limited++;
+        sb_printf(&b, "LIMIT\t%s\t%s\t%s\t%s", EXEC, where, encoding, why ? why : "limit");
+        break;
+    default:
+        c->errors++;
+        sb_printf(&b, "ERROR\t%s\t%s\t%s\t%s", EXEC, where, encoding, why ? why : "error");
+        break;
+    }
+    lines_push(w, &b);
+}
+
+#ifndef DATASET_QUICKJS
+
+/* The C library's exec at `start` over UTF-16 (utf8 NULL) or UTF-8: 1 with *g filled, 0 for no match, TEST_LIMIT or
+ * TEST_ERROR. A y flag makes it sticky, as the crate's own captures are. */
+static int exec_call(cre_regex *re, const uint16_t *text, size_t len, const char *utf8, size_t utf8_len, size_t start,
+                     exec_got *g, const char **why) {
+    cre_captures *caps = NULL;
+    cre_captures_new(re, &caps);
+    bool found = false;
+    cre_status status = utf8 ? cre_regex_captures_limit(re, utf8, utf8_len, start, LIMIT_MS, caps, &found)
+                             : cre_regex_captures_limit_utf16(re, text, len, start, LIMIT_MS, caps, &found);
+    int rc = status == CRE_OK ? (found ? 1 : 0) : status == CRE_MATCH_LIMIT ? TEST_LIMIT : TEST_ERROR;
+    if (rc == TEST_LIMIT) *why = "time";
+    if (rc == TEST_ERROR) *why = "error";
+    if (rc == 1) {
+        g->groups_len = cre_captures_len(caps);
+        g->groups = malloc(2 * g->groups_len * sizeof *g->groups);
+        groups_of(caps, g->groups);
+        g->names_len = cre_regex_group_name_count(re);
+        g->names = calloc(g->names_len + 1, sizeof *g->names);
+        g->name_lens = calloc(g->names_len + 1, sizeof *g->name_lens);
+        g->named = malloc((2 * g->names_len + 1) * sizeof *g->named);
+        for (size_t n = 0; n < g->names_len; n++) {
+            cre_str name = cre_regex_group_name(re, n);
+            g->names[n] = utf8_to_utf16(name.ptr, name.len, &g->name_lens[n]);
+            cre_match m;
+            cre_captures_name(caps, name.ptr, name.len, &m);
+            g->named[2 * n] = m.start;
+            g->named[2 * n + 1] = m.end;
+        }
+    }
+    cre_captures_free(caps);
+    return rc;
+}
+
+#else
+
+/* libregexp's exec at `start` over UTF-16: 1 with *g filled (a name's group the one of that name that took part), 0
+ * for no match, TEST_LIMIT or TEST_ERROR. libregexp reads the y flag from its bytecode, as QuickJS's exec does. */
+static int exec_call(engine_re *re, const uint16_t *text, size_t len, const char *utf8, size_t utf8_len, size_t start,
+                     exec_got *g, const char **why) {
+    (void)utf8, (void)utf8_len;
+    size_t n = (size_t)re->capture_count;
+    size_t *groups = malloc(2 * n * sizeof *groups);
+    int rc = engine_exec16(re, text, len, start, groups, why);
+    if (rc != 1) {
+        free(groups);
+        return rc;
+    }
+    g->groups_len = n;
+    g->groups = groups;
+    g->names = calloc(n, sizeof *g->names);
+    g->name_lens = calloc(n, sizeof *g->name_lens);
+    g->named = malloc(2 * n * sizeof *g->named);
+    for (size_t k = 1; re->names && k < n; k++) {
+        if (!re->names[k]) continue;
+        size_t at = g->names_len;
+        for (size_t m = 0; m < g->names_len; m++) {
+            if (units_equal(g->names[m], g->name_lens[m], re->names[k], re->name_lens[k])) at = m;
+        }
+        if (at == g->names_len) {
+            g->names[at] = re->names[k];
+            g->name_lens[at] = re->name_lens[k];
+            g->named[2 * at] = g->named[2 * at + 1] = (size_t)-1;
+            g->names_len++;
+        }
+        if (g->named[2 * at] == (size_t)-1 && groups[2 * k] != (size_t)-1) {
+            g->named[2 * at] = groups[2 * k];
+            g->named[2 * at + 1] = groups[2 * k + 1];
+        }
+    }
+    return 1;
+}
+
+#endif
+
+/* One answer of a call: exec from start (null past the end of the text), against the answer. */
+static int exec_answer_of(engine_re *re, const json *answer, const uint16_t *text, size_t len, const char *utf8,
+                          size_t utf8_len, const size_t *byte_at, size_t start, bool carries, const char **why) {
+    if (start > len) return answer->kind == JSON_NULL ? 1 : 0;
+    exec_got g = {0};
+    int rc = exec_call(re, text, len, utf8, utf8_len, utf8 ? byte_at[start] : start, &g, why);
+    if (rc < 0) return rc;
+    bool ok = same_exec_answer(answer, rc == 1 ? &g : NULL, carries, utf8 ? byte_at : NULL);
+    exec_got_free(&g);
+    return ok ? 1 : 0;
+}
+
+/* Judges a record of exec/test262.jsonl: the pattern with its own flags (g, y and d among them), from each call's
+ * lastIndex. */
+static void judge_exec(const json *r, const json *pattern, const options *o, counts *c, lines *w) {
+    const json *flags_j = json_string(json_get(r, "flags"));
+    size_t flags_len;
+    char *flags = utf16_to_utf8_lossy(flags_j ? flags_j->units : NULL, flags_j ? flags_j->len : 0, &flags_len);
+    sbuf shown = {0};
+    sb_shown(&shown, pattern);
+    bool is_error;
+    char *message;
+    engine_re *re = engine_compile(pattern->units, pattern->len, flags, &is_error, &message);
+    free(message);
+    const json *tests = json_get(r, "tests");
+    if (!re) {
+        c->refused++;
+        sbuf b = {0};
+        sb_printf(&b, "REFUSED\t%s\t/%s/%s", EXEC, shown.p ? shown.p : "", flags);
+        lines_push(w, &b);
+    } else {
+        bool carries = strchr(flags, 'g') || strchr(flags, 'y');
+        for (size_t t = 0; tests && tests->kind == JSON_ARRAY && t < tests->len; t++) {
+            const json *test = &tests->items[t];
+            if (json_is_true(json_get(test, "v8_deviation"))) continue;
+            const json *text = json_string(json_get(test, "text"));
+            const json *answer = json_get(test, "answer");
+            if (!text || !answer) continue;
+            size_t start = carries ? last_index_of(test, text->len) : 0;
+            sbuf where = {0};
+            sb_printf(&where, "/%s/%s\t", shown.p ? shown.p : "", flags);
+            sb_escape(&where, text->units, text->len);
+            sb_printf(&where, "\t%.17g", json_get(test, "lastIndex")->number);
+            const char *why = NULL;
+            if (o->utf16) {
+                int rc = exec_answer_of(re, answer, text->units, text->len, NULL, 0, NULL, start, carries, &why);
+                count_exec(c, w, where.p, "utf16", rc, why);
+            }
+#ifndef DATASET_QUICKJS
+            if (o->utf8 && !has_lone_surrogate(text->units, text->len) && !inside_pair(text->units, text->len, start)) {
+                size_t utf8_len;
+                char *utf8 = utf16_to_utf8_lossy(text->units, text->len, &utf8_len);
+                size_t *byte_at = byte_offsets(text->units, text->len);
+                int rc = exec_answer_of(re, answer, text->units, text->len, utf8, utf8_len, byte_at, start, carries, &why);
+                count_exec(c, w, where.p, "utf8", rc, why);
+                free(byte_at);
+                free(utf8);
+            }
+#endif
+            free(where.p);
+        }
+        engine_free(re);
+    }
+    free(shown.p);
+    free(flags);
+}
+
+/* Writes the engine's compliance as the benchmark page reads it: the counts, this runner and the calls it makes in
+ * each encoding it asked in, and what it leaves out. */
+static void write_compliance(const char *path, const options *o, const counts *t) {
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "cannot write %s\n", path);
+        exit(2);
+    }
+    fprintf(f, "{\"right\":%lld,\"wrong\":%lld,\"refused\":%lld,\"acceptedInvalid\":%lld,\"limited\":%lld,", t->right,
+            t->wrong, t->refused, t->accepted, t->limited + t->errors);
+    fprintf(f, "\"judge\":{\"runner\":\"https://github.com/corvus-dotnet/corvus-regex-ecma262-rs/blob/main/tools/c/dataset.c\",\"calls\":{");
+#ifdef DATASET_QUICKJS
+    (void)o;
+    fprintf(f, "\"utf16\":[\"lre_compile\",\"lre_exec\"]}},");
+    fprintf(f, "\"excludes\":[{\"class\":\"encoding\",\"leaves\":\"utf8\"},"
+               "{\"class\":\"operations\",\"leaves\":[\"global\",\"replace\",\"split\"]}]}\n");
+#else
+    if (o->utf16)
+        fprintf(f, "\"utf16\":[\"cre_regex_is_match_limit_utf16\",\"cre_regex_captures_limit_utf16\","
+                   "\"cre_regex_find_iter_utf16\",\"cre_regex_replace_utf16\",\"cre_regex_split_utf16\"]%s",
+                o->utf8 ? "," : "");
+    if (o->utf8)
+        fprintf(f, "\"utf8\":[\"cre_regex_is_match_limit\",\"cre_regex_captures_limit\",\"cre_regex_find_iter\","
+                   "\"cre_regex_replace\"]");
+    fprintf(f, "}},\"excludes\":[]}\n");
+#endif
+    fclose(f);
+}
+
 static void judge_record(const char *name, const json *r, const options *o, counts *c, lines *w) {
     const json *pattern = json_string(json_get(r, "pattern"));
     if (!pattern) return;
+    if (strcmp(name, EXEC) == 0) {
+        judge_exec(r, pattern, o, c, w);
+        return;
+    }
     if (strcmp(name, "captures.jsonl") == 0) {
         if (o->utf16) judge_captures(r, pattern, c, w);
         return;
@@ -1358,8 +1648,18 @@ static char *read_file(const char *path, size_t *len) {
 }
 
 int main(int argc, char **argv) {
+    const char *compliance = NULL;
+    for (int k = 1; k + 1 < argc; k++) {
+        if (strcmp(argv[k], "--compliance") == 0) {
+            compliance = argv[k + 1];
+            for (int m = k; m + 2 <= argc; m++) argv[m] = argv[m + 2];
+            argc -= 2;
+            break;
+        }
+    }
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <data directory> <wrong-cases file> [file filter] [utf16|utf8|both]\n", argv[0]);
+        fprintf(stderr, "usage: %s <data directory> <wrong-cases file> [file filter] [utf16|utf8|both] [--compliance <file>]\n",
+                argv[0]);
         return 2;
     }
     const char *directory = argv[1], *wrong_path = argv[2];
@@ -1379,6 +1679,17 @@ int main(int argc, char **argv) {
         }
     }
     qsort(files, kept, sizeof *files, compare_strings);
+    /* The exec calls of test262, in a directory of their own: with the default filter, or one that names them. */
+    if (strcmp(filter, "*.jsonl") == 0 || strncmp(filter, "exec", 4) == 0) {
+        char path[4096];
+        snprintf(path, sizeof path, "%s/%s", directory, EXEC);
+        FILE *probe = fopen(path, "rb");
+        if (probe) {
+            fclose(probe);
+            files = realloc(files, (kept + 1) * sizeof *files);
+            files[kept++] = strdup(EXEC);
+        }
+    }
     counts total = {0};
     lines wrong = {0};
     long long records = 0, skipped = 0;
@@ -1443,6 +1754,7 @@ int main(int argc, char **argv) {
         for (size_t k = 0; k < wrong.len; k++) fprintf(out, "%s\n", wrong.items[k]);
         fclose(out);
     }
+    if (compliance) write_compliance(compliance, &o, &total);
     printf("\nrecords %lld (skipped %lld deviations)  right %lld  wrong %lld  refused-valid %lld  accepted-invalid %lld  "
            "limit %lld  errors %lld  in %.1fs\n",
            records, skipped, total.right, total.wrong, total.refused, total.accepted, total.limited, total.errors,

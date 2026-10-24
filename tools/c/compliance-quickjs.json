@@ -1,0 +1,31 @@
+{
+ "right": 15653583,
+ "wrong": 109,
+ "refused": 61,
+ "acceptedInvalid": 23,
+ "limited": 983,
+ "judge": {
+  "runner": "https://github.com/corvus-dotnet/corvus-regex-ecma262-rs/blob/main/tools/c/dataset.c",
+  "calls": {
+   "utf16": [
+    "lre_compile",
+    "lre_exec"
+   ]
+  }
+ },
+ "excludes": [
+  {
+   "class": "encoding",
+   "leaves": "utf8"
+  },
+  {
+   "class": "operations",
+   "leaves": [
+    "global",
+    "replace",
+    "split"
+   ]
+  }
+ ],
+ "dataCommit": "cff0860b7ebc5eb9c801eb9f8cec9d5398688ff2"
+}
