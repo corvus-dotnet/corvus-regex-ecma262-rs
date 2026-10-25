@@ -10,7 +10,8 @@ on:
     inputs:
       tag:
         # A release's tag (capi-publish.yml): its version is written into the manifests and the header, which hold
-        # 0.0.0, before the build (tools/release/stamp.ps1). Empty for CI, which builds the placeholder.
+        # 0.0.0, before the build (tools/release/stamp.ps1). CI passes v99.98.97, so that the stamping runs in every
+        # job of every pull request, as a release runs it.
         type: string
         default: ''
 
@@ -46,6 +47,8 @@ jobs:
           persist-credentials: false
       - name: Write the release's version
         if: inputs.tag != ''
+        # The job's steps run in corvus-regex-ecma262-capi; the script and release.json are at the root.
+        working-directory: .
         shell: pwsh
         env:
           TAG: ${{ inputs.tag }}
@@ -172,6 +175,8 @@ jobs:
           persist-credentials: false
       - name: Write the release's version
         if: inputs.tag != ''
+        # The job's steps run in corvus-regex-ecma262-capi; the script and release.json are at the root.
+        working-directory: .
         shell: pwsh
         env:
           TAG: ${{ inputs.tag }}
