@@ -198,7 +198,7 @@ version sets `nextVersion` in `release.json` (a minor version is a breaking chan
 its install line). A pull request labelled `no_release` releases nothing, and its changes ship with the next release.
 
 The tag is the version. The manifests, `CRE_VERSION_*` (in the C library's `src/lib.rs` and header) and the smoke
-test's CMake request hold `0.0.0-dev`, and each workflow that builds a release writes the tag's version into them first
+test's CMake request hold `0.0.0`, and each workflow that builds a release writes the tag's version into them first
 (`tools/release/stamp.ps1`; a test checks they agree). The one release carries everything, through four workflows:
 `crates-publish.yml` tests the crate, runs the ECMA-262 test data and publishes it to crates.io by trusted publishing (no
 token is stored); `capi-publish.yml` builds the C library's archives for Linux (x64 and arm64, glibc and musl), macOS

@@ -36,9 +36,12 @@ $version = "$major.$minor.$patch"
 
 foreach ($s in @($library.stamp)) {
     $text = [IO.File]::ReadAllText((Resolve-Path $s.file))
-    $found = ([regex]::Matches($text, [regex]::Escape($s.placeholder))).Count
+    # A placeholder spanning lines is written with \n; a file checked out with CRLF has \r\n.
+    $newline = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $placeholder = $s.placeholder.Replace("`n", $newline)
+    $found = ([regex]::Matches($text, [regex]::Escape($placeholder))).Count
     if ($found -ne $s.count) { throw "$($s.file) has the placeholder '$($s.placeholder)' $found times, not $($s.count)" }
     $with = $s.with.Replace('{version}', $version).Replace('{major}', $major).Replace('{minor}', $minor).Replace('{patch}', $patch)
-    [IO.File]::WriteAllText((Resolve-Path $s.file), $text.Replace($s.placeholder, $with))
+    [IO.File]::WriteAllText((Resolve-Path $s.file), $text.Replace($placeholder, $with.Replace("`n", $newline)))
     Write-Host "$($s.file): '$($s.placeholder)' -> '$with' ($found)"
 }

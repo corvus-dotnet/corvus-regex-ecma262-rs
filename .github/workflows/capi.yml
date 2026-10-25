@@ -10,7 +10,7 @@ on:
     inputs:
       tag:
         # A release's tag (capi-publish.yml): its version is written into the manifests and the header, which hold
-        # 0.0.0-dev, before the build (tools/release/stamp.ps1). Empty for CI, which builds the placeholder.
+        # 0.0.0, before the build (tools/release/stamp.ps1). Empty for CI, which builds the placeholder.
         type: string
         default: ''
 

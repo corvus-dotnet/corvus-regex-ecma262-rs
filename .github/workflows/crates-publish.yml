@@ -1,6 +1,6 @@
 # Publishes the corvus-regex-ecma262 crate to crates.io when a GitHub release tagged v<version> is published, which
 # auto-release.yml does after a merged pull request that changed the engine. The version is the tag's: the manifests hold
-# 0.0.0-dev, and tools/release/stamp.ps1 writes the tag's version into them before the build (it is never committed, so
+# 0.0.0, and tools/release/stamp.ps1 writes the tag's version into them before the build (it is never committed, so
 # cargo publish is given --allow-dirty). A version already on crates.io publishes nothing, so re-running a release's job
 # is safe.
 #

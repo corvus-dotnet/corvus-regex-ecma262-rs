@@ -31,7 +31,7 @@ jobs:
       with:
         persist-credentials: false
     - name: Write the release's version
-      # The harness reports the engine's version, from the manifests, which hold 0.0.0-dev. A release image (v<version>,
+      # The harness reports the engine's version, from the manifests, which hold 0.0.0. A release image (v<version>,
       # or harness-<version>.<n> for the engine at <version>) reports the release's.
       if: github.event_name == 'release'
       env:
