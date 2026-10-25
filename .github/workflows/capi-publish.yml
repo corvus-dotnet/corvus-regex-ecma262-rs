@@ -1,7 +1,7 @@
 # Attaches the C library's archives to a GitHub release of this repository: one release, v<version>, carries the
 # crate (crates-publish.yml), the harness images (harness-image.yml, c-harness-image.yml) and the C archives. The
 # archives for every platform are built and tested by capi.yml, then uploaded to the release. The C library's version
-# is the engine's, and the tag must name it.
+# is the engine's: the tag's, which capi.yml writes into the manifests and the header (tools/release/stamp.ps1).
 #
 # - A published release attaches them to itself, built from the release's commit.
 # - A manual run (workflow_dispatch) attaches them to the existing release named by its tag input, built from main,
@@ -41,20 +41,14 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Check the tag names the version, and the release exists
+      - name: Check the tag is a version, and the release exists
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' corvus-regex-ecma262-capi/Cargo.toml | head -n 1)
-          engine=$(sed -n 's/^version = "\(.*\)"$/\1/p' corvus-regex-ecma262/Cargo.toml | head -n 1)
-          if [ "$version" != "$engine" ]; then
-            echo "::error::The C library's version ($version) is not the engine's ($engine)."
-            exit 1
-          fi
-          if [ "$TAG" != "v$version" ]; then
-            echo "::error::The tag is $TAG but corvus-regex-ecma262-capi/Cargo.toml says $version (the tag must be v$version)."
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The tag is $TAG, which is not v<major>.<minor>.<patch>."
             exit 1
           fi
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null; then
@@ -72,6 +66,8 @@ jobs:
     name: Build and test
     needs: version
     uses: ./.github/workflows/capi.yml
+    with:
+      tag: ${{ needs.version.outputs.tag }}
 
   attach:
     name: Attach to ${{ needs.version.outputs.tag }}

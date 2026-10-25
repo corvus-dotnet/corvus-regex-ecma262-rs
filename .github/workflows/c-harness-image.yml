@@ -30,6 +30,13 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
+    - name: Write the release's version
+      # The harness reports the engine's version, from the manifests, which hold 0.0.0-dev. A release image (v<version>,
+      # or harness-<version>.<n> for the engine at <version>) reports the release's.
+      if: github.event_name == 'release'
+      env:
+        TAG: ${{ github.event.release.tag_name }}
+      run: pwsh -NoProfile -File tools/release/stamp.ps1 -Tag "$TAG"
     - name: Build the C harness image
       run: docker build --build-arg COMMIT="${GITHUB_SHA::7}" -f tools/c/Dockerfile -t harness .
     - name: "Smoke-run it: two workloads, the short job, as the central site runs it"

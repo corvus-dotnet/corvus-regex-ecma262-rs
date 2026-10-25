@@ -1,12 +1,15 @@
-# Publishes the corvus-regex-ecma262 crate to crates.io when a GitHub release is published. The release's tag must be
-# v<version> for the version in corvus-regex-ecma262/Cargo.toml; a version already on crates.io publishes nothing, so
-# re-running a release's job is safe. To release: bump the version, push, and publish a release tagged v<version>.
+# Publishes the corvus-regex-ecma262 crate to crates.io when a GitHub release tagged v<version> is published, which
+# auto-release.yml does after a merged pull request that changed the engine. The version is the tag's: the manifests hold
+# 0.0.0-dev, and tools/release/stamp.ps1 writes the tag's version into them before the build (it is never committed, so
+# cargo publish is given --allow-dirty). A version already on crates.io publishes nothing, so re-running a release's job
+# is safe.
 #
 # It authenticates with crates.io trusted publishing (OIDC): no token is stored, and the crate's trusted publisher on
 # crates.io names this repository and this workflow file, so keep the file name.
 #
 # crates.io has no staged approval: the publish step makes the version live, and a published version can be yanked
-# but never replaced or deleted. The C library (corvus-regex-ecma262-capi) is not published.
+# but never replaced or deleted. The C library (corvus-regex-ecma262-capi) is not published to crates.io; its archives
+# are attached to the release (capi-publish.yml).
 name: crates-publish
 on:
   release:
@@ -33,16 +36,16 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
-    - name: Check the tag names this version and whether crates.io has it
+    - name: Take the version from the tag and ask whether crates.io has it
       id: version
       env:
         TAG: ${{ github.event.release.tag_name }}
       run: |
-        version=$(sed -n 's/^version = "\(.*\)"$/\1/p' corvus-regex-ecma262/Cargo.toml | head -n 1)
-        if [ "$TAG" != "v$version" ]; then
-          echo "::error::The release's tag is $TAG but corvus-regex-ecma262/Cargo.toml says $version (the tag must be v$version)."
+        if ! [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+          echo "::error::The release's tag is $TAG, which is not v<major>.<minor>.<patch>."
           exit 1
         fi
+        version=${BASH_REMATCH[1]}
         echo "version=$version" >> "$GITHUB_OUTPUT"
         # crates.io answers 404 for a version it does not have; it asks callers for a user agent.
         status=$(curl -s -o /dev/null -w '%{http_code}' -A 'corvus-dotnet/corvus-regex-ecma262-rs crates-publish' \
@@ -57,6 +60,11 @@ jobs:
             echo "::error::crates.io answered $status for corvus-regex-ecma262 $version."
             exit 1 ;;
         esac
+    - name: Write the version into the manifests
+      if: steps.version.outputs.published == 'false'
+      env:
+        TAG: ${{ github.event.release.tag_name }}
+      run: pwsh -NoProfile -File tools/release/stamp.ps1 -Tag "$TAG"
     - name: Install the toolchain of rust-toolchain.toml
       if: steps.version.outputs.published == 'false'
       run: rustup show
@@ -79,7 +87,7 @@ jobs:
     - name: Package
       # Builds the crate from its packaged sources, as crates.io will.
       if: steps.version.outputs.published == 'false'
-      run: cargo publish -p corvus-regex-ecma262 --locked --dry-run
+      run: cargo publish -p corvus-regex-ecma262 --locked --allow-dirty --dry-run
     - name: Authenticate with crates.io
       if: steps.version.outputs.published == 'false'
       id: auth
@@ -90,7 +98,7 @@ jobs:
         CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         VERSION: ${{ steps.version.outputs.version }}
       run: |
-        cargo publish -p corvus-regex-ecma262 --locked
+        cargo publish -p corvus-regex-ecma262 --locked --allow-dirty
         {
           echo "### corvus-regex-ecma262 $VERSION is published"
           echo
