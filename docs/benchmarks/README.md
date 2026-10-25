@@ -31,9 +31,9 @@ changes on the host during a run (its clock, its heat, its other work) falls on 
   costs the run 30 s rather than a limit in every round. The page shows such a figure as "> 30 s": the engine did not
   produce a result within 30 s. (The limit was two minutes in every round until 2026-10-23, when R's PCRE2 row spent
   78 minutes of a nightly run on 13 workloads that never gave a figure.)
-- **The counts.** Every engine's count is compared with V8's, the oracle of the test data. An ECMA-262 engine that
-  counts otherwise is an error on that workload; regex, which does not claim ECMA-262, keeps its figure and the
-  workload carries "counts differ" with both counts.
+- **The counts.** Every engine's count is compared with V8's, the oracle of the test data. An engine that counts
+  otherwise has given a wrong answer on that workload, whatever its dialect (`regex`, which does not claim ECMA-262,
+  as much as this library): it has no figure there, and the central page shows a failure with both counts.
 - **V8 once.** Run with `V8=0` (the central benchmark run gives it to every image but the one that times V8), a harness
   times no V8 and runs no V8 over the test data: it compares each count with the workload's `v8Count`, V8's count,
   which the central run writes into the workloads once before any image runs, and its data file has no V8 row.
