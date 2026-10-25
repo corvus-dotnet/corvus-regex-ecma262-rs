@@ -108,8 +108,10 @@ jobs:
 
   capi:
     # The C library's archives on every release platform (capi.yml), with no filter of paths, so the gate can
-    # require them.
+    # require them. The probe tag runs the release's stamping (tools/release/stamp.ps1) in every job.
     uses: ./.github/workflows/capi.yml
+    with:
+      tag: v99.98.97
 
   gate:
     # The one check of this workflow that the ruleset of main requires: it passes when every job above passed (or was
