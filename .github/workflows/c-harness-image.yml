@@ -65,8 +65,8 @@ jobs:
       # The central site runs this image with V8=0, so that V8 is timed once a night, and each engine's count is checked
       # against the v8Count it writes into the workloads. The steps above never take that path. Here zqj carries its true
       # count (0) and aei a wrong one (999), since no engine finds aei in the text and every engine counts 0 there. The data
-      # file must have no V8 row, every ECMA-262 engine must time zqj and give aei as a wrong count, and every engine of
-      # another dialect keeps its figure on aei.
+      # file must have no V8 row, and every engine, of whatever dialect, must time zqj and give aei as a wrong count: a
+      # count other than V8's is a wrong answer, whatever the dialect.
       run: |
         python3 -c "import json; w=json.load(open('workloads.json')); [x.update(v8Count={'sherlock: zqj': 0, 'sherlock: aei': 999}[x['id']]) for x in w]; json.dump(w, open('workloads-night.json','w'), ensure_ascii=False)"
         mkdir -p out-night && chmod 777 out-night
@@ -79,14 +79,11 @@ jobs:
         ecma = [i["name"] for i in d["impls"] if isinstance(i.get("compliance"), dict)]
         others = [i["name"] for i in d["impls"] if i.get("compliance") == "not ECMA-262"]
         assert ecma and len(ecma) + len(others) == len(names), names
-        for name in ecma:
+        for name in ecma + others:
             zqj, aei = d["results"][name].get("sherlock: zqj"), d["results"][name].get("sherlock: aei")
             assert isinstance(zqj, dict) and "time" in zqj, (name, zqj)
             assert aei == {"wrongCount": {"counted": 0, "v8": 999}}, (name, aei)
-        for name in others:
-            aei = d["results"][name].get("sherlock: aei")
-            assert isinstance(aei, dict) and "time" in aei, (name, aei)
-        print("night run: no V8 row;", len(ecma), "ECMA-262 engines held to v8Count;", len(others), "others kept their figures")
+        print("night run: no V8 row;", len(ecma) + len(others), "engines, of every dialect, held to v8Count")
         PY
     - name: "Count gate: every workload counted by this library beside V8, each count V8's"
       # A count that differs from V8's is a wrong answer, which the central page shows as a wrong count: it fails here,
