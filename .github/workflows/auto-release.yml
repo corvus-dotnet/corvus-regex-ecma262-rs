@@ -1,8 +1,9 @@
 # Releases what a merged pull request changed, unless it is labelled no_release: each package of .github/release.json
 # whose paths changed since its last tag gets the next patch version (tools/release/release.ps1), as a published GitHub
-# release on the merge commit. maven-publish.yml then publishes the library to Maven Central and harness-image.yml the
-# image under the release's tag. A pull request labelled no_release releases nothing; its changes ship with the next
-# release. The design is docs/plan/automatic-releases.md in corvus-dotnet/Corvus.Regex.Ecma262.
+# release on the merge commit. The workflows that run on a published release then publish it (README.md, Releasing). A
+# pull request labelled no_release releases nothing; its changes ship with the next release. The same file in every
+# repository of the regex engines (keep the copies identical); the design is docs/plan/automatic-releases.md in
+# corvus-dotnet/Corvus.Regex.Ecma262.
 name: auto-release
 on:
   pull_request:
