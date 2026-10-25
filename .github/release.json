@@ -1,0 +1,99 @@
+{
+  "packages": [
+    {
+      "name": "corvus-regex-ecma262",
+      "tag": "v",
+      "paths": [
+        "Cargo.toml",
+        "rust-toolchain.toml",
+        "corvus-regex-ecma262/Cargo.toml",
+        "corvus-regex-ecma262/src/",
+        "corvus-regex-ecma262-capi/Cargo.toml",
+        "corvus-regex-ecma262-capi/build.rs",
+        "corvus-regex-ecma262-capi/src/",
+        "corvus-regex-ecma262-capi/include/",
+        "corvus-regex-ecma262-capi/cmake/",
+        "corvus-regex-ecma262-capi/package.ps1",
+        "corvus-regex-ecma262-capi/xcframework.ps1"
+      ],
+      "stamp": [
+        {
+          "file": "corvus-regex-ecma262/Cargo.toml",
+          "placeholder": "version = \"0.0.0\"",
+          "with": "version = \"{version}\"",
+          "count": 1
+        },
+        {
+          "file": "corvus-regex-ecma262-capi/Cargo.toml",
+          "placeholder": "version = \"0.0.0\"",
+          "with": "version = \"{version}\"",
+          "count": 2
+        },
+        {
+          "file": "Cargo.lock",
+          "placeholder": "name = \"corvus-regex-ecma262\"\nversion = \"0.0.0\"\n",
+          "with": "name = \"corvus-regex-ecma262\"\nversion = \"{version}\"\n",
+          "count": 1
+        },
+        {
+          "file": "Cargo.lock",
+          "placeholder": "name = \"corvus-regex-ecma262-capi\"\nversion = \"0.0.0\"\n",
+          "with": "name = \"corvus-regex-ecma262-capi\"\nversion = \"{version}\"\n",
+          "count": 1
+        },
+        {
+          "file": "corvus-regex-ecma262-capi/include/corvus_regex_ecma262.h",
+          "placeholder": "#define CRE_VERSION_MAJOR 0\n",
+          "with": "#define CRE_VERSION_MAJOR {major}\n",
+          "count": 1
+        },
+        {
+          "file": "corvus-regex-ecma262-capi/include/corvus_regex_ecma262.h",
+          "placeholder": "#define CRE_VERSION_MINOR 0\n",
+          "with": "#define CRE_VERSION_MINOR {minor}\n",
+          "count": 1
+        },
+        {
+          "file": "corvus-regex-ecma262-capi/include/corvus_regex_ecma262.h",
+          "placeholder": "#define CRE_VERSION_PATCH 0\n",
+          "with": "#define CRE_VERSION_PATCH {patch}\n",
+          "count": 1
+        },
+        {
+          "file": "corvus-regex-ecma262-capi/src/lib.rs",
+          "placeholder": "pub const CRE_VERSION_MAJOR: u32 = 0;",
+          "with": "pub const CRE_VERSION_MAJOR: u32 = {major};",
+          "count": 1
+        },
+        {
+          "file": "corvus-regex-ecma262-capi/src/lib.rs",
+          "placeholder": "pub const CRE_VERSION_MINOR: u32 = 0;",
+          "with": "pub const CRE_VERSION_MINOR: u32 = {minor};",
+          "count": 1
+        },
+        {
+          "file": "corvus-regex-ecma262-capi/src/lib.rs",
+          "placeholder": "pub const CRE_VERSION_PATCH: u32 = 0;",
+          "with": "pub const CRE_VERSION_PATCH: u32 = {patch};",
+          "count": 1
+        },
+        {
+          "file": "corvus-regex-ecma262-capi/tests/native/CMakeLists.txt",
+          "placeholder": "find_package(corvus_regex_ecma262 0.0 CONFIG REQUIRED)",
+          "with": "find_package(corvus_regex_ecma262 {major}.{minor} CONFIG REQUIRED)",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "name": "harness",
+      "harnessOf": "corvus-regex-ecma262",
+      "tag": "harness-",
+      "paths": [
+        "Dockerfile",
+        "tools/benchmarks/",
+        "tools/c/"
+      ]
+    }
+  ]
+}

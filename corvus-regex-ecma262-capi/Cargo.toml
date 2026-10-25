@@ -1,6 +1,6 @@
 [package]
 name = "corvus-regex-ecma262-capi"
-version = "0.2.1"
+version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,6 +17,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 # Renamed: the C library is itself `corvus_regex_ecma262`, and its tests use both.
-corvus = { package = "corvus-regex-ecma262", path = "../corvus-regex-ecma262", version = "0.2.1" }
+corvus = { package = "corvus-regex-ecma262", path = "../corvus-regex-ecma262", version = "0.0.0" }
 # Checks a UTF-8 text in about half the time std does.
 simdutf8 = "0.1.5"

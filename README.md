@@ -190,22 +190,26 @@ beside its figures: see [docs/benchmarks](docs/benchmarks/README.md), and the re
 
 ## Releasing
 
-Bump `version` in `corvus-regex-ecma262/Cargo.toml` and in `corvus-regex-ecma262-capi/Cargo.toml` (the C library's
-version is the engine's, with `CRE_VERSION_*` in its `src/lib.rs` and header; a test checks they agree), push it, and
-publish a GitHub release tagged `v<version>` on that commit. The one release carries everything, through four
-workflows: `crates-publish.yml` tests the crate, runs the ECMA-262 test data and publishes it to crates.io by trusted
-publishing (no token is stored); `capi-publish.yml` builds the C library's archives for Linux (x64 and arm64, glibc and
-musl), macOS (arm64 and x64) and Windows (x64 and arm64), tests each by building the smoke test against it, and
-attaches them to the release; and `harness-image.yml` and `c-harness-image.yml` publish the benchmark images under the
-release's tag, which the central benchmark page runs from that night. A tag that does not match the version fails the
-publish. `capi-publish.yml` can also be run by hand with a tag, to attach the archives to a release made before it
-existed; it refuses when the engine's sources have changed since that tag.
+Every merged pull request releases what it changed, unless it is labelled `no_release`. `auto-release.yml` runs
+`tools/release/release.ps1` on the merge commit: when the engine's code changed since its last tag (the paths
+`.github/release.json` lists: the crates' sources, manifests and the C library's packaging, not their tests or READMEs),
+it makes a GitHub release tagged `v<version>` with the next patch version. A pull request that needs a minor or major
+version sets `nextVersion` in `release.json` (a minor version is a breaking change, and the crate's README names it in
+its install line). A pull request labelled `no_release` releases nothing, and its changes ship with the next release.
 
-A change to the benchmark harness alone (the harness, a Dockerfile, a runner, or another engine's checked-in counts)
-needs no version: it is a harness release, `gh release create harness-<version>.<n> --latest=false` (for example
-`harness-0.2.1.1`). Only the two image workflows run for it; `crates-publish.yml` and `capi-publish.yml` skip a tag
-that starts `harness-`, and the repository's Latest stays the crate's release. The central page takes each image at
-the newest release of either kind.
+The tag is the version. The manifests, `CRE_VERSION_*` (in the C library's `src/lib.rs` and header) and the smoke
+test's CMake request hold `0.0.0`, and each workflow that builds a release writes the tag's version into them first
+(`tools/release/stamp.ps1`; a test checks they agree). The one release carries everything, through four workflows:
+`crates-publish.yml` tests the crate, runs the ECMA-262 test data and publishes it to crates.io by trusted publishing (no
+token is stored); `capi-publish.yml` builds the C library's archives for Linux (x64 and arm64, glibc and musl), macOS
+(arm64 and x64) and Windows (x64 and arm64), tests each by building the smoke test against it, and attaches them to the
+release; and `harness-image.yml` and `c-harness-image.yml` publish the benchmark images under the release's tag, which
+the central benchmark page runs from that night. `capi-publish.yml` can also be run by hand with a tag, to attach the
+archives to a release made before it existed; it refuses when the engine's sources have changed since that tag.
+
+When only the benchmark harness changed (`Dockerfile`, `tools/benchmarks/`, `tools/c/`), the release is
+`harness-<version>.<n>`, for the engine at `v<version>`. Only the two image workflows run for it, and the repository's
+Latest stays the engine's release. The central page takes each image at the newest release of either kind.
 
 ## Licence
 

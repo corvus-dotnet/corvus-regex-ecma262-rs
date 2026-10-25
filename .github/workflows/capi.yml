@@ -7,6 +7,12 @@ name: capi
 on:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      tag:
+        # A release's tag (capi-publish.yml): its version is written into the manifests and the header, which hold
+        # 0.0.0, before the build (tools/release/stamp.ps1). Empty for CI, which builds the placeholder.
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -38,6 +44,12 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Write the release's version
+        if: inputs.tag != ''
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: ./tools/release/stamp.ps1 -Tag $env:TAG
       - name: Toolchain
         # rustup where the runner image has none, then the version pinned in rust-toolchain.toml.
         env:
@@ -158,6 +170,12 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Write the release's version
+        if: inputs.tag != ''
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: ./tools/release/stamp.ps1 -Tag $env:TAG
       - name: Toolchain
         # The version pinned in rust-toolchain.toml, with every Apple target the XCFramework holds.
         run: |
