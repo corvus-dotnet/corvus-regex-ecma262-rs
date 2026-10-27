@@ -1,7 +1,7 @@
 //! Runs an engine over the ECMA-262 regular expression test data (github.com/corvus-dotnet/ecma262-regex-test-data).
 //!
 //!   dataset <data directory> <wrong-cases output file> [file filter] [utf16|utf8|both] [--engine corvus|regress]
-//!           [--compliance <file>]
+//!           [--compliance <file>] [--edition current|es2020] [--unicode 13|17|18|latest]
 //!
 //! Each record is asked about under each grammar V8 found it valid in: the record's flags with u added (the
 //! `unicode` answers), the record's flags alone (the `legacy` answers) and, in the file that has them, the flags with
@@ -32,6 +32,9 @@
 //! three answers of a record have reached the limit, its other answers are unanswered without being asked, so that a
 //! pattern regress cannot answer on any text costs seconds, not one limit for each of its answers.
 //!
+//! With `--edition` and `--unicode` this crate reads every pattern with that edition's grammar and that version's
+//! tables, and the data is the data as `node edition.js apply` or `node unicode.js apply` writes it for them.
+//!
 //! With `--compliance <file>`, the engine's compliance object is written to the file, as the benchmark page reads it
 //! (docs/implementing-a-source.md in corvus-regex-ecma262-benchmarks): the counts, this runner and the calls it makes
 //! in each encoding, and what it leaves out (nothing for this crate; for regress, the operations written over its
@@ -44,7 +47,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use corvus_regex_ecma262::{Error, MatchError, Regex};
+use corvus_regex_ecma262::{Edition, Error, MatchError, Regex, RegexBuilder, UnicodeVersion};
 use corvus_regex_ecma262_tools::json::{self, Json, escape};
 
 const LIMIT: Duration = Duration::from_secs(2);
@@ -54,6 +57,15 @@ const SILENCE: Duration = Duration::from_secs(60);
 /// The answers of a record that may reach the limit before its other answers are unanswered without being asked.
 const LIMITS_PER_RECORD: usize = 3;
 const REPLACEMENT: &str = "<$&|$1|$2|$10|$<a>|$$|$`|$'>";
+
+/// The edition and the version of Unicode this crate reads every pattern with (`--edition`, `--unicode`).
+static SETTINGS: std::sync::OnceLock<(Edition, UnicodeVersion)> = std::sync::OnceLock::new();
+
+/// This crate's regular expression of a pattern and flags, with the settings of the run.
+fn corvus_new(pattern: &str, flags: &str) -> Result<Regex, Error> {
+    let (edition, unicode_version) = SETTINGS.get().copied().unwrap_or_default();
+    RegexBuilder::new(pattern).flags(flags).edition(edition).unicode_version(unicode_version).build()
+}
 
 #[derive(Default)]
 struct Counts {
@@ -110,6 +122,27 @@ fn main() {
         args.drain(k..k + 2);
         path
     });
+    let mut take = |name: &str| {
+        args.iter().position(|a| a == name).map(|k| {
+            let value = args[k + 1].clone();
+            args.drain(k..k + 2);
+            value
+        })
+    };
+    let edition = match take("--edition").as_deref() {
+        None | Some("current") => Edition::Current,
+        Some("es2020") => Edition::Es2020,
+        Some(other) => panic!("the edition is current or es2020, not {other}"),
+    };
+    let unicode_version = match take("--unicode").as_deref() {
+        None => UnicodeVersion::Default,
+        Some("13" | "13.0") => UnicodeVersion::V13,
+        Some("17" | "17.0") => UnicodeVersion::V17,
+        Some("18" | "18.0") => UnicodeVersion::V18,
+        Some("latest") => UnicodeVersion::Latest,
+        Some(other) => panic!("the Unicode version is 13, 17, 18 or latest, not {other}"),
+    };
+    SETTINGS.set((edition, unicode_version)).unwrap();
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let engine = match args.iter().position(|a| a == "--engine").map(|k| args[k + 1].as_str()) {
         None | Some("corvus") => EngineKind::Corvus,
@@ -299,9 +332,11 @@ impl Engine for Corvus {
     type Re = Regex;
 
     fn compile(pattern: &str, flags: &str) -> Result<Regex, (bool, String)> {
-        Regex::new(pattern, flags).map_err(|e| match e {
+        corvus_new(pattern, flags).map_err(|e| match e {
             Error::Invalid(m) => (false, format!("PARSE: {m}")),
             Error::TooLarge(m) => (false, format!("TOO-LARGE: {m}")),
+            // The flags of a grammar the edition does not have (the v flag of ECMAScript 2020): a refusal.
+            Error::Flags(m) => (false, format!("FLAGS: {m}")),
             other => (true, format!("ERROR: {other}")),
         })
     }
@@ -752,7 +787,15 @@ fn judge_captures(r: &Json, pattern: &str, counts: &Counts, wrong: &mut Vec<Stri
     let Some(tests) = r.get("tests").and_then(Json::as_array) else { return };
     let mut cache: HashMap<String, Option<Regex>> = HashMap::new();
     let mut make =
-        |f: String| -> Option<Regex> { cache.entry(f.clone()).or_insert_with(|| Regex::new(pattern, &f).ok()).clone() };
+        |f: String| -> Option<Regex> { cache.entry(f.clone()).or_insert_with(|| corvus_new(pattern, &f).ok()).clone() };
+    // A grammar the data finds the pattern not valid in, as an overlay may, must be refused here too.
+    for mode in ["unicode", "legacy"] {
+        let mode_flags = if mode == "unicode" { format!("{flags}u") } else { flags.clone() };
+        if valid.get(mode).and_then(Json::as_bool) == Some(false) && make(mode_flags.clone()).is_some() {
+            counts.accepted.fetch_add(1, Ordering::Relaxed);
+            wrong.push(format!("ACCEPTED-INVALID\tcaptures.jsonl\t/{shown}/{mode_flags}"));
+        }
+    }
     for t in tests {
         if t.get("v8_deviation").and_then(Json::as_bool) == Some(true) {
             continue;
@@ -978,7 +1021,7 @@ fn exec_where(shown: &str, flags: &str, text: &[u16], t: &Json) -> String {
 fn judge_exec(r: &Json, pattern: &str, options: &Options, counts: &Counts, wrong: &mut Vec<String>) {
     let flags = r.get("flags").and_then(Json::as_string).unwrap();
     let shown = escape(&pattern.encode_utf16().collect::<Vec<u16>>());
-    let Ok(re) = Regex::new(pattern, &flags) else {
+    let Ok(re) = corvus_new(pattern, &flags) else {
         counts.refused.fetch_add(1, Ordering::Relaxed);
         wrong.push(format!("REFUSED\t{EXEC}\t/{shown}/{flags}"));
         return;

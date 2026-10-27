@@ -79,7 +79,8 @@ pub(crate) struct Inst {
     /// `x` and `y` are jump targets.
     pub x: i32,
     pub y: i32,
-    /// `a` and `b` are a group, a loop or a range of groups, depending on the instruction.
+    /// `a` and `b` are a group, a loop or a range of groups, depending on the instruction. For a backreference `b`
+    /// is the major number of the version of Unicode whose case folding it matches with.
     pub a: i32,
     pub b: i32,
     /// `min` and `max` bound a repetition. A max of -1 is no bound.
@@ -613,7 +614,12 @@ impl Compiler {
                 // When several groups share the name, at most one has taken part, and the others match the empty
                 // string. So matching each in turn matches the one that took part.
                 for g in &n.groups {
-                    self.add(Inst { a: self.tracked[g], flag: self.unicode, ..Inst::new(op) });
+                    self.add(Inst {
+                        a: self.tracked[g],
+                        b: n.fold_version as i32,
+                        flag: self.unicode,
+                        ..Inst::new(op)
+                    });
                 }
             }
             NodeKind::Look => {

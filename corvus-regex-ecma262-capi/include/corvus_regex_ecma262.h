@@ -65,6 +65,22 @@ extern "C" {
 /* The limit of cre_regex_split that keeps every piece, as split(separator) with no limit. */
 #define CRE_SPLIT_ALL 0xFFFFFFFFu
 
+/* The edition of ECMA-262 whose grammar a pattern is read with (cre_regex_new_with_options): today's, the default, or
+ * ECMAScript 2020's, which JSON Schema 2020-12 names. The 2020 grammar refuses what later editions added, and nothing
+ * else: the d and v flags, modifier groups, a group name used twice, and a property name or value that is not in the
+ * edition's tables. */
+#define CRE_EDITION_CURRENT 0u
+#define CRE_EDITION_ES2020 1u
+
+/* The version of Unicode whose tables a pattern is read with (cre_regex_new_with_options), independent of the
+ * edition: the default (the version of the V8 the answers are held to, 17 today), 13, 17, 18, or the latest the
+ * library carries (18 today). */
+#define CRE_UNICODE_DEFAULT 0u
+#define CRE_UNICODE_13 13u
+#define CRE_UNICODE_17 17u
+#define CRE_UNICODE_18 18u
+#define CRE_UNICODE_LATEST 0x7FFFFFFFu
+
 /* The outcome of a call: CRE_OK, or why it failed (the details are in cre_last_error_message). */
 typedef uint32_t cre_status;
 /* The call succeeded. */
@@ -184,6 +200,13 @@ cre_status cre_regex_new(const char *pattern, size_t pattern_len, const char *fl
 cre_status cre_regex_new_with_timeout(const char *pattern, size_t pattern_len, const char *flags, size_t flags_len,
                                       uint64_t timeout_ms, cre_regex **out_regex);
 
+/* cre_regex_new_with_timeout with the edition whose grammar the pattern is read with (a CRE_EDITION_ value) and the
+ * version of Unicode whose tables it is read with (a CRE_UNICODE_ value). Under CRE_EDITION_ES2020 the d and v flags
+ * are CRE_INVALID_FLAGS. A value that is not one of the constants is CRE_INVALID_ARGUMENT. */
+cre_status cre_regex_new_with_options(const char *pattern, size_t pattern_len, const char *flags, size_t flags_len,
+                                      uint64_t timeout_ms, uint32_t edition, uint32_t unicode_version,
+                                      cre_regex **out_regex);
+
 /* The match timeout of the regular expression, in milliseconds (0 for none). */
 uint64_t cre_regex_match_timeout(const cre_regex *regex);
 
@@ -194,6 +217,18 @@ void cre_regex_free(cre_regex *regex);
  * valid here. The status is CRE_INVALID_UTF8 or CRE_INVALID_ARGUMENT for arguments that are not text. */
 cre_status cre_regex_is_valid(const char *pattern, size_t pattern_len, const char *flags, size_t flags_len,
                               bool *out_valid);
+
+/* cre_regex_is_valid in the grammar of an edition (a CRE_EDITION_ value) and under a version of Unicode (a
+ * CRE_UNICODE_ value). A value that is not one of the constants is CRE_INVALID_ARGUMENT. */
+cre_status cre_regex_is_valid_with_options(const char *pattern, size_t pattern_len, const char *flags,
+                                           size_t flags_len, uint32_t edition, uint32_t unicode_version,
+                                           bool *out_valid);
+
+/* The edition the regular expression was read with, a CRE_EDITION_ value (CRE_EDITION_CURRENT for NULL). */
+uint32_t cre_regex_edition(const cre_regex *regex);
+
+/* The version of Unicode the regular expression was read with, resolved: 13, 17 or 18 (0 for NULL). */
+uint32_t cre_regex_unicode_version(const cre_regex *regex);
 
 /* The source of the pattern, as it was given. It stays valid as long as the regular expression ({NULL, 0} for NULL). */
 cre_str cre_regex_source(const cre_regex *regex);

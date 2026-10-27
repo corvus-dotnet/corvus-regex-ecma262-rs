@@ -8,15 +8,15 @@
 //! The parser applies the equivalence to every literal and class as it reads them, so a case-insensitive group is
 //! matched with plain classes. Only a backreference needs the function when matching.
 //!
-//! The folding and the uppercase mapping come from the tables of `ucd`, never from the standard library, so a
-//! pattern matches the same texts whichever toolchain built the program.
+//! The folding and the uppercase mapping come from the tables of `ucd` of the pattern's version of Unicode, never from
+//! the standard library, so a pattern matches the same texts whichever toolchain built the program.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use super::Rune;
 use super::charset::CharSet;
-use super::ucd;
+use super::ucd::Ucd;
 
 /// The characters of the Basic Multilingual Plane whose uppercase form is more than one character, as inclusive
 /// pairs. Canonicalize leaves them alone.
@@ -32,17 +32,18 @@ static MULTI_UPPER: LazyLock<CharSet> = LazyLock::new(|| {
     )
 });
 
-/// The Canonicalize function of ECMA-262 for case-insensitive matching.
-pub(crate) fn canonicalize(r: Rune, unicode_mode: bool) -> Rune {
+/// The Canonicalize function of ECMA-262 for case-insensitive matching, with the case mappings of a version of
+/// Unicode.
+pub(crate) fn canonicalize(ucd: &Ucd, r: Rune, unicode_mode: bool) -> Rune {
     if unicode_mode {
         // Every character of a simple case folding class folds to the same character.
-        return ucd::fold(r);
+        return ucd.fold(r);
     }
     // A character beyond the Basic Multilingual Plane is two code units, and neither has an uppercase form.
     if r > 0xFFFF || MULTI_UPPER.contains(r) {
         return r;
     }
-    let upper = ucd::to_upper(r);
+    let upper = ucd.to_upper(r);
     if r >= 128 && upper < 128 || upper > 0xFFFF {
         return r;
     }
@@ -75,35 +76,35 @@ fn new_fold_table(classes: HashMap<Rune, Vec<Rune>>) -> FoldTable {
     t
 }
 
-static UNICODE_FOLD_TABLE: LazyLock<FoldTable> = LazyLock::new(|| {
-    // A class is a character that others fold to, with those others.
-    let mut classes: HashMap<Rune, Vec<Rune>> = HashMap::new();
-    for r in ucd::folding() {
-        let key = ucd::fold(r);
-        classes.entry(key).or_insert_with(|| vec![key]).push(r);
+/// The table of the grammar in use, for a version of Unicode. It is built on first use, which only a pattern with a
+/// case-insensitive group reaches.
+fn fold_classes(ucd: &'static Ucd, unicode_mode: bool) -> &'static FoldTable {
+    if unicode_mode {
+        ucd.unicode_fold.get_or_init(|| {
+            // A class is a character that others fold to, with those others.
+            let mut classes: HashMap<Rune, Vec<Rune>> = HashMap::new();
+            for r in ucd.folding() {
+                let key = ucd.fold(r);
+                classes.entry(key).or_insert_with(|| vec![key]).push(r);
+            }
+            new_fold_table(classes)
+        })
+    } else {
+        ucd.legacy_fold.get_or_init(|| {
+            let mut classes: HashMap<Rune, Vec<Rune>> = HashMap::new();
+            for r in 0..=0xFFFF {
+                classes.entry(canonicalize(ucd, r, false)).or_default().push(r);
+            }
+            new_fold_table(classes)
+        })
     }
-    new_fold_table(classes)
-});
-
-static LEGACY_FOLD_TABLE: LazyLock<FoldTable> = LazyLock::new(|| {
-    let mut classes: HashMap<Rune, Vec<Rune>> = HashMap::new();
-    for r in 0..=0xFFFF {
-        classes.entry(canonicalize(r, false)).or_default().push(r);
-    }
-    new_fold_table(classes)
-});
-
-/// The table of the grammar in use. It is built on first use, which only a pattern with a case-insensitive group
-/// reaches.
-fn fold_classes(unicode_mode: bool) -> &'static FoldTable {
-    if unicode_mode { &UNICODE_FOLD_TABLE } else { &LEGACY_FOLD_TABLE }
 }
 
-/// The set of every character equivalent to some member of the set.
+/// The set of every character equivalent to some member of the set, under a version of Unicode.
 ///
 /// It also returns the number of characters with a case variant that the set holds, which is the work it did.
-pub(crate) fn fold_closure(set: &Arc<CharSet>, unicode_mode: bool) -> (Arc<CharSet>, usize) {
-    let table = fold_classes(unicode_mode);
+pub(crate) fn fold_closure(ucd: &'static Ucd, set: &Arc<CharSet>, unicode_mode: bool) -> (Arc<CharSet>, usize) {
+    let table = fold_classes(ucd, unicode_mode);
     let mut extra: Vec<Rune> = Vec::new();
     let mut variants = 0;
     for &[lo, hi] in set.ranges.as_chunks::<2>().0 {

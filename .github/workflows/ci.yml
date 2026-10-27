@@ -1,7 +1,8 @@
 # Build, clippy (warnings denied), the tests, the ECMA-262 test data, the C smoke test and the test data through the C
 # library, on Linux and Windows. The data (github.com/corvus-dotnet/ecma262-regex-test-data) is pinned to a commit;
 # the pass is 0 wrong answers, 0 refusals of a valid pattern, 0 acceptances of an invalid one and 0 matches at their
-# limit, in both encodings, through the crate and through the C library.
+# limit, in both encodings, through the crate and through the C library, and on Linux for Unicode 13 and 18 and for
+# the grammar of ECMAScript 2020 as the data's overlays write the data for them.
 name: ci
 on:
   push:
@@ -49,7 +50,7 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         repository: corvus-dotnet/ecma262-regex-test-data
-        ref: cff0860b7ebc5eb9c801eb9f8cec9d5398688ff2
+        ref: 1b4c4353c4fa3fc3e318db32ef0261391519b9a5
         path: ecma262-regex-test-data
         persist-credentials: false
     - name: The checked-in counts were made at this commit of the test data
@@ -74,6 +75,41 @@ jobs:
       run: cargo run -j 4 --release --bin stack-probe
     - name: Run the ECMA-262 test data
       run: cargo run -j 4 --release --bin dataset -- ecma262-regex-test-data/data wrong-cases.tsv
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      if: runner.os == 'Linux'
+      with:
+        node-version: '24.22.1'
+    - name: Run the ECMA-262 test data for other versions of Unicode and for ECMAScript 2020
+      # The data as its own scripts write it for Unicode 13 and 18 (unicode.js apply) and for the grammar of
+      # ECMAScript 2020 (edition.js apply), each judged with the crate set to match.
+      if: runner.os == 'Linux'
+      shell: pwsh
+      run: |
+        $runner = './target/release/dataset'
+        $data = 'ecma262-regex-test-data'
+        $runs = @(
+            @{ Name = 'unicode-13'; Tool = 'unicode.js'; Version = '13.0'; Options = @('--unicode', '13') },
+            @{ Name = 'unicode-18'; Tool = 'unicode.js'; Version = '18.0'; Options = @('--unicode', '18') },
+            @{ Name = 'es2020'; Tool = 'edition.js'; Version = ''; Options = @('--edition', 'es2020') },
+            @{ Name = 'es2020-unicode-13'; Tool = 'edition.js'; Version = '13.0'; Options = @('--edition', 'es2020', '--unicode', '13') }
+        )
+        $failed = @()
+        foreach ($run in $runs) {
+            $out = Join-Path $env:RUNNER_TEMP $run.Name
+            if ($run.Tool -eq 'unicode.js') {
+                node "$data/unicode.js" apply $run.Version $out "$data/data"
+            }
+            else {
+                # An empty version is the data's own Unicode.
+                node "$data/edition.js" apply $out $run.Version "$data/data"
+            }
+
+            if ($LASTEXITCODE -ne 0) { throw "The data for $($run.Name) was not written." }
+            & $runner $out "wrong-cases-$($run.Name).tsv" '*.jsonl' both @($run.Options)
+            if ($LASTEXITCODE -ne 0) { $failed += $run.Name }
+        }
+
+        if ($failed.Count -gt 0) { throw "Wrong: $($failed -join ', ')" }
     - name: Run the ECMA-262 test data with the memory of failed places from the first step
       if: runner.os == 'Linux'
       run: cargo run -j 4 --release --bin dataset -- ecma262-regex-test-data/data wrong-cases-memo.tsv

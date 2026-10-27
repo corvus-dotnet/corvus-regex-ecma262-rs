@@ -43,6 +43,16 @@ the reference throws `RegexMatchTimeoutException`, every member that matches ret
 `_within` members give one match a limit of its own. A pattern without a backreference needs none: the memo keeps it
 linear.
 
+The edition and the version of Unicode (the reference's `RegexEdition` and `RegexUnicodeVersion`): `Edition` and
+`UnicodeVersion`, set on a `RegexBuilder` beside the flags and the match timeout, the builder being how the `regex`
+crate takes settings. Each version of Unicode is a `Ucd` (`ucd.rs`) over its own generated tables (`tables13.rs`,
+`tables17.rs`, `tables18.rs`, with `strings<major>.rs` for the properties of strings), each with its own cache of
+property sets and its own case-folding classes. Both settings are resolved when the pattern is compiled; the only thing
+a match reads from the version is the case folding of a case-insensitive backreference, whose instruction carries the
+major number in `b`. The 2020 grammar's property names (`es2020.rs`) are generated from the test data's
+`es2020-properties.json`, as the reference's are. The C library takes both as `uint32_t` constants
+(`cre_regex_new_with_options`).
+
 ## The search layer
 
 The reference has a hand-written vectorised search for each kind of literal (`Needle`, `MultiNeedle`, `Teddy`). Rust

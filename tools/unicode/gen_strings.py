@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes strings_gen.rs, the data behind the properties of strings that a pattern with the v flag may name
+"""Writes strings<major>.rs, the data behind the properties of strings that a pattern with the v flag may name
 (\\p{RGI_Emoji} and the six it is the union of), from the two emoji sequence files of the Unicode Character Database.
 
 ECMA-262 lets \\p{...} name seven properties of strings with the v flag: Basic_Emoji, Emoji_Keycap_Sequence,
@@ -11,7 +11,7 @@ Each property is written as two texts: its single code points as hexadecimal ran
 hexadecimal code points, a space between the code points of a sequence and a semicolon between sequences. This is
 the generator of the .NET reference engine (tools/unicode/gen-ecma-unicode-strings.ps1) in Python.
 
-    python3 tools/unicode/gen_strings.py <emoji-sequences.txt> <emoji-zwj-sequences.txt> [output]
+    python3 tools/unicode/gen_strings.py <emoji-sequences.txt> <emoji-zwj-sequences.txt> corvus-regex-ecma262/src/strings<major>.rs
 """
 import re
 import sys
@@ -28,7 +28,7 @@ PROPERTIES = [
 
 def main():
     seq_file, zwj_file = sys.argv[1], sys.argv[2]
-    output = sys.argv[3] if len(sys.argv) > 3 else "corvus-regex-ecma262/src/strings_gen.rs"
+    output = sys.argv[3]
     code_points = {p: [] for p in PROPERTIES}
     sequences = {p: [] for p in PROPERTIES}
     versions = set()

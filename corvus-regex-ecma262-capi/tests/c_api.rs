@@ -745,3 +745,64 @@ fn a_regular_expression_has_a_match_timeout() {
     assert_eq!(unsafe { cre_regex_new_with_timeout(ptr("a**"), 3, ptr("gg"), 2, 5, &mut re) }, CRE_INVALID_FLAGS);
     assert!(re.is_null());
 }
+
+#[test]
+fn the_edition_and_the_version_of_unicode_are_settings_of_their_own() {
+    let mut re = std::ptr::null_mut();
+    let status = unsafe {
+        cre_regex_new_with_options(ptr("(.)\\1"), 5, ptr("iu"), 2, 1000, CRE_EDITION_CURRENT, CRE_UNICODE_13, &mut re)
+    };
+    assert_eq!(status, CRE_OK, "{}", string(cre_last_error_message()));
+    assert_eq!(unsafe { cre_regex_unicode_version(re) }, 13);
+    assert_eq!(unsafe { cre_regex_edition(re) }, CRE_EDITION_CURRENT);
+    assert_eq!(unsafe { cre_regex_match_timeout(re) }, 1000);
+    // A capital and a small letter of Vithkuqi, a script of Unicode 14, are not one letter under 13.
+    let text = "\u{10570}\u{10597}";
+    let mut matched = true;
+    assert_eq!(unsafe { cre_regex_is_match(re, ptr(text), text.len(), &mut matched) }, CRE_OK);
+    assert!(!matched);
+    unsafe { cre_regex_free(re) };
+
+    let mut re = std::ptr::null_mut();
+    let status = unsafe {
+        cre_regex_new_with_options(ptr("(.)\\1"), 5, ptr("iu"), 2, 0, CRE_EDITION_ES2020, CRE_UNICODE_LATEST, &mut re)
+    };
+    assert_eq!(status, CRE_OK);
+    assert_eq!(unsafe { cre_regex_unicode_version(re) }, 18);
+    assert_eq!(unsafe { cre_regex_edition(re) }, CRE_EDITION_ES2020);
+    let mut matched = false;
+    assert_eq!(unsafe { cre_regex_is_match(re, ptr(text), text.len(), &mut matched) }, CRE_OK);
+    assert!(matched);
+    unsafe { cre_regex_free(re) };
+
+    // The grammar of ECMAScript 2020: no modifier group, no v flag.
+    let mut re = std::ptr::null_mut();
+    let status = unsafe {
+        cre_regex_new_with_options(ptr("(?i:a)"), 6, ptr(""), 0, 0, CRE_EDITION_ES2020, CRE_UNICODE_DEFAULT, &mut re)
+    };
+    assert_eq!(status, CRE_INVALID_PATTERN);
+    assert!(re.is_null());
+    let status = unsafe {
+        cre_regex_new_with_options(ptr("a"), 1, ptr("v"), 1, 0, CRE_EDITION_ES2020, CRE_UNICODE_DEFAULT, &mut re)
+    };
+    assert_eq!(status, CRE_INVALID_FLAGS);
+    // A value that is not one of the constants.
+    let status = unsafe { cre_regex_new_with_options(ptr("a"), 1, ptr(""), 0, 0, 7, CRE_UNICODE_DEFAULT, &mut re) };
+    assert_eq!(status, CRE_INVALID_ARGUMENT);
+    let status = unsafe { cre_regex_new_with_options(ptr("a"), 1, ptr(""), 0, 0, CRE_EDITION_CURRENT, 16, &mut re) };
+    assert_eq!(status, CRE_INVALID_ARGUMENT);
+
+    let mut valid = true;
+    let pattern = "\\p{Script=Yezidi}";
+    let n = pattern.len();
+    let check = |edition, version, valid: &mut bool| unsafe {
+        cre_regex_is_valid_with_options(ptr(pattern), n, ptr("u"), 1, edition, version, valid)
+    };
+    assert_eq!(check(CRE_EDITION_ES2020, CRE_UNICODE_13, &mut valid), CRE_OK);
+    assert!(!valid);
+    assert_eq!(check(CRE_EDITION_CURRENT, CRE_UNICODE_13, &mut valid), CRE_OK);
+    assert!(valid);
+    assert_eq!(check(CRE_EDITION_CURRENT, 5, &mut valid), CRE_INVALID_ARGUMENT);
+    assert!(!valid);
+    assert_eq!(unsafe { cre_regex_unicode_version(std::ptr::null()) }, 0);
+}
