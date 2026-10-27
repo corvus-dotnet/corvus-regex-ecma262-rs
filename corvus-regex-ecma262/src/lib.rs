@@ -25,7 +25,7 @@
 //! package of the Go module, which the Object Pascal and OCaml ports carry too. The files and the names still
 //! follow the Go source, so that a fix made in one can be carried to the others: `parse.rs` is `parse.go`,
 //! `compile.rs` is `compile.go`, `vm.rs` is `vm.go`, `dfa.rs` is `dfa.go`, `charset.rs`, `fold.rs` and `units.rs`
-//! are the files of the same names, and `ucd.rs` with `tables_gen.rs` is the `ucd` package.
+//! are the files of the same names, and `ucd.rs` with `tables<major>.rs` is the `ucd` package.
 //!
 //! # Code units
 //!
@@ -73,13 +73,20 @@
 //! separate alternatives, modifier groups, and Unicode property escapes for every property, value and alias
 //! ECMA-262 lists, with Unicode 17 data, and the v flag of ECMAScript 2024: nested classes, the difference and the
 //! intersection of classes, strings in a class (`\q{...}`) and the seven properties of strings. The properties and
-//! the case folding come from the tables of `ucd.rs` and `strings_gen.rs` and never from the standard library or
-//! from a dependency, so a pattern matches the same texts whatever built the program.
+//! the case folding come from the tables of `ucd.rs`, `tables<major>.rs` and `strings<major>.rs` and never from the
+//! standard library or from a dependency, so a pattern matches the same texts whatever built the program.
+//!
+//! [`RegexBuilder`] reads a pattern with the grammar of ECMAScript 2020 ([`Edition::Es2020`]), the grammar JSON
+//! Schema 2020-12 names, and with the tables of Unicode 13, 17 or 18 ([`UnicodeVersion`]), each chosen on its own.
+//! Both are read when the pattern is compiled, so a match costs the same whichever is chosen.
 
 mod adfa;
 mod charset;
 mod compile;
 mod dfa;
+// Generated: the property names and values of the tables of ECMAScript 2020.
+#[rustfmt::skip]
+mod es2020;
 mod fold;
 mod pair8;
 mod parse;
@@ -88,14 +95,27 @@ mod regex;
 mod replace;
 mod search;
 mod simd16;
-// Generated: the properties of strings of the v flag, with the version of Unicode they are from.
+// Generated: the properties of strings of the v flag of each version of Unicode, with the version they are from.
 #[allow(dead_code)]
 #[rustfmt::skip]
-mod strings_gen;
-// Generated: it has names of scripts and properties that only the tests read.
+mod strings13;
 #[allow(dead_code)]
 #[rustfmt::skip]
-mod tables_gen;
+mod strings17;
+#[allow(dead_code)]
+#[rustfmt::skip]
+mod strings18;
+// Generated: the Unicode tables of each version of Unicode. They have names of scripts and properties that only the
+// tests read.
+#[allow(dead_code)]
+#[rustfmt::skip]
+mod tables13;
+#[allow(dead_code)]
+#[rustfmt::skip]
+mod tables17;
+#[allow(dead_code)]
+#[rustfmt::skip]
+mod tables18;
 #[cfg(test)]
 mod tests;
 mod ucd;
@@ -108,7 +128,7 @@ use std::time::Duration;
 
 pub use parse::{Limit, MAX_NESTING, MAX_PATTERN_LENGTH, MAX_SIZE, TooLargeError};
 pub(crate) use re2::MAX_RE2_COST;
-pub use regex::{CaptureLocations, CaptureMatches, Captures, Haystack, Match, Matches, Regex};
+pub use regex::{CaptureLocations, CaptureMatches, Captures, Haystack, Match, Matches, Regex, RegexBuilder};
 pub use vm::{MAX_STACK, MatchError};
 
 /// A code point, or a UTF-16 code unit of a pattern read without the u flag. It is signed, as the `rune` of the Go
@@ -256,6 +276,59 @@ pub(crate) fn shallow(pattern: &str, unicode_sets: bool) -> bool {
 /// one over the limit of nesting, which is the limit the thread is there to serve.
 pub(crate) const NO_DEEP_STACK: Error = Error::TooLarge(TooLargeError { limit: Limit::Nesting, value: MAX_NESTING });
 
+/// The edition of ECMA-262 whose grammar a pattern is read with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Edition {
+    /// Today's grammar, ECMAScript 2025: the default.
+    #[default]
+    Current,
+    /// The grammar of ECMAScript 2020 (ECMA-262, 11th edition), which JSON Schema 2020-12 names. It refuses what later
+    /// editions added, and nothing else: the `d` and `v` flags, modifier groups such as `(?i:...)`, a group name used
+    /// by two groups, and a property name or value that is not in the edition's tables. A pattern it accepts has the
+    /// same answers as in today's grammar, under the same version of Unicode.
+    Es2020,
+}
+
+/// The version of Unicode whose character database a pattern is read with: the members of each `\p{...}`, the
+/// characters of a group name, and the case folding of the `i` flag. It is independent of the [`Edition`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum UnicodeVersion {
+    /// The version of the V8 the answers are held to, Unicode 17 today. It moves when that V8 moves.
+    #[default]
+    Default,
+    /// Unicode 13.0, the version of the year of ECMAScript 2020.
+    V13,
+    /// Unicode 17.0.
+    V17,
+    /// Unicode 18.0.
+    V18,
+    /// The latest version the crate carries, Unicode 18 today. It moves when a later version is added.
+    Latest,
+}
+
+impl UnicodeVersion {
+    /// The version this one stands for: [`Default`](UnicodeVersion::Default) is V8's (17) and
+    /// [`Latest`](UnicodeVersion::Latest) the newest the crate carries (18). Any other is itself.
+    pub fn resolve(self) -> UnicodeVersion {
+        match self {
+            UnicodeVersion::Default => UnicodeVersion::V17,
+            UnicodeVersion::Latest => UnicodeVersion::V18,
+            other => other,
+        }
+    }
+
+    /// The major number of the version, resolved: 13, 17 or 18.
+    pub fn major(self) -> u32 {
+        match self.resolve() {
+            UnicodeVersion::V13 => 13,
+            UnicodeVersion::V18 => 18,
+            _ => 17,
+        }
+    }
+}
+
 /// The flags of a pattern, as `new RegExp(pattern, flags)` takes them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Flags {
@@ -311,6 +384,8 @@ impl Flags {
             icase: self.ignore_case,
             multiline: self.multiline,
             dot_all: self.dot_all,
+            edition: Edition::Current,
+            unicode_version: UnicodeVersion::Default,
         }
     }
 }
@@ -359,7 +434,7 @@ pub(crate) fn compile(pattern: &str) -> Result<Regex, Error> {
     on_a_deep_stack(pattern, false, || {
         let (root, facts, ps) = read(pattern)?;
         let flags = Flags { unicode: facts.unicode, ..Flags::default() };
-        Ok(Regex::from_tree(pattern, flags, None, root, facts, &ps))
+        Ok(Regex::from_tree(pattern, flags, None, flags.syntax(), root, facts, &ps))
     })
     .unwrap_or(Err(NO_DEEP_STACK))
 }

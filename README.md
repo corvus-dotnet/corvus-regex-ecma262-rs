@@ -9,7 +9,8 @@ its C library, for any language that calls C.
   properties of strings.
 - ECMAScript 2025: lookbehind, named groups (and a name shared between alternatives), modifier groups such as
   `(?i:...)`, and every Unicode property ECMA-262 lists, from tables of Unicode 17 the crate carries, so a pattern
-  answers the same whatever toolchain built it.
+  answers the same whatever toolchain built it. The grammar of ECMAScript 2020, which JSON Schema 2020-12 names, and
+  the tables of Unicode 13 or 18 are a setting away.
 - Text as `&str` (UTF-8, the engine's own encoding) or as `&[u16]` (UTF-16, lone surrogates and all). Nothing is
   transcoded, and a match allocates nothing once the thread's working memory has grown.
 - `is_match`, `find`, `find_iter`, `captures`, `captures_iter`, `replace` (with every `$` form of `GetSubstitution`)
@@ -100,6 +101,33 @@ allocates nothing; `next_batch` on `find_iter` and `captures_iter` writes the ne
 `captures_iter`) into a slice, a batch at a time, which allocates nothing either. `is_match_within`, `find_at_within`
 and `captures_at_within` give one match a limit of its own in place of the pattern's timeout.
 
+### The edition and the version of Unicode
+
+JSON Schema 2020-12 names the grammar of ECMAScript 2020 (ECMA-262, 11th edition). `Edition::Es2020` refuses what
+later editions added, and nothing else: the `d` and `v` flags, modifier groups such as `(?i:...)`, a group name used by
+two groups, and a property name or value that is not in the 2020 tables (such as `\p{Script=Yezidi}`). A pattern it
+accepts has the same answers as in today's grammar.
+
+The version of Unicode is chosen apart from the edition: `UnicodeVersion::V13`, `V17` or `V18`, `Latest` (18 today)
+or `Default`, the version of the V8 the answers are held to (17 today). It decides the members of each `\p{...}`, the
+characters of a group name and the case folding of the `i` flag. `RegexBuilder` takes both, with the flags and the
+match timeout; both are read when the pattern is compiled, so a match costs the same whichever is chosen.
+
+```rust
+use std::time::Duration;
+use corvus_regex_ecma262::{Edition, RegexBuilder, UnicodeVersion};
+
+// ECMAScript 2020 as its edition was published, with the Unicode of its year.
+let re = RegexBuilder::new(r"^\p{Script=Greek}+$")
+    .flags("u")
+    .match_timeout(Some(Duration::from_secs(1)))
+    .edition(Edition::Es2020)
+    .unicode_version(UnicodeVersion::V13)
+    .build()
+    .unwrap();
+assert!(re.is_match("αβγ").unwrap());
+```
+
 ### From C
 
 The `corvus-regex-ecma262-capi` crate builds `libcorvus_regex_ecma262` (shared and static), with the header
@@ -110,7 +138,8 @@ the groups by number (into a buffer the caller owns) and by name (into a reusabl
 (`cre_matches`, a match a call or a batch of them into an array the caller owns, with or without the groups), `replace`
 and `replace_all` with every `$` form, and `split`, each matching function with a `_limit` form that takes a limit of
 time of its own; `cre_regex_new_with_timeout` gives a regular expression a match timeout that every function then gives
-its matches, and `cre_set_default_match_timeout` gives one to every regular expression. Every fallible function returns
+its matches, `cre_regex_new_with_options` gives it the edition and the version of Unicode too, and
+`cre_set_default_match_timeout` gives a timeout to every regular expression. Every fallible function returns
 a `cre_status` with a message for the thread, owned results have a free function each, and no panic crosses into the
 caller. A UTF-8 text is checked to be UTF-8 on each call (once for a global search); a caller whose strings are UTF-8 by
 construction can skip that read of the whole text with each UTF-8 function's `_unchecked` form, for which text that is

@@ -10,8 +10,8 @@ use super::compile::{self, Program};
 use super::parse::{self, Node};
 use super::units::{Text, Utf8, Utf16};
 use super::{
-    Error, Facts, Flags, MAX_RE2_COST, MatchError, deep, default_match_timeout, dfa, on_a_deep_stack, read_with,
-    shallow,
+    Edition, Error, Facts, Flags, MAX_RE2_COST, MatchError, UnicodeVersion, deep, default_match_timeout, dfa,
+    on_a_deep_stack, read_with, shallow,
 };
 
 /// The value of a slot for a group that did not take part.
@@ -108,6 +108,98 @@ impl GroupInfo {
     }
 }
 
+/// The grammar of flags in an edition, under a version of Unicode. The grammar of ECMAScript 2020 has no `d` flag
+/// (2022) and no `v` flag (2024), and refuses them as flags that are not valid.
+fn syntax_of(flags: Flags, edition: Edition, unicode_version: UnicodeVersion) -> Result<parse::Syntax, Error> {
+    if edition == Edition::Es2020 && (flags.has_indices || flags.unicode_sets) {
+        return Err(Error::Flags(format!("the flags {flags} have d or v, which ECMAScript 2020 does not have")));
+    }
+    Ok(parse::Syntax { edition, unicode_version, ..flags.syntax() })
+}
+
+/// Compiles a pattern with settings beyond its flags: the match timeout, the edition of ECMA-262 whose grammar it is
+/// read with and the version of Unicode whose tables it is read with, each independent of the others. What it does
+/// not set is as [`Regex::new`] has it: the [`default_match_timeout`](crate::default_match_timeout), today's grammar
+/// and V8's Unicode.
+///
+/// ```
+/// use std::time::Duration;
+/// use corvus_regex_ecma262::{Edition, RegexBuilder, UnicodeVersion};
+///
+/// // ECMAScript 2020 as its edition was published, with the Unicode of its year, as JSON Schema 2020-12 reads a
+/// // pattern.
+/// let re = RegexBuilder::new(r"^\p{Script=Greek}+$")
+///     .flags("u")
+///     .match_timeout(Some(Duration::from_secs(1)))
+///     .edition(Edition::Es2020)
+///     .unicode_version(UnicodeVersion::V13)
+///     .build()
+///     .unwrap();
+/// assert!(re.is_match("αβγ").unwrap());
+/// assert!(RegexBuilder::new("(?i:a)").edition(Edition::Es2020).build().is_err());
+/// ```
+#[derive(Clone, Debug)]
+pub struct RegexBuilder {
+    pattern: String,
+    flags: Result<Flags, Error>,
+    timeout: Option<Option<Duration>>,
+    edition: Edition,
+    unicode_version: UnicodeVersion,
+}
+
+impl RegexBuilder {
+    /// A builder for the pattern, with no flags.
+    pub fn new(pattern: &str) -> RegexBuilder {
+        RegexBuilder {
+            pattern: pattern.to_string(),
+            flags: Ok(Flags::default()),
+            timeout: None,
+            edition: Edition::Current,
+            unicode_version: UnicodeVersion::Default,
+        }
+    }
+
+    /// The flags, as `new RegExp(pattern, flags)` takes them. Flags that are not valid are the error of
+    /// [`RegexBuilder::build`].
+    pub fn flags(&mut self, flags: &str) -> &mut RegexBuilder {
+        self.flags = Flags::parse(flags);
+        self
+    }
+
+    /// The flags, already read.
+    pub fn with_flags(&mut self, flags: Flags) -> &mut RegexBuilder {
+        self.flags = Ok(flags);
+        self
+    }
+
+    /// The match timeout (see [`Regex::with_timeout`]): `None` (or zero) for no limit. Without it the pattern takes
+    /// the [`default_match_timeout`](crate::default_match_timeout).
+    pub fn match_timeout(&mut self, timeout: Option<Duration>) -> &mut RegexBuilder {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// The edition of ECMA-262 whose grammar the pattern is read with.
+    pub fn edition(&mut self, edition: Edition) -> &mut RegexBuilder {
+        self.edition = edition;
+        self
+    }
+
+    /// The version of Unicode whose tables the pattern is read with.
+    pub fn unicode_version(&mut self, unicode_version: UnicodeVersion) -> &mut RegexBuilder {
+        self.unicode_version = unicode_version;
+        self
+    }
+
+    /// Compiles the pattern, with the errors of [`Regex::new`]. Under [`Edition::Es2020`] the `d` and `v` flags are
+    /// [`Error::Flags`].
+    pub fn build(&self) -> Result<Regex, Error> {
+        let flags = self.flags.clone()?;
+        let timeout = self.timeout.unwrap_or_else(default_match_timeout);
+        Regex::build(&self.pattern, flags, timeout, self.edition, self.unicode_version)
+    }
+}
+
 /// A compiled ECMA-262 regular expression. It is immutable once compiled, and safe to share between threads; a
 /// clone shares nothing that changes.
 #[derive(Clone)]
@@ -125,6 +217,9 @@ pub struct Regex {
     /// The time a match may take before it is abandoned, which brings the cap on the memory of its backtracking with
     /// it; `None` for no limit.
     timeout: Option<Duration>,
+    /// The edition of the grammar and the version of Unicode, resolved, the pattern was read with.
+    edition: Edition,
+    unicode_version: UnicodeVersion,
     /// The automaton of the pattern over ASCII text (see `dfa.rs`), built on the first match. `None` inside when
     /// the pattern has none.
     pub(crate) dfa: OnceLock<Option<dfa::Dfa>>,
@@ -197,11 +292,21 @@ impl Regex {
     /// assert_eq!(re.is_match(&("a".repeat(60) + "b")), Err(MatchError::Time));
     /// ```
     pub fn with_timeout(pattern: &str, flags: Flags, match_timeout: Option<Duration>) -> Result<Regex, Error> {
-        let syntax = flags.syntax();
+        Regex::build(pattern, flags, match_timeout, Edition::Current, UnicodeVersion::Default)
+    }
+
+    fn build(
+        pattern: &str,
+        flags: Flags,
+        match_timeout: Option<Duration>,
+        edition: Edition,
+        unicode_version: UnicodeVersion,
+    ) -> Result<Regex, Error> {
+        let syntax = syntax_of(flags, edition, unicode_version)?;
         let timeout = match_timeout.filter(|t| !t.is_zero());
         on_a_deep_stack(pattern, flags.unicode_sets, || {
             let (root, facts, ps) = read_with(pattern, syntax)?;
-            Ok(Regex::from_tree(pattern, flags, timeout, root, facts, &ps))
+            Ok(Regex::from_tree(pattern, flags, timeout, syntax, root, facts, &ps))
         })
         .unwrap_or(Err(super::NO_DEEP_STACK))
     }
@@ -209,14 +314,21 @@ impl Regex {
     /// Whether the pattern is valid with the flags, without compiling it.
     pub fn is_valid(pattern: &str, flags: &str) -> bool {
         let Ok(flags) = Flags::parse(flags) else { return false };
-        on_a_deep_stack(pattern, flags.unicode_sets, || parse::parse_with(pattern, flags.syntax()).is_ok())
-            .unwrap_or(false)
+        Regex::is_valid_with(pattern, flags, Edition::Current, UnicodeVersion::Default)
+    }
+
+    /// Whether the pattern is valid with the flags in the grammar of an edition and under a version of Unicode,
+    /// without compiling it.
+    pub fn is_valid_with(pattern: &str, flags: Flags, edition: Edition, unicode_version: UnicodeVersion) -> bool {
+        let Ok(syntax) = syntax_of(flags, edition, unicode_version) else { return false };
+        on_a_deep_stack(pattern, flags.unicode_sets, || parse::parse_with(pattern, syntax).is_ok()).unwrap_or(false)
     }
 
     pub(crate) fn from_tree(
         pattern: &str,
         flags: Flags,
         timeout: Option<Duration>,
+        syntax: parse::Syntax,
         root: Node,
         facts: Facts,
         ps: &parse::Parser,
@@ -247,6 +359,8 @@ impl Regex {
             info,
             regular,
             timeout,
+            edition: syntax.edition,
+            unicode_version: syntax.unicode_version.resolve(),
             dfa,
             #[cfg(test)]
             size: facts.size,
@@ -266,6 +380,22 @@ impl Regex {
     /// The time each match may take before it is abandoned, or `None` for no limit (see [`Regex::with_timeout`]).
     pub fn match_timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+
+    /// The edition of ECMA-262 whose grammar the pattern was read with (see [`RegexBuilder::edition`]).
+    pub fn edition(&self) -> Edition {
+        self.edition
+    }
+
+    /// The version of Unicode whose tables the pattern was read with, resolved: never
+    /// [`UnicodeVersion::Default`] or [`UnicodeVersion::Latest`] (see [`RegexBuilder::unicode_version`]).
+    pub fn unicode_version(&self) -> UnicodeVersion {
+        self.unicode_version
+    }
+
+    /// The grammar the pattern was read with, to read it again.
+    fn syntax(&self) -> parse::Syntax {
+        parse::Syntax { edition: self.edition, unicode_version: self.unicode_version, ..self.flags.syntax() }
     }
 
     /// The number of groups of a match: one for the whole match, and one for each capturing group.
@@ -289,7 +419,7 @@ impl Regex {
         }
         self.caps.get_or_init(|| {
             let build = || {
-                let (root, _) = parse::parse_with(&self.pattern, self.flags.syntax()).expect("the pattern was read");
+                let (root, _) = parse::parse_with(&self.pattern, self.syntax()).expect("the pattern was read");
                 compile::compile_program(root, self.unicode(), Some(self.info.groups))
             };
             if shallow(&self.pattern, self.flags.unicode_sets) {
@@ -303,7 +433,7 @@ impl Regex {
     /// Builds the automaton of the pattern, which opens few groups (see `from_tree`).
     #[cold]
     fn build_dfa(&self) -> Option<dfa::Dfa> {
-        let (root, _) = parse::parse_with(&self.pattern, self.flags.syntax()).ok()?;
+        let (root, _) = parse::parse_with(&self.pattern, self.syntax()).ok()?;
         dfa::build_dfa(&root)
     }
 

@@ -14,7 +14,7 @@ use super::fold::canonicalize;
 use super::parse::{self, Limit, MAX_NESTING, MAX_PATTERN_LENGTH, MAX_SIZE};
 use super::units::{has_supplementary, unit_at, unit_before};
 use super::vm::{MatchError, set_memo_from_the_start};
-use super::{Error, Regex, Rune, check, compile, ucd, valid};
+use super::{Error, Regex, Rune, UnicodeVersion, check, compile, ucd, valid};
 
 const NODE_SIZE: usize = 32;
 const RANGE_SIZE: usize = 8;
@@ -981,15 +981,17 @@ fn concurrent_use() {
 /// two characters with one canonical form are in a class.
 #[test]
 fn fold_tables() {
-    for unicode_mode in [true, false] {
+    for (version, unicode_mode) in VERSIONS.iter().flat_map(|&v| [(v, true), (v, false)]) {
+        let u = ucd::ucd(version);
         // Every character with a case variant, with the closure of the set that holds it alone.
         let mut seen: HashMap<Rune, Rune> = HashMap::new();
         for r in 0..=ucd::MAX_RUNE {
-            let key = canonicalize(r, unicode_mode);
+            let key = canonicalize(u, r, unicode_mode);
             let other = seen.get(&key).copied().or((key != r).then_some(key));
             if let Some(other) = other {
                 for (a, b) in [(r, other), (other, r)] {
-                    let (closed, variants) = super::fold::fold_closure(&CharSet::shared(&[a, a], false), unicode_mode);
+                    let (closed, variants) =
+                        super::fold::fold_closure(u, &CharSet::shared(&[a, a], false), unicode_mode);
                     assert!(variants == 1 && closed.contains(b), "u flag {unicode_mode}: U+{a:04X} and U+{b:04X}");
                 }
             }
@@ -997,10 +999,14 @@ fn fold_tables() {
         }
         // The closure of everything holds nothing more, and every member of a closure has one canonical form.
         for r in [0x4B, 0x6B, 0x212A, 0x53, 0x17F, 0xDF, 0x1E9E, 0x3A3, 0x3C2, 0x3C3, 0x130, 0x131, 0x1C4, 0x10400] {
-            let (closed, _) = super::fold::fold_closure(&CharSet::shared(&[r, r], false), unicode_mode);
+            let (closed, _) = super::fold::fold_closure(u, &CharSet::shared(&[r, r], false), unicode_mode);
             for &[lo, hi] in closed.ranges.as_chunks::<2>().0 {
                 for member in lo..=hi {
-                    assert_eq!(canonicalize(member, unicode_mode), canonicalize(r, unicode_mode), "U+{member:04X}");
+                    assert_eq!(
+                        canonicalize(u, member, unicode_mode),
+                        canonicalize(u, r, unicode_mode),
+                        "U+{member:04X}"
+                    );
                 }
             }
         }
@@ -1068,14 +1074,24 @@ fn modifiers() {
     }
 }
 
+/// The versions of Unicode the crate carries.
+const VERSIONS: [UnicodeVersion; 3] = [UnicodeVersion::V13, UnicodeVersion::V17, UnicodeVersion::V18];
+
 #[test]
 fn properties() {
+    for version in VERSIONS {
+        properties_of(version);
+    }
+}
+
+fn properties_of(version: UnicodeVersion) {
+    let u = ucd::ucd(version);
     let mut expressions = 0;
     let mut resolve = |expr: &str| {
         expressions += 1;
-        assert!(property_set(expr).is_some(), "\\p{{{expr}}} does not resolve");
+        assert!(property_set(u, expr).is_some(), "\\p{{{expr}}} does not resolve under {version:?}");
     };
-    for name in ucd::binary_names() {
+    for name in u.binary_names() {
         resolve(name);
     }
     for name in
@@ -1089,7 +1105,7 @@ fn properties() {
         resolve(&format!("gc={name}"));
         resolve(&format!("General_Category={name}"));
     }
-    for names in ucd::script_names() {
+    for names in u.script_names() {
         for value in *names {
             for property in ["sc", "Script", "scx", "Script_Extensions"] {
                 resolve(&format!("{property}={value}"));
@@ -1456,7 +1472,7 @@ fn a_match_too_large_for_the_memory_goes_without_it() {
 // The limits of size.
 
 fn ranges_of(name: &str) -> usize {
-    property_set(name).unwrap().ranges.len() / 2
+    property_set(ucd::ucd(UnicodeVersion::Default), name).unwrap().ranges.len() / 2
 }
 
 /// Patterns just under the limit of size, of every shape that is costly for its size.

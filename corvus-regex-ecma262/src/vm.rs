@@ -11,6 +11,7 @@ use super::charset::CharSet;
 use super::compile::{Inst, MAX_MEMO_LOOPS, Op, Program};
 use super::fold::{canonicalize, is_fold_word_rune};
 use super::search::{Literals, Plan, RunEnd, Shape};
+use super::ucd;
 use super::units::{Text, is_word_unit};
 
 /// Why a match was abandoned. Neither is an answer.
@@ -1349,6 +1350,7 @@ impl Program {
                         continue 'run;
                     }
                     steps -= ((to - from) >> 3) as i64;
+                    let ucd = ucd::by_major(i.b);
                     let (mut at, mut ok) = (pos, true);
                     while from < to && ok {
                         let (want, w) = T::read(input, from, units);
@@ -1360,7 +1362,8 @@ impl Program {
                         let (got, w) = T::read(input, at, units);
                         at += w;
                         ok = got == want
-                            || i.op == Op::BackrefFold && canonicalize(got, i.flag) == canonicalize(want, i.flag);
+                            || i.op == Op::BackrefFold
+                                && canonicalize(ucd, got, i.flag) == canonicalize(ucd, want, i.flag);
                     }
                     if ok {
                         pos = at;
@@ -1376,6 +1379,7 @@ impl Program {
                         continue 'run;
                     }
                     steps -= ((to - from) >> 3) as i64;
+                    let ucd = ucd::by_major(i.b);
                     let (mut at, mut ok) = (pos, true);
                     while from < to && ok {
                         let (want, w) = T::read_last(input, to, units);
@@ -1387,7 +1391,8 @@ impl Program {
                         let (got, w) = T::read_last(input, at, units);
                         at -= w;
                         ok = got == want
-                            || i.op == Op::BackrefFoldBack && canonicalize(got, i.flag) == canonicalize(want, i.flag);
+                            || i.op == Op::BackrefFoldBack
+                                && canonicalize(ucd, got, i.flag) == canonicalize(ucd, want, i.flag);
                     }
                     if ok {
                         pos = at;

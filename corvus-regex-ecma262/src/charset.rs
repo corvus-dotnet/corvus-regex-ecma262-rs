@@ -1,10 +1,9 @@
 //! Sets of code points, the classes ECMA-262 defines, and the sets of the Unicode properties (`charset.go`).
 
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 use super::Rune;
-use super::ucd;
+use super::ucd::{self, Ucd};
 
 /// The last Unicode code point.
 pub(crate) const MAX_RUNE: Rune = ucd::MAX_RUNE;
@@ -228,46 +227,45 @@ fn binary_name(name: &str) -> Option<&'static str> {
     })
 }
 
-/// The sets already built for property expressions. A property set can have hundreds of ranges, and schemas tend to
-/// repeat the same few. Only an expression ECMA-262 defines is kept, and those are a fixed few hundred, so the
-/// cache is bounded.
-static PROPERTY_CACHE: LazyLock<Mutex<HashMap<String, Arc<CharSet>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Resolves the expression between the braces of `\p{...}` to its set. `None` for a name or value that ECMA-262
-/// does not define.
-pub(crate) fn property_set(expr: &str) -> Option<Arc<CharSet>> {
-    if let Some(cached) = PROPERTY_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(expr) {
+/// Resolves the expression between the braces of `\p{...}` to its set under a version of Unicode. `None` for a name
+/// or value that ECMA-262 does not define.
+///
+/// The sets already built are kept, one cache for each version (`Ucd::property_cache`). A property set can have
+/// hundreds of ranges, and schemas tend to repeat the same few. Only an expression ECMA-262 defines is kept, and
+/// those are a fixed few hundred, so each cache is bounded.
+pub(crate) fn property_set(ucd: &'static Ucd, expr: &str) -> Option<Arc<CharSet>> {
+    if let Some(cached) = ucd.property_cache.lock().unwrap_or_else(|e| e.into_inner()).get(expr) {
         return Some(cached.clone());
     }
-    let pairs = property_pairs(expr)?;
+    let pairs = property_pairs(ucd, expr)?;
     let set = CharSet::shared(&pairs, false);
-    PROPERTY_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(expr.to_string(), set.clone());
+    ucd.property_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(expr.to_string(), set.clone());
     Some(set)
 }
 
-/// The ranges of a property expression. Every range comes from the tables of `ucd`, which hold one fixed version of
-/// Unicode, so the answer does not depend on the toolchain.
-fn property_pairs(expr: &str) -> Option<Vec<Rune>> {
+/// The ranges of a property expression. Every range comes from the tables of `ucd` of the version, so the answer
+/// does not depend on the toolchain.
+fn property_pairs(ucd: &'static Ucd, expr: &str) -> Option<Vec<Rune>> {
     if let Some((name, value)) = expr.split_once('=') {
         return match name {
-            "General_Category" | "gc" => category_pairs(value),
-            "Script" | "sc" => ucd::script(value).map(|t| t.pairs()),
-            "Script_Extensions" | "scx" => ucd::script_extensions(value).map(|t| t.pairs()),
+            "General_Category" | "gc" => category_pairs(ucd, value),
+            "Script" | "sc" => ucd.script(value).map(|t| t.pairs()),
+            "Script_Extensions" | "scx" => ucd.script_extensions(value).map(|t| t.pairs()),
             _ => None,
         };
     }
-    if let Some(pairs) = category_pairs(expr) {
+    if let Some(pairs) = category_pairs(ucd, expr) {
         return Some(pairs);
     }
     match binary_name(expr)? {
         "ASCII" => Some(vec![0, 0x7F]),
         "Any" => Some(vec![0, MAX_RUNE]),
-        canonical => ucd::binary(canonical).map(|t| t.pairs()),
+        canonical => ucd.binary(canonical).map(|t| t.pairs()),
     }
 }
 
-fn category_pairs(value: &str) -> Option<Vec<Rune>> {
-    ucd::category(category_name(value)?).map(|t| t.pairs())
+fn category_pairs(ucd: &'static Ucd, value: &str) -> Option<Vec<Rune>> {
+    ucd.category(category_name(value)?).map(|t| t.pairs())
 }
 
 impl CharSet {
@@ -316,11 +314,16 @@ pub(crate) struct StringProperty {
     pub(crate) strings: Vec<Vec<Rune>>,
 }
 
-static STRING_PROPERTIES: LazyLock<Vec<StringProperty>> = LazyLock::new(|| {
+/// The properties of strings of a version of Unicode, read from its `strings<major>.rs` on first use.
+fn string_properties(ucd: &'static Ucd) -> &'static [StringProperty] {
+    ucd.string_properties.get_or_init(|| read_string_properties(ucd.data.strings))
+}
+
+fn read_string_properties(properties: &[(&str, &str, &str); 6]) -> Vec<StringProperty> {
     let mut all = Vec::new();
     let mut union: Vec<Rune> = Vec::new();
     let mut every: Vec<Vec<Rune>> = Vec::new();
-    for (_, code_points, sequences) in super::strings_gen::PROPERTIES.iter() {
+    for (_, code_points, sequences) in properties.iter() {
         let mut pairs = Vec::new();
         for item in code_points.split(' ').filter(|s| !s.is_empty()) {
             let (lo, hi) = item.split_once("..").unwrap_or((item, item));
@@ -338,13 +341,14 @@ static STRING_PROPERTIES: LazyLock<Vec<StringProperty>> = LazyLock::new(|| {
     }
     all.push(StringProperty { set: CharSet::shared(&union, false), strings: every });
     all
-});
+}
 
-/// The property of strings of the name (`RGI_Emoji` and the six it is the union of), or `None`.
-pub(crate) fn string_property(name: &str) -> Option<&'static StringProperty> {
+/// The property of strings of the name (`RGI_Emoji` and the six it is the union of) under a version of Unicode, or
+/// `None`.
+pub(crate) fn string_property(ucd: &'static Ucd, name: &str) -> Option<&'static StringProperty> {
     if name == "RGI_Emoji" {
-        return STRING_PROPERTIES.last();
+        return string_properties(ucd).last();
     }
-    let k = super::strings_gen::PROPERTIES.iter().position(|(n, _, _)| *n == name)?;
-    Some(&STRING_PROPERTIES[k])
+    let k = ucd.data.strings.iter().position(|(n, _, _)| *n == name)?;
+    Some(&string_properties(ucd)[k])
 }

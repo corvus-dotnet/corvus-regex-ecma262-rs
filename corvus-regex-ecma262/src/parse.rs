@@ -4,11 +4,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, LazyLock};
 
-use super::Rune;
 use super::charset::{CharSet, DIGIT_PAIRS, DOT_SET, MAX_RUNE, SPACE_PAIRS, WORD_PAIRS, property_set, string_property};
+use super::es2020;
 use super::fold::{FOLD_WORD_SET, NOT_FOLD_WORD_SET, canonicalize, fold_closure};
-use super::ucd;
+use super::ucd::{Ucd, ucd};
 use super::units::{high_surrogate, low_surrogate};
+use super::{Edition, Rune, UnicodeVersion};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NodeKind {
@@ -126,6 +127,8 @@ pub(crate) struct Node {
     pub name: Vec<Rune>,
     /// Marks a `Backref`, `WordBoundary` or `NotWordBoundary` inside a case-insensitive group.
     pub fold: bool,
+    /// The major number of the version of Unicode whose case folding a `Backref` matches with.
+    pub fold_version: u32,
     /// `behind` and `negative` describe a `Look`.
     pub behind: bool,
     pub negative: bool,
@@ -145,6 +148,7 @@ impl Node {
             groups: Vec::new(),
             name: Vec::new(),
             fold: false,
+            fold_version: 0,
             behind: false,
             negative: false,
         }
@@ -192,6 +196,10 @@ pub(crate) struct Parser {
     sets: bool,
     /// The sequences of the property of strings the last class escape named (the v flag), or `None`.
     escape_strings: Option<&'static [Vec<Rune>]>,
+    /// The Unicode of the version the pattern is read with.
+    ucd: &'static Ucd,
+    /// The grammar of ECMAScript 2020, which refuses what later editions added.
+    es2020: bool,
     depth: usize,
     /// `group_count` and `has_names` come from a scan of the whole pattern before parsing, because the meaning of
     /// `\1` and `\k` depends on groups that may follow them.
@@ -232,6 +240,10 @@ pub(crate) struct Syntax {
     pub icase: bool,
     pub multiline: bool,
     pub dot_all: bool,
+    /// The edition of ECMA-262 whose grammar the pattern is read with.
+    pub edition: Edition,
+    /// The version of Unicode whose tables the pattern is read with.
+    pub unicode_version: UnicodeVersion,
 }
 
 /// Reads the pattern with no flag but the grammar's (see [`parse_with`]).
@@ -257,6 +269,8 @@ pub(crate) fn parse_with(pattern: &str, syntax: Syntax) -> Parse<(Node, Parser)>
         unicode,
         sets: syntax.sets,
         escape_strings: None,
+        ucd: ucd(syntax.unicode_version),
+        es2020: syntax.edition == Edition::Es2020,
         depth: 0,
         group_count: 0,
         has_names: false,
@@ -364,11 +378,6 @@ fn is_ascii_letter(c: Rune) -> bool {
 fn syntax_character(c: Rune) -> bool {
     u8::try_from(c).is_ok_and(|c| b"^$\\.*+?()[]{}|/".contains(&c))
 }
-
-static ID_START: LazyLock<&'static ucd::Table> =
-    LazyLock::new(|| ucd::binary_table("ID_Start").expect("the tables have ID_Start"));
-static ID_CONTINUE: LazyLock<&'static ucd::Table> =
-    LazyLock::new(|| ucd::binary_table("ID_Continue").expect("the tables have ID_Continue"));
 
 fn append_class_atom(pairs: &mut Vec<Rune>, c: Rune, set: Option<&Arc<CharSet>>) {
     match set {
@@ -507,7 +516,7 @@ impl Parser {
     /// equivalent to it.
     fn char_node(&mut self, c: Rune) -> Node {
         if self.icase {
-            let (set, _) = fold_closure(&CharSet::shared(&[c, c], false), self.unicode);
+            let (set, _) = fold_closure(self.ucd, &CharSet::shared(&[c, c], false), self.unicode);
             if set.ranges.len() != 2 || set.ranges[0] != set.ranges[1] {
                 return Node::set(set);
             }
@@ -525,7 +534,7 @@ impl Parser {
     /// The set with every character equivalent to one of its members. It charges the pattern for the work and for
     /// the set: a byte for each character with a case variant that the set holds, and its ranges.
     fn fold(&mut self, set: &Arc<CharSet>) -> Parse<Arc<CharSet>> {
-        let (closed, variants) = fold_closure(set, self.unicode);
+        let (closed, variants) = fold_closure(self.ucd, set, self.unicode);
         self.charge(variants + RANGE_SIZE * closed.ranges.len() / 2)?;
         Ok(closed)
     }
@@ -694,7 +703,8 @@ impl Parser {
             return Ok((Node::with_subs(NodeKind::Group, vec![body]), true));
         }
         let c = self.peek();
-        if c == ch('i') || c == ch('m') || c == ch('s') || c == ch('-') {
+        // Modifier groups came in ECMAScript 2025, so the 2020 grammar reads `(?i` as an invalid group.
+        if (c == ch('i') || c == ch('m') || c == ch('s') || c == ch('-')) && !self.es2020 {
             return Ok((self.modifier_group()?, true));
         }
         if self.eat('=') || self.eat('!') {
@@ -717,6 +727,10 @@ impl Parser {
             // Two groups may share a name only when they are in separate alternatives of one disjunction, so that
             // no match can go through both.
             if let Some(others) = self.names.get(&name) {
+                // The 2020 grammar refuses a name used twice, wherever the groups are.
+                if self.es2020 {
+                    return self.fail("duplicate group name");
+                }
                 for other in others {
                     if !separate_alternatives(&other.path, &self.path) {
                         return self.fail("duplicate group name");
@@ -814,10 +828,19 @@ impl Parser {
                 self.i += 1;
             }
             if name.is_empty() {
-                if !(c == ch('$') || c == ch('_') || ID_START.contains(c)) {
+                let id_start = self.ucd.id_start.get_or_init(|| self.ucd.binary_table("ID_Start").expect("ID_Start"));
+                if !(c == ch('$') || c == ch('_') || id_start.contains(c)) {
                     return self.fail("invalid group name");
                 }
-            } else if !(c == ch('$') || c == 0x200C || c == 0x200D || ID_CONTINUE.contains(c)) {
+            } else if !(c == ch('$')
+                || c == 0x200C
+                || c == 0x200D
+                || self
+                    .ucd
+                    .id_continue
+                    .get_or_init(|| self.ucd.binary_table("ID_Continue").expect("ID_Continue"))
+                    .contains(c))
+            {
                 return self.fail("invalid group name");
             }
             name.push(c);
@@ -855,7 +878,15 @@ impl Parser {
                 let name = self.group_name()?;
                 self.named_refs = true;
                 self.needs_backtracking = true;
-                return Ok((Node { name, fold: self.icase, ..Node::new(NodeKind::Backref) }, true));
+                return Ok((
+                    Node {
+                        name,
+                        fold: self.icase,
+                        fold_version: self.ucd.data.version.major(),
+                        ..Node::new(NodeKind::Backref)
+                    },
+                    true,
+                ));
             }
             self.i += 1;
             return Ok((self.char_node(ch('k')), true));
@@ -865,7 +896,15 @@ impl Parser {
             let n = self.number()?;
             if n <= self.group_count {
                 self.needs_backtracking = true;
-                return Ok((Node { groups: vec![n as i32], fold: self.icase, ..Node::new(NodeKind::Backref) }, true));
+                return Ok((
+                    Node {
+                        groups: vec![n as i32],
+                        fold: self.icase,
+                        fold_version: self.ucd.data.version.major(),
+                        ..Node::new(NodeKind::Backref)
+                    },
+                    true,
+                ));
             }
             if self.unicode {
                 return self.fail("reference to a group that does not exist");
@@ -952,10 +991,13 @@ impl Parser {
                 if !self.eat('}') {
                     return self.fail("invalid property name");
                 }
-                let Some(set) = property_set(&expr) else {
+                // The 2020 grammar knows only the names and values of its own tables, whatever the version of
+                // Unicode.
+                let known = !self.es2020 || es2020::has(&expr);
+                let Some(set) = property_set(self.ucd, &expr).filter(|_| known) else {
                     if self.sets
                         && c == ch('p')
-                        && let Some(property) = string_property(&expr)
+                        && let Some(property) = string_property(self.ucd, &expr)
                     {
                         // A property of strings, which the v flag alone names, and which has no complement.
                         self.charge(RANGE_SIZE * (property.set.ranges.len() / 2 + property.strings.len()))?;
@@ -1430,7 +1472,7 @@ impl Parser {
     /// A string as its code points, each canonicalized in a case-insensitive group so that strings are compared as
     /// ECMA-262 compares them.
     fn canonical_string(&self, code_points: &[Rune]) -> Vec<Rune> {
-        code_points.iter().map(|&c| if self.icase { canonicalize(c, true) } else { c }).collect()
+        code_points.iter().map(|&c| if self.icase { canonicalize(self.ucd, c, true) } else { c }).collect()
     }
 
     /// The node of a class of the v flag's grammar: its set, or, where it holds strings, the alternatives of its

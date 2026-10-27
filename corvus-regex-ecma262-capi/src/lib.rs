@@ -22,7 +22,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
-use corvus::{CaptureLocations, CaptureMatches, Captures, Error, Flags, Haystack, MatchError, Matches, Regex};
+use corvus::{
+    CaptureLocations, CaptureMatches, Captures, Edition, Error, Flags, Haystack, MatchError, Matches, Regex,
+    RegexBuilder, UnicodeVersion,
+};
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Types and constants
@@ -57,6 +60,40 @@ pub const CRE_VERSION_PATCH: u32 = 0;
 pub const CRE_UNSET: usize = usize::MAX;
 /// The limit of `cre_regex_split` that keeps every piece, as `split(separator)` with no limit.
 pub const CRE_SPLIT_ALL: u32 = u32::MAX;
+
+/// The edition of ECMA-262 whose grammar a pattern is read with: today's (the default), or ECMAScript 2020's, which
+/// JSON Schema 2020-12 names (see `Edition`).
+pub const CRE_EDITION_CURRENT: u32 = 0;
+pub const CRE_EDITION_ES2020: u32 = 1;
+
+/// The version of Unicode whose tables a pattern is read with (see `UnicodeVersion`): the default (V8's, 17 today),
+/// 13, 17, 18, or the latest the library carries (18 today).
+pub const CRE_UNICODE_DEFAULT: u32 = 0;
+pub const CRE_UNICODE_13: u32 = 13;
+pub const CRE_UNICODE_17: u32 = 17;
+pub const CRE_UNICODE_18: u32 = 18;
+pub const CRE_UNICODE_LATEST: u32 = 0x7FFF_FFFF;
+
+/// The edition of a `CRE_EDITION_` value.
+fn edition_of(edition: u32) -> Result<Edition, Failure> {
+    match edition {
+        CRE_EDITION_CURRENT => Ok(Edition::Current),
+        CRE_EDITION_ES2020 => Ok(Edition::Es2020),
+        other => Err(Failure::new(CRE_INVALID_ARGUMENT, format!("{other} is not a CRE_EDITION_ value"))),
+    }
+}
+
+/// The version of a `CRE_UNICODE_` value.
+fn unicode_version_of(version: u32) -> Result<UnicodeVersion, Failure> {
+    match version {
+        CRE_UNICODE_DEFAULT => Ok(UnicodeVersion::Default),
+        CRE_UNICODE_13 => Ok(UnicodeVersion::V13),
+        CRE_UNICODE_17 => Ok(UnicodeVersion::V17),
+        CRE_UNICODE_18 => Ok(UnicodeVersion::V18),
+        CRE_UNICODE_LATEST => Ok(UnicodeVersion::Latest),
+        other => Err(Failure::new(CRE_INVALID_ARGUMENT, format!("{other} is not a CRE_UNICODE_ value"))),
+    }
+}
 
 /// A UTF-8 string the library owns: `len` bytes from `ptr`, not NUL-terminated. Each function returning one says how
 /// long it stays valid.
@@ -584,19 +621,57 @@ pub unsafe extern "C" fn cre_regex_new_with_timeout(
     timeout_ms: u64,
     out_regex: *mut *mut cre_regex,
 ) -> cre_status {
+    unsafe {
+        cre_regex_new_with_options(
+            pattern,
+            pattern_len,
+            flags,
+            flags_len,
+            timeout_ms,
+            CRE_EDITION_CURRENT,
+            CRE_UNICODE_DEFAULT,
+            out_regex,
+        )
+    }
+}
+
+/// `cre_regex_new_with_timeout` with the edition of ECMA-262 whose grammar the pattern is read with (a `CRE_EDITION_`
+/// value) and the version of Unicode whose tables it is read with (a `CRE_UNICODE_` value), each independent of the
+/// other. Under `CRE_EDITION_ES2020` the d and v flags are `CRE_INVALID_FLAGS`, and a modifier group, a group name
+/// used twice or a property name outside the tables of ECMAScript 2020 is `CRE_INVALID_PATTERN`. A value that is
+/// not one of the constants is `CRE_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn cre_regex_new_with_options(
+    pattern: *const c_char,
+    pattern_len: usize,
+    flags: *const c_char,
+    flags_len: usize,
+    timeout_ms: u64,
+    edition: u32,
+    unicode_version: u32,
+    out_regex: *mut *mut cre_regex,
+) -> cre_status {
     guard(|| {
         let slot = unsafe { out(out_regex, "out_regex") }?;
         *slot = std::ptr::null_mut();
         let pattern = unsafe { text(pattern, pattern_len, "pattern") }?;
         let flags = unsafe { text(flags, flags_len, "flags") }?;
         let flags = Flags::parse(flags).map_err(|e| Failure::new(CRE_INVALID_FLAGS, e.to_string()))?;
+        let (edition, unicode_version) = (edition_of(edition)?, unicode_version_of(unicode_version)?);
         let timeout = Some(Duration::from_millis(timeout_ms));
-        let regex = Regex::with_timeout(pattern, flags, timeout).map_err(|e| match &e {
-            Error::Invalid(m) => Failure::new(CRE_INVALID_PATTERN, m.clone()),
-            Error::Flags(m) => Failure::new(CRE_INVALID_FLAGS, m.clone()),
-            Error::TooLarge(_) => Failure::new(CRE_PATTERN_TOO_LARGE, e.to_string()),
-            _ => Failure::new(CRE_INVALID_PATTERN, e.to_string()),
-        })?;
+        let regex = RegexBuilder::new(pattern)
+            .with_flags(flags)
+            .match_timeout(timeout)
+            .edition(edition)
+            .unicode_version(unicode_version)
+            .build()
+            .map_err(|e| match &e {
+                Error::Invalid(m) => Failure::new(CRE_INVALID_PATTERN, m.clone()),
+                Error::Flags(m) => Failure::new(CRE_INVALID_FLAGS, m.clone()),
+                Error::TooLarge(_) => Failure::new(CRE_PATTERN_TOO_LARGE, e.to_string()),
+                _ => Failure::new(CRE_INVALID_PATTERN, e.to_string()),
+            })?;
         let flags = regex.flags().to_string();
         let names = regex.group_names().map(String::from).collect();
         *slot = Box::into_raw(Box::new(cre_regex { inner: regex, flags, names }));
@@ -638,6 +713,48 @@ pub unsafe extern "C" fn cre_regex_is_valid(
         *slot = Regex::is_valid(pattern, flags);
         Ok(())
     })
+}
+
+/// `cre_regex_is_valid` in the grammar of an edition (a `CRE_EDITION_` value) and under a version of Unicode (a
+/// `CRE_UNICODE_` value). A value that is not one of the constants is `CRE_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_is_valid_with_options(
+    pattern: *const c_char,
+    pattern_len: usize,
+    flags: *const c_char,
+    flags_len: usize,
+    edition: u32,
+    unicode_version: u32,
+    out_valid: *mut bool,
+) -> cre_status {
+    guard(|| {
+        let slot = unsafe { out(out_valid, "out_valid") }?;
+        *slot = false;
+        let pattern = unsafe { text(pattern, pattern_len, "pattern") }?;
+        let flags = unsafe { text(flags, flags_len, "flags") }?;
+        let (edition, unicode_version) = (edition_of(edition)?, unicode_version_of(unicode_version)?);
+        *slot = Flags::parse(flags).is_ok_and(|f| Regex::is_valid_with(pattern, f, edition, unicode_version));
+        Ok(())
+    })
+}
+
+/// The edition the regular expression was read with, a `CRE_EDITION_` value (`CRE_EDITION_CURRENT` for NULL).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_edition(regex: *const cre_regex) -> u32 {
+    // SAFETY: a handle this library created, or NULL.
+    quietly(CRE_EDITION_CURRENT, || {
+        unsafe { regex.as_ref() }.map_or(CRE_EDITION_CURRENT, |r| match r.inner.edition() {
+            Edition::Es2020 => CRE_EDITION_ES2020,
+            _ => CRE_EDITION_CURRENT,
+        })
+    })
+}
+
+/// The version of Unicode the regular expression was read with, resolved: 13, 17 or 18 (0 for NULL).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_unicode_version(regex: *const cre_regex) -> u32 {
+    // SAFETY: a handle this library created, or NULL.
+    quietly(0, || unsafe { regex.as_ref() }.map_or(0, |r| r.inner.unicode_version().major()))
 }
 
 /// The source of the pattern, as it was given. It stays valid as long as the regular expression ({NULL, 0} for
