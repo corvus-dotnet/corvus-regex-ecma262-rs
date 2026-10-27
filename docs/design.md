@@ -50,8 +50,10 @@ crate takes settings. Each version of Unicode is a `Ucd` (`ucd.rs`) over its own
 property sets and its own case-folding classes. Both settings are resolved when the pattern is compiled; the only thing
 a match reads from the version is the case folding of a case-insensitive backreference, whose instruction carries the
 major number in `b`. The 2020 grammar's property names (`es2020.rs`) are generated from the test data's
-`es2020-properties.json`, as the reference's are. The C library takes both as `uint32_t` constants
-(`cre_regex_new_with_options`).
+`es2020-properties.json`, as the reference's are. Every one of these files is made from its sources by the scripts in
+`tools/unicode`, and CI makes them all again with `check-tables.ps1` (from each version's Unicode Character Database
+and regress's `gen-unicode`, every download checked against its SHA-256) and fails unless they are the checked-in files.
+The C library takes both as `uint32_t` constants (`cre_regex_new_with_options`).
 
 ## The search layer
 
