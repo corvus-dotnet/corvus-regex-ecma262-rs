@@ -123,6 +123,10 @@ jobs:
       env:
         RUSTFLAGS: --cfg corvus_memo_from_the_start
         CARGO_TARGET_DIR: target/memo
+    - name: Check that docs/api-c.md is what the C header makes
+      if: runner.os == 'Linux'
+      shell: pwsh
+      run: ./tools/docs/gen-api-c.ps1 -Check
     - name: Build the C library
       run: cargo build -j 4 --release -p corvus-regex-ecma262-capi
     - name: The C smoke test
