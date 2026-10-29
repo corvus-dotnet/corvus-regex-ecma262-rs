@@ -47,8 +47,8 @@ else()
   endif()
 endif()
 
-# The C programs of the getting-started page the documentation site publishes (docs/getting-started-c.md), each block
-# of C a program of its own, built and run as the smoke test is, so that the page shows only code that works.
+# The C programs of the getting-started page the documentation site publishes (docs/getting-started-c.md): each block
+# of C with a main is a program of its own, built and run as the smoke test is, so that the page shows only code that works.
 set(CRE_GETTING_STARTED "${CMAKE_CURRENT_SOURCE_DIR}/../../../docs/getting-started-c.md" CACHE FILEPATH
   "The getting-started page whose C programs are built and run as tests")
 set(samples)
@@ -66,6 +66,11 @@ if(EXISTS "${CRE_GETTING_STARTED}")
     string(SUBSTRING "${doc}" 0 ${end} code)
     math(EXPR end "${end} + 4")
     string(SUBSTRING "${doc}" ${end} -1 doc)
+    # A block that is not a whole program, such as the #include of Setup, is not built.
+    string(FIND "${code}" "int main(" has_main)
+    if(has_main EQUAL -1)
+      continue()
+    endif()
     math(EXPR n "${n} + 1")
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/getting_started_${n}.c" "${code}\n")
     list(APPEND samples "getting_started_${n}")
