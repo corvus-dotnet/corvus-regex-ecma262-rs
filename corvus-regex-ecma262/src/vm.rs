@@ -856,6 +856,12 @@ impl Program {
             while pending != 0 {
                 let k = pending.trailing_zeros() as usize;
                 let s = base + k;
+                // The reach is `hi` characters, which is `hi` units only over ASCII: past a unit beyond ASCII the
+                // look ahead could stop short of an occurrence that allows an earlier start, so the search is made
+                // again the plain way, which counts in characters.
+                if input[s..(s + hi).min(len)].iter().any(|&u| Into::<u32>::into(u) >= 0x80) {
+                    return Err(());
+                }
                 if after <= s + hi
                     && let Some(q2) = literals.find_within(bytes, after, s + hi, T::UTF8)
                 {
