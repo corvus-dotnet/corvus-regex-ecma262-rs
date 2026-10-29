@@ -456,3 +456,8 @@ pub(crate) fn check(pattern: &str) -> Result<Facts, Error> {
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeExamples;
+
+/// The examples of the getting-started page the documentation site publishes (docs/getting-started.md), run as tests.
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/getting-started.md")]
+struct GettingStartedExamples;
