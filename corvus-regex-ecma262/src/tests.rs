@@ -1887,6 +1887,41 @@ fn the_searches_find_what_every_position_finds() {
 /// The search by a pair of positions finds what comparing every literal at every start finds: the leftmost
 /// occurrence, the first literal in order of those that start there.
 #[test]
+fn a_window_reaches_as_many_characters_as_it_counts() {
+    // The windows search with the reverse automaton tries a waiting start only once no later occurrence could allow
+    // an earlier one, and looks for one within the window's reach, which is a number of characters. Over two- and
+    // three-byte UTF-8, or surrogate pairs under u, that is more units than characters: looked for that many units
+    // ahead, the later occurrence was missed and a later start answered ((?:b.{2,6})?x over "bxſſſſx" from 1, not 0).
+    let patterns =
+        [r"(?:b.{2,6})?x", r"(?:[a-z][\s\S]{1,8})?xy", r"(?:\w[^a]{3,5})?x", r"(|([^a]|[^a][^a]){2,4}){2}(\3){3,5}?x"];
+    for pattern in patterns {
+        for flags in ["", "u"] {
+            let searched = Regex::new(pattern, flags).unwrap();
+            super::search::NO_SEARCH.with(|n| n.set(true));
+            let plain = Regex::new(pattern, flags).unwrap();
+            super::search::NO_SEARCH.with(|n| n.set(false));
+            let literal = if pattern.ends_with("xy") { "xy" } else { "x" };
+            for wide in ["ſ", "é", "€", "中", "😀", "a"] {
+                for k in 0..=9 {
+                    let text = format!("b{literal}{}{literal}", wide.repeat(k));
+                    let f: Vec<(usize, usize)> =
+                        searched.find_iter(&text).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
+                    let g: Vec<(usize, usize)> =
+                        plain.find_iter(&text).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
+                    assert_eq!(f, g, "/{pattern}/{flags} on {text:?} over UTF-8");
+                    let t16: Vec<u16> = text.encode_utf16().collect();
+                    let f: Vec<(usize, usize)> =
+                        searched.find_iter_utf16(&t16).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
+                    let g: Vec<(usize, usize)> =
+                        plain.find_iter_utf16(&t16).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
+                    assert_eq!(f, g, "/{pattern}/{flags} on {text:?} over UTF-16");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn the_pair_search_finds_the_leftmost_literal() {
     use super::pair8::PairSearch;
     let sets: [&[&str]; 7] = [

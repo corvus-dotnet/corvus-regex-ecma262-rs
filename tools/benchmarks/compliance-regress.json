@@ -1,9 +1,9 @@
 {
- "right": 29233558,
+ "right": 29302207,
  "wrong": 148848,
  "refused": 54,
  "acceptedInvalid": 1430,
- "limited": 556355,
+ "limited": 556422,
  "judge": {
   "runner": "https://github.com/corvus-dotnet/corvus-regex-ecma262-rs/blob/main/tools/src/bin/dataset.rs",
   "calls": {
@@ -27,5 +27,5 @@
    ]
   }
  ],
- "dataCommit": "1b4c4353c4fa3fc3e318db32ef0261391519b9a5"
+ "dataCommit": "36e8b71c181fa10554760f461dc8c526fd3ffb42"
 }
