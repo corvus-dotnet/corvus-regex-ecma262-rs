@@ -5,8 +5,7 @@
 `corvus-regex-ecma262` is a Rust crate whose patterns answer as ECMAScript does. Where the `regex` crate has its own
 grammar and its own meaning for `\d`, `\w`, `\s`, `.`, case folding and Unicode properties, this crate has ECMA-262's,
 so a pattern written for JavaScript, or taken from a JSON Schema, matches the same texts here as it does there. It is
-the engine the C library and every binding over it are built on, held to V8's answers on the ECMA-262 test data, with
-no dependencies.
+the engine the C library and every binding over it are built on, held to V8's answers on the ECMA-262 test data.
 
 This guide covers:
 
@@ -26,7 +25,8 @@ This guide covers:
 corvus-regex-ecma262 = "0.2"
 ```
 
-The minimum Rust version is 1.89, on any target the standard library supports, and the crate has no dependencies.
+The minimum Rust version is 1.89, on any target the standard library supports. The crate's only dependencies are
+`memchr` and `aho-corasick`.
 
 ```rust
 use corvus_regex_ecma262::Regex;

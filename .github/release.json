@@ -19,7 +19,8 @@
         "docs/getting-started-c.md",
         "docs/api-c.md",
         "docs/design.md",
-        "docs/contributing.md"
+        "docs/contributing.md",
+        "docs/design-c.md"
       ],
       "stamp": [
         {
