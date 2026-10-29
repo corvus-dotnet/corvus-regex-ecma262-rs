@@ -14,13 +14,7 @@
         "corvus-regex-ecma262-capi/include/",
         "corvus-regex-ecma262-capi/cmake/",
         "corvus-regex-ecma262-capi/package.ps1",
-        "corvus-regex-ecma262-capi/xcframework.ps1",
-        "docs/getting-started.md",
-        "docs/getting-started-c.md",
-        "docs/api-c.md",
-        "docs/design.md",
-        "docs/contributing.md",
-        "docs/design-c.md"
+        "corvus-regex-ecma262-capi/xcframework.ps1"
       ],
       "stamp": [
         {

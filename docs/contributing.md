@@ -119,9 +119,11 @@ night beside every other engine; a run on another machine is comparable with its
 Every pull request merged into main releases the crate and the C library with the next patch version, unless it is
 labelled `no_release`: `auto-release.yml` runs `tools/release` on the merge, which makes a GitHub release tagged
 `v<version>`; `crates-publish.yml` publishes the crate to crates.io, and `capi-publish.yml` attaches every platform's
-archive and the XCFramework. A change to the published documents releases a patch too, since the documentation site
-takes them from the latest release. A change to a benchmark harness alone is a harness release, which publishes the
-harness images. A pull request that needs a minor or major version sets `nextVersion` in `.github/release.json`.
+archive and the XCFramework. A change to a benchmark harness alone is a harness release, which publishes the harness
+images. A pull request that needs a minor or major version sets `nextVersion` in `.github/release.json`. The
+documentation site takes the published documents (the getting-started page, the API reference, the design document and
+this guide) from `main`, and they describe the latest release: a change to them alone is merged with `no_release`, and a
+change to the API carries its documents, which its release brings into step.
 
 `main` is protected by a ruleset: changes arrive by pull request, and the `CI gate`, `Harness image` and `C harness
 image` checks must be green on the branch as it will merge.
