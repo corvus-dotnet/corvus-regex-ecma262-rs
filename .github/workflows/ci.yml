@@ -51,7 +51,7 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         repository: corvus-dotnet/ecma262-regex-test-data
-        ref: 36e8b71c181fa10554760f461dc8c526fd3ffb42
+        ref: e3041c18c5f5ce40c18af25023085c60befa16d8
         path: ecma262-regex-test-data
         persist-credentials: false
     - name: The generated Unicode data is what its sources make
