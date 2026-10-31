@@ -14,7 +14,7 @@ use super::fold::canonicalize;
 use super::parse::{self, Limit, MAX_NESTING, MAX_PATTERN_LENGTH, MAX_SIZE};
 use super::units::{has_supplementary, unit_at, unit_before};
 use super::vm::{MatchError, set_memo_from_the_start};
-use super::{Error, Regex, Rune, UnicodeVersion, check, compile, ucd, valid};
+use super::{Edition, Error, Flags, Regex, Rune, UnicodeVersion, check, compile, ucd, valid};
 
 const NODE_SIZE: usize = 32;
 const RANGE_SIZE: usize = 8;
@@ -68,6 +68,12 @@ fn cases(set: &str) -> Vec<V8Case> {
 /// not valid.
 fn check_verdict(p: &str, valid_unicode: bool, valid_legacy: bool) -> Option<Regex> {
     assert_eq!(valid(p), valid_unicode, "valid({p:?})");
+    assert_eq!(Regex::is_valid_pattern(p, "u"), valid_unicode, "is_valid_pattern({p:?}, u)");
+    // The sets do not all record validity without the u flag the same way, so the reader is held to what each says:
+    // valid without the flag when `valid_legacy` is, and valid in neither grammar when compiling refuses it.
+    if valid_legacy || !valid_unicode {
+        assert_eq!(Regex::is_valid_pattern(p, ""), valid_legacy, "is_valid_pattern({p:?})");
+    }
     let re = compile(p);
     assert_eq!(re.is_ok(), valid_unicode || valid_legacy, "compile({p:?}): {:?}", re.as_ref().err());
     let re = re.ok()?;
@@ -2027,6 +2033,165 @@ fn searches_find_the_starts_the_fuzzer_found() {
             let g: Vec<(usize, usize)> =
                 plain.find_iter_utf16(&t16).map(Result::unwrap).map(|m| (m.start(), m.end())).collect();
             assert_eq!(f, g, "/{pattern}/{flags} on {text:?} over UTF-16");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The grammar-only reader
+
+/// The reader asks the grammar only: a pattern over a limit of size is valid when its grammar is, and not valid when
+/// it is not, however large.
+#[test]
+fn the_grammar_only_reader_applies_no_limit_of_size() {
+    let deep = |n: usize, open: &str, close: &str| open.repeat(n) + "a" + &close.repeat(n);
+    for (pattern, flags, valid) in [
+        ("a".repeat(MAX_PATTERN_LENGTH + 1), "u", true),
+        ("a".repeat(MAX_PATTERN_LENGTH + 1) + "(", "u", false),
+        (deep(MAX_NESTING + 1, "(?:", ")"), "u", true),
+        (deep(200_000, "(?:", ")"), "", true),
+        (deep(200_000, "(?:", ")") + ")", "u", false),
+        (deep(200_000, "(?=", ")"), "", true),
+        (deep(200_000, "[", "]"), "v", true),
+        (deep(200_000, "[^", "]"), "v", true),
+        (deep(200_000, "[", "]") + "]", "v", false),
+        ("x".repeat(20_000), "", true),
+        ((0..5000).map(|n| format!("(?<n{n}>a)")).collect::<String>() + r"\k<n4999>", "u", true),
+        ((0..5000).map(|n| format!("(?<n{n}>a)")).collect::<String>() + r"\k<m>", "u", false),
+        ((0..5000).map(|_| "(?<n>a)").collect::<Vec<_>>().join("|"), "u", true),
+        ((0..5000).map(|_| "(?<n>a)").collect::<String>(), "u", false),
+    ] {
+        assert_eq!(Regex::is_valid_pattern(&pattern, flags), valid, "{:.40}/{flags}", pattern);
+        if !valid {
+            assert!(!Regex::is_valid(&pattern, flags), "{:.40}/{flags}", pattern);
+        }
+    }
+}
+
+/// The reader decides as the parser does wherever the parser reaches no limit, in each grammar, edition and version
+/// of Unicode.
+#[test]
+fn the_grammar_only_reader_agrees_with_the_parser() {
+    let patterns = [
+        r"(?i:a)",
+        r"(?<a>x)|(?<a>y)",
+        r"(?<a>x)(?<a>y)",
+        r"((?<a>x)|(?<a>y))(?<a>z)",
+        r"(?<a>x)|((?<a>y)|(?<a>z))",
+        r"\k<a>(?<a>x)",
+        r"\k<a>",
+        r"\k",
+        r"(?<a>x)\k",
+        r"\1(x)",
+        r"\2(x)",
+        r"\8",
+        r"\08",
+        r"[\8]",
+        r"\c",
+        r"[\c_]",
+        r"\u{10FFFF}",
+        r"\u{110000}",
+        r"\ud83d\ude00",
+        r"(?<\u{1d4d0}>x)",
+        r"(?<\ud835\udcd0>x)",
+        r"(?<𝓐>x)",
+        r"\p{Script=Greek}",
+        r"\p{sc=Yezi}",
+        r"\p{Script=Sidetic}",
+        r"\P{RGI_Emoji}",
+        r"\p{RGI_Emoji}",
+        r"[^\p{RGI_Emoji}]",
+        r"\p{L}",
+        r"\p{Lu}",
+        r"\p{Letter}",
+        r"\p{ASCII}",
+        r"\p{Any}",
+        r"\p{Assigned}",
+        r"\p{gc=LC}",
+        r"\p{scx=Hrkt}",
+        r"\p{é}",
+        r"\p{",
+        r"\p{}",
+        r"a{2,1}",
+        r"a{99999999999999999999,1}",
+        r"a{1,99999999999999999999}",
+        r"a{,1}",
+        r"x{",
+        r"{1}",
+        r"]",
+        r"}",
+        r"[a-]",
+        r"[\d-a]",
+        r"[a-\d]",
+        r"[z-a]",
+        r"[\b-\n]",
+        r"(?=a)*",
+        r"(?<=a)*",
+        r"(?!a){2}",
+        r"[[a]&&[b]]",
+        r"[a&&b&&c]",
+        r"[a--b--c]",
+        r"[a&&b--c]",
+        r"[a-z&&b]",
+        r"[\q{abc}]",
+        r"[^\q{abc}]",
+        r"[^\q{a|b}]",
+        r"[^[\q{ab}]]",
+        r"[^[^\q{ab}]]",
+        r"[[\q{ab}]&&a]",
+        r"[^[\q{ab}]&&a]",
+        r"[^a--\q{ab}]",
+        r"[\q{ab}--a]",
+        r"[^\q{ab}--a]",
+        r"[a&&]",
+        r"[&&a]",
+        r"[a!!b]",
+        r"[\!]",
+        r"[(]",
+        r"[a-[b]]",
+        r"[\q{a",
+        r"(?i-i:a)",
+        r"(?-:a)",
+        r"(?ii:a)",
+        r"(?x:a)",
+        r"(?i",
+        r"(?<",
+        r"(?<a",
+        r"(?<a>",
+        r"(?<=",
+        r"a|*",
+        r"\",
+        r"[\",
+        r"(",
+        r")",
+        r"a)",
+        r"\b+",
+        r"^*",
+        r"$+",
+        r"\B{2}",
+        r"\xg",
+        r"\x4",
+        r"\-",
+        r"[\-]",
+        r"\/",
+        r"\a",
+        r"\_",
+        "😀{2}",
+        "[😀-😁]",
+        "[😁-😀]",
+    ];
+    for p in patterns {
+        for flags in ["", "u", "v", "i", "iu"] {
+            for edition in [Edition::Current, Edition::Es2020] {
+                for unicode_version in [UnicodeVersion::Default, UnicodeVersion::V13, UnicodeVersion::V18] {
+                    let Ok(f) = Flags::parse(flags) else { continue };
+                    assert_eq!(
+                        Regex::is_valid_pattern_with(p, f, edition, unicode_version),
+                        Regex::is_valid_with(p, f, edition, unicode_version),
+                        "{p:?}/{flags} {edition:?} {unicode_version:?}"
+                    );
+                }
+            }
         }
     }
 }

@@ -91,6 +91,20 @@ assert!(matches!(Regex::new("a", "uv"), Err(Error::Flags(_))));
 assert!(!Regex::is_valid("(?<n>a)(?<n>b)", "u"));
 ```
 
+`Regex::is_valid` reads a pattern as compiling it would, so a pattern over a limit of size is not valid there.
+`Regex::is_valid_pattern` (and `is_valid_pattern_with`, with an edition and a version of Unicode) asks the grammar
+alone, allocates nothing for a pattern of ordinary size, and counts a pattern too large to compile as valid when its
+grammar is. It is the check for a JSON Schema `format: regex`.
+
+```rust
+use corvus_regex_ecma262::Regex;
+
+let deep = "(".repeat(5000) + &")".repeat(5000);
+assert!(!Regex::is_valid(&deep, "u"));
+assert!(Regex::is_valid_pattern(&deep, "u"));
+assert!(!Regex::is_valid_pattern("(?<n>a)(?<n>b)", "u"));
+```
+
 ## The edition and the version of Unicode
 
 By default a pattern is read with today's grammar, ECMAScript 2025 (`Edition::Current`), and with the tables of the

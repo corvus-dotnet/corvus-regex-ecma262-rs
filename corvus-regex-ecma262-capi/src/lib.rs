@@ -738,6 +738,50 @@ pub unsafe extern "C" fn cre_regex_is_valid_with_options(
     })
 }
 
+/// Whether a pattern is valid in the grammar of the flags: `*out_valid`. It asks the grammar only and allocates
+/// nothing: unlike `cre_regex_is_valid` it does not apply the limits of size, so a pattern too large to compile is
+/// valid here. The status is `CRE_INVALID_UTF8` or `CRE_INVALID_ARGUMENT` for arguments that are not text.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_is_valid_pattern(
+    pattern: *const c_char,
+    pattern_len: usize,
+    flags: *const c_char,
+    flags_len: usize,
+    out_valid: *mut bool,
+) -> cre_status {
+    guard(|| {
+        let slot = unsafe { out(out_valid, "out_valid") }?;
+        *slot = false;
+        let pattern = unsafe { text(pattern, pattern_len, "pattern") }?;
+        let flags = unsafe { text(flags, flags_len, "flags") }?;
+        *slot = Regex::is_valid_pattern(pattern, flags);
+        Ok(())
+    })
+}
+
+/// `cre_regex_is_valid_pattern` in the grammar of an edition (a `CRE_EDITION_` value) and under a version of Unicode
+/// (a `CRE_UNICODE_` value). A value that is not one of the constants is `CRE_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cre_regex_is_valid_pattern_with_options(
+    pattern: *const c_char,
+    pattern_len: usize,
+    flags: *const c_char,
+    flags_len: usize,
+    edition: u32,
+    unicode_version: u32,
+    out_valid: *mut bool,
+) -> cre_status {
+    guard(|| {
+        let slot = unsafe { out(out_valid, "out_valid") }?;
+        *slot = false;
+        let pattern = unsafe { text(pattern, pattern_len, "pattern") }?;
+        let flags = unsafe { text(flags, flags_len, "flags") }?;
+        let (edition, unicode_version) = (edition_of(edition)?, unicode_version_of(unicode_version)?);
+        *slot = Flags::parse(flags).is_ok_and(|f| Regex::is_valid_pattern_with(pattern, f, edition, unicode_version));
+        Ok(())
+    })
+}
+
 /// The edition the regular expression was read with, a `CRE_EDITION_` value (`CRE_EDITION_CURRENT` for NULL).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cre_regex_edition(regex: *const cre_regex) -> u32 {

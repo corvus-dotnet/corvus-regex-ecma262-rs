@@ -93,3 +93,30 @@ fn a_warm_match_allocates_nothing() {
         assert_eq!(n, 0, "/{pattern}/{flags}: {n} allocations in batches");
     }
 }
+
+/// The grammar-only reader allocates nothing for a pattern of ordinary size, valid or not, in any grammar: it keeps
+/// its stacks in place, and a property name as its place in the pattern.
+#[test]
+fn the_grammar_only_reader_allocates_nothing() {
+    let names = (0..12).map(|n| format!("(?<n{n}>a)")).collect::<String>() + r"\k<n11>";
+    let nested = "(?:".repeat(30) + "a" + &")".repeat(30);
+    for (pattern, flags) in [
+        (r"^[a-z][a-z0-9_]{0,29}$", "u"),
+        (r"^(?<year>\d{4})-(?<month>\d{2})\k<year>$", "u"),
+        (r"(?<a>x)|(?<a>y)", "u"),
+        (r"^\p{Script=Greek}+\P{L}$", "u"),
+        (r"[\p{L}--[a-z]&&\q{abc|d}]", "v"),
+        (r"[^\p{RGI_Emoji}]", "v"),
+        (r"(?i:a)(?<=b)(?!c)", ""),
+        (r"\8[\c_]\k{2}", ""),
+        (r"[z-a]", "u"),
+        (r"(?<a>x)(?<a>y)", "u"),
+        (names.as_str(), "u"),
+        (nested.as_str(), "u"),
+    ] {
+        let n = allocations(|| {
+            std::hint::black_box(Regex::is_valid_pattern(pattern, flags));
+        });
+        assert_eq!(n, 0, "/{pattern}/{flags}: {n} allocations");
+    }
+}

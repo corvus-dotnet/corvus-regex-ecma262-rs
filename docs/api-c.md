@@ -419,6 +419,28 @@ cre_status cre_regex_is_valid_with_options(const char *pattern, size_t pattern_l
 cre_regex_is_valid in the grammar of an edition (a CRE_EDITION_ value) and under a version of Unicode (a
 CRE_UNICODE_ value). A value that is not one of the constants is CRE_INVALID_ARGUMENT.
 
+### cre_regex_is_valid_pattern
+
+```c
+cre_status cre_regex_is_valid_pattern(const char *pattern, size_t pattern_len, const char *flags, size_t flags_len,
+                                      bool *out_valid);
+```
+
+Whether a pattern is valid in the grammar of the flags: \*out_valid. It asks the grammar only and allocates nothing:
+unlike cre_regex_is_valid it does not apply the limits of size, so a pattern too large to compile is valid here. The
+status is CRE_INVALID_UTF8 or CRE_INVALID_ARGUMENT for arguments that are not text.
+
+### cre_regex_is_valid_pattern_with_options
+
+```c
+cre_status cre_regex_is_valid_pattern_with_options(const char *pattern, size_t pattern_len, const char *flags,
+                                                   size_t flags_len, uint32_t edition, uint32_t unicode_version,
+                                                   bool *out_valid);
+```
+
+cre_regex_is_valid_pattern in the grammar of an edition (a CRE_EDITION_ value) and under a version of Unicode (a
+CRE_UNICODE_ value). A value that is not one of the constants is CRE_INVALID_ARGUMENT.
+
 ### cre_regex_edition
 
 ```c

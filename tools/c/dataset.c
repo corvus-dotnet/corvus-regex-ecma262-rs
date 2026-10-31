@@ -51,6 +51,9 @@ static const char REPLACEMENT[] = "<$&|$1|$2|$10|$<a>|$$|$`|$'>";
 
 typedef struct {
     long long right, wrong, refused, accepted, limited, errors;
+    /* The answers of the grammar-only reader that agree with V8's on whether a pattern is valid, and those that do
+     * not. */
+    long long reader_right, reader_wrong;
 } counts;
 
 static void counts_add(counts *a, const counts *b) {
@@ -60,6 +63,8 @@ static void counts_add(counts *a, const counts *b) {
     a->accepted += b->accepted;
     a->limited += b->limited;
     a->errors += b->errors;
+    a->reader_right += b->reader_right;
+    a->reader_wrong += b->reader_wrong;
 }
 
 typedef struct {
@@ -1523,9 +1528,43 @@ static void write_compliance(const char *path, const options *o, const counts *t
     fclose(f);
 }
 
+#ifndef DATASET_QUICKJS
+/* Asks the grammar-only reader (cre_regex_is_valid_pattern) whether the pattern is valid in each grammar of the record,
+ * as V8 answered. It reads no limit of size, so its answer is the grammar's for a pattern of any size. */
+static void judge_reader(const char *name, const json *r, const json *pattern, counts *c, lines *w) {
+    const json *flags_j = json_string(json_get(r, "flags"));
+    size_t flags_len, pattern_len;
+    char *flags = utf16_to_utf8_lossy(flags_j ? flags_j->units : NULL, flags_j ? flags_j->len : 0, &flags_len);
+    char *p8 = utf16_to_utf8_lossy(pattern->units, pattern->len, &pattern_len);
+    mode modes[3];
+    size_t mode_count = modes_of(r, modes);
+    for (size_t m = 0; m < mode_count; m++) {
+        char mode_flags[32];
+        snprintf(mode_flags, sizeof mode_flags, "%s%s", flags, modes[m].suffix);
+        bool valid = false;
+        if (cre_regex_is_valid_pattern(p8, pattern_len, mode_flags, strlen(mode_flags), &valid) != CRE_OK) valid = false;
+        if (valid == modes[m].valid) {
+            c->reader_right++;
+            continue;
+        }
+        c->reader_wrong++;
+        sbuf b = {0};
+        sb_printf(&b, "READER\t%s\t/", name);
+        sb_shown(&b, pattern);
+        sb_printf(&b, "/%s\tV8 says %s", mode_flags, modes[m].valid ? "valid" : "not valid");
+        lines_push(w, &b);
+    }
+    free(flags);
+    free(p8);
+}
+#endif
+
 static void judge_record(const char *name, const json *r, const options *o, counts *c, lines *w) {
     const json *pattern = json_string(json_get(r, "pattern"));
     if (!pattern) return;
+#ifndef DATASET_QUICKJS
+    if (strcmp(name, EXEC) != 0) judge_reader(name, r, pattern, c, w);
+#endif
     if (strcmp(name, EXEC) == 0) {
         judge_exec(r, pattern, o, c, w);
         return;
@@ -1759,5 +1798,8 @@ int main(int argc, char **argv) {
            "limit %lld  errors %lld  in %.1fs\n",
            records, skipped, total.right, total.wrong, total.refused, total.accepted, total.limited, total.errors,
            now_seconds() - start);
-    return total.wrong + total.refused + total.accepted + total.errors + total.limited == 0 ? 0 : 1;
+#ifndef DATASET_QUICKJS
+    printf("grammar-only reader: right %lld  wrong %lld\n", total.reader_right, total.reader_wrong);
+#endif
+    return total.wrong + total.refused + total.accepted + total.errors + total.limited + total.reader_wrong == 0 ? 0 : 1;
 }

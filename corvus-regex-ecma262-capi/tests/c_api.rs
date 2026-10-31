@@ -805,4 +805,30 @@ fn the_edition_and_the_version_of_unicode_are_settings_of_their_own() {
     assert_eq!(check(CRE_EDITION_CURRENT, 5, &mut valid), CRE_INVALID_ARGUMENT);
     assert!(!valid);
     assert_eq!(unsafe { cre_regex_unicode_version(std::ptr::null()) }, 0);
+
+    // The grammar-only reader: the same grammar, and no limit of size.
+    let check = |pattern: &str, edition, valid: &mut bool| unsafe {
+        cre_regex_is_valid_pattern_with_options(
+            ptr(pattern),
+            pattern.len(),
+            ptr("u"),
+            1,
+            edition,
+            CRE_UNICODE_13,
+            valid,
+        )
+    };
+    assert_eq!(check("\\p{Script=Yezidi}", CRE_EDITION_ES2020, &mut valid), CRE_OK);
+    assert!(!valid);
+    assert_eq!(check("\\p{Script=Yezidi}", CRE_EDITION_CURRENT, &mut valid), CRE_OK);
+    assert!(valid);
+    let deep = "(".repeat(5000) + &")".repeat(5000);
+    assert_eq!(check(&deep, CRE_EDITION_CURRENT, &mut valid), CRE_OK);
+    assert!(valid);
+    assert_eq!(unsafe { cre_regex_is_valid(ptr(&deep), deep.len(), ptr("u"), 1, &mut valid) }, CRE_OK);
+    assert!(!valid);
+    assert_eq!(unsafe { cre_regex_is_valid_pattern(ptr(&deep), deep.len(), ptr("u"), 1, &mut valid) }, CRE_OK);
+    assert!(valid);
+    assert_eq!(check("(?i:a)", 9, &mut valid), CRE_INVALID_ARGUMENT);
+    assert!(!valid);
 }

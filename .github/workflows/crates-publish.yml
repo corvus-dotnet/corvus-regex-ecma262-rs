@@ -78,7 +78,7 @@ jobs:
       if: steps.version.outputs.published == 'false'
       with:
         repository: corvus-dotnet/ecma262-regex-test-data
-        ref: 36e8b71c181fa10554760f461dc8c526fd3ffb42
+        ref: e3041c18c5f5ce40c18af25023085c60befa16d8
         path: ecma262-regex-test-data
         persist-credentials: false
     - name: Run the ECMA-262 test data

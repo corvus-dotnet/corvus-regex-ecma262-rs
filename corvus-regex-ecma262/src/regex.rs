@@ -324,6 +324,44 @@ impl Regex {
         on_a_deep_stack(pattern, flags.unicode_sets, || parse::parse_with(pattern, syntax).is_ok()).unwrap_or(false)
     }
 
+    /// Whether the pattern is valid in the grammar of the flags, decided with nothing allocated (see
+    /// [`Regex::is_valid_pattern_with`]). Unlike [`Regex::is_valid`], it does not apply the limits of size, so a
+    /// pattern too large to compile is valid here.
+    pub fn is_valid_pattern(pattern: &str, flags: &str) -> bool {
+        let Ok(flags) = Flags::parse(flags) else { return false };
+        Regex::is_valid_pattern_with(pattern, flags, Edition::Current, UnicodeVersion::Default)
+    }
+
+    /// Whether the pattern is valid in the grammar of ECMA-262 for the flags, of an edition and under a version of
+    /// Unicode. It asks the grammar only: unlike [`Regex::is_valid_with`], which reads the pattern as compiling it
+    /// would, it does not apply this engine's limits of size ([`MAX_PATTERN_LENGTH`](crate::MAX_PATTERN_LENGTH),
+    /// [`MAX_NESTING`](crate::MAX_NESTING), [`MAX_SIZE`](crate::MAX_SIZE)), so a pattern too large to compile is valid
+    /// here. It reads the pattern in place with stacks of its own, so no pattern can overflow the stack of the thread,
+    /// and it allocates nothing unless the pattern's groups nest more than 32 deep or it has more than 12 named groups.
+    /// The u and v flags choose the grammar, and the others do not change it. It is `false` too when the flags and the
+    /// edition are not valid together.
+    ///
+    /// ```
+    /// use corvus_regex_ecma262::{Edition, Flags, Regex, UnicodeVersion};
+    ///
+    /// let u = Flags { unicode: true, ..Flags::default() };
+    /// // Valid in the grammar, though over the limits of size, so `is_valid_with` says no.
+    /// let deep = "(".repeat(5000) + &")".repeat(5000);
+    /// assert!(Regex::is_valid_pattern_with(&deep, u, Edition::Current, UnicodeVersion::Default));
+    /// assert!(!Regex::is_valid_with(&deep, u, Edition::Current, UnicodeVersion::Default));
+    /// // ECMAScript 2020 has no modifier groups.
+    /// assert!(!Regex::is_valid_pattern_with("(?i:a)", u, Edition::Es2020, UnicodeVersion::Default));
+    /// ```
+    pub fn is_valid_pattern_with(
+        pattern: &str,
+        flags: Flags,
+        edition: Edition,
+        unicode_version: UnicodeVersion,
+    ) -> bool {
+        let Ok(syntax) = syntax_of(flags, edition, unicode_version) else { return false };
+        super::validate::is_valid(pattern, syntax)
+    }
+
     pub(crate) fn from_tree(
         pattern: &str,
         flags: Flags,

@@ -8,7 +8,9 @@
 //! v added (the `unicode_sets` answers). A text is matched as UTF-16 and as UTF-8; a text with a lone surrogate has no
 //! UTF-8 form and is matched as UTF-16 alone. Records marked v8_deviation are left out. Any difference from V8 is a
 //! wrong answer; a refusal of a valid pattern, an acceptance of an invalid one, and a match that reaches its limit are
-//! counted apart and listed too. `captures.jsonl` is judged on exec, the global search, the sticky flag, replace and
+//! counted apart and listed too. With this crate, each record is also asked of the grammar-only reader
+//! (`Regex::is_valid_pattern_with`) in every grammar the record names, valid or not, and its answer must be V8's
+//! (`READER` lines, and the `grammar-only reader` line of the report). `captures.jsonl` is judged on exec, the global search, the sticky flag, replace and
 //! split, as the .NET runner of the reference engine judges it. `ill-formed-utf8.jsonl` holds bytes that are not
 //! UTF-8, whose right answer over UTF-8 is a refusal: a `str` cannot hold them, so the bytes are refused where they
 //! would become one, before the engine, as a program that uses it refuses them (both engines take a `str`).
@@ -47,7 +49,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use corvus_regex_ecma262::{Edition, Error, MatchError, Regex, RegexBuilder, UnicodeVersion};
+use corvus_regex_ecma262::{Edition, Error, Flags, MatchError, Regex, RegexBuilder, UnicodeVersion};
 use corvus_regex_ecma262_tools::json::{self, Json, escape};
 
 const LIMIT: Duration = Duration::from_secs(2);
@@ -66,6 +68,11 @@ fn corvus_new(pattern: &str, flags: &str) -> Result<Regex, Error> {
     let (edition, unicode_version) = SETTINGS.get().copied().unwrap_or_default();
     RegexBuilder::new(pattern).flags(flags).edition(edition).unicode_version(unicode_version).build()
 }
+
+/// The answers of the grammar-only reader (`Regex::is_valid_pattern_with`) that agree with V8's on whether a pattern
+/// is valid, and those that do not. Each record is asked about in each grammar, as the parser is.
+static READER_RIGHT: AtomicI64 = AtomicI64::new(0);
+static READER_WRONG: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Default)]
 struct Counts {
@@ -222,7 +229,33 @@ fn main() {
         skipped.load(Ordering::Relaxed),
         clock.elapsed().as_secs_f64()
     );
-    std::process::exit(if wrong + refused + accepted + errors + limited == 0 { 0 } else { 1 });
+    let (reader_right, reader_wrong) = (READER_RIGHT.load(Ordering::Relaxed), READER_WRONG.load(Ordering::Relaxed));
+    if engine == EngineKind::Corvus {
+        println!("grammar-only reader: right {reader_right}  wrong {reader_wrong}");
+    }
+    std::process::exit(if wrong + refused + accepted + errors + limited + reader_wrong == 0 { 0 } else { 1 });
+}
+
+/// Asks the grammar-only reader whether the pattern is valid in each grammar of the record, as V8 answered. It reads
+/// no limit of size, so its answer is the grammar's for a pattern of any size.
+fn judge_reader(name: &str, r: &Json, pattern: &str, wrong: &mut Vec<String>) {
+    let (edition, unicode_version) = SETTINGS.get().copied().unwrap_or_default();
+    let flags = r.get("flags").and_then(Json::as_string).unwrap();
+    for (suffix, _, expected_valid) in modes(r) {
+        let mode_flags = format!("{flags}{suffix}");
+        let valid =
+            Flags::parse(&mode_flags).is_ok_and(|f| Regex::is_valid_pattern_with(pattern, f, edition, unicode_version));
+        if valid == expected_valid {
+            READER_RIGHT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            READER_WRONG.fetch_add(1, Ordering::Relaxed);
+            let shown = escape(&pattern.encode_utf16().collect::<Vec<u16>>());
+            wrong.push(format!(
+                "READER\t{name}\t/{shown}/{mode_flags}\tV8 says {}",
+                if expected_valid { "valid" } else { "not valid" }
+            ));
+        }
+    }
 }
 
 /// Writes the engine's compliance as the benchmark page reads it: the counts (right, wrong, refused, accepted invalid,
@@ -562,6 +595,9 @@ fn end_at_limit() -> ! {
 
 fn judge_record(name: &str, r: &Json, options: &Options, counts: &Counts, wrong: &mut Vec<String>) {
     let pattern = r.get("pattern").and_then(Json::as_string).unwrap();
+    if options.engine == EngineKind::Corvus && name != EXEC {
+        judge_reader(name, r, &pattern, wrong);
+    }
     if name == EXEC {
         match options.engine {
             EngineKind::Corvus => judge_exec(r, &pattern, options, counts, wrong),
