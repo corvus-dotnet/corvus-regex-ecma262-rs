@@ -120,6 +120,7 @@ mod tables18;
 mod tests;
 mod ucd;
 mod units;
+mod validate;
 mod vm;
 
 use std::fmt::{self, Write as _};

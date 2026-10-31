@@ -30,6 +30,16 @@ version of Unicode (`UnicodeVersion::Default`, 17 today). A `RegexBuilder` overr
 flags and the match timeout, the builder being how the `regex` crate takes settings: `Edition::Es2020` is the grammar
 JSON Schema 2020-12 names, and the versions are 13, 17, 18 and latest. Both are resolved when the pattern is compiled.
 
+**Validity.** `Regex::is_valid` and `is_valid_with` read a pattern as compiling it would, so a pattern over a limit of
+size is not valid there. `Regex::is_valid_pattern` and `is_valid_pattern_with` ask the grammar alone, as the .NET
+engine's `IsValidPattern` does: a pattern too large to compile is valid there when its grammar is. They read the
+pattern in place (`validate.rs`, a port of the .NET engine's `EcmaRegexValidator` that makes the parser's decision at
+each step), with the groups and the nested classes of the v flag on stacks of their own, so no pattern can overflow
+the stack, and they allocate nothing unless the groups nest more than 32 deep or there are more than 12 named groups.
+The data-set runner asks the reader about every record in every grammar and checks its answer against V8's
+(`grammar-only reader` in its report). This is what a JSON Schema `format: regex` check needs: the grammar, whatever
+an engine's limits.
+
 **Errors.** A pattern that does not compile is an `Error`: `Invalid`, `Flags` or `TooLarge` (with the limit), never a
 panic. Every method that matches returns `Result<_, MatchError>`, which is `Err` only when a match reaches its limit
 (`Time` or `Memory`).

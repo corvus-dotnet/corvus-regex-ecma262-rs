@@ -290,6 +290,27 @@ impl Ucd {
         (self.data.binary_table)(name).map(Ranges::Table)
     }
 
+    /// Whether [`Ucd::category`] has a table for the name, without building it.
+    pub(crate) fn has_category(&'static self, name: &str) -> bool {
+        matches!(name, "L" | "LC" | "M" | "N" | "P" | "S" | "Z" | "C") || (self.data.category_table)(name).is_some()
+    }
+
+    /// Whether [`Ucd::binary`] has a table for the name, without building it.
+    pub(crate) fn has_binary(&'static self, name: &str) -> bool {
+        name == "Assigned" || (self.data.binary_table)(name).is_some()
+    }
+
+    /// Whether [`Ucd::script`] has a table for the name, without building it.
+    pub(crate) fn has_script(&'static self, name: &str) -> bool {
+        matches!(name, "Unknown" | "Zzzz" | "Katakana_Or_Hiragana" | "Hrkt") || (self.data.script_table)(name).is_some()
+    }
+
+    /// Whether [`Ucd::script_extensions`] has a table for the name, without building it.
+    pub(crate) fn has_script_extensions(&'static self, name: &str) -> bool {
+        matches!(name, "Unknown" | "Zzzz" | "Katakana_Or_Hiragana" | "Hrkt")
+            || (self.data.script_extensions_table)(name).is_some()
+    }
+
     /// The generated table of a binary property, for the callers that test one code point.
     pub(crate) fn binary_table(&'static self, name: &str) -> Option<&'static Table> {
         (self.data.binary_table)(name)

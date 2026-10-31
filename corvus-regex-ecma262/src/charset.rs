@@ -264,6 +264,30 @@ fn property_pairs(ucd: &'static Ucd, expr: &str) -> Option<Vec<Rune>> {
     }
 }
 
+/// Whether a property expression names a property, as [`property_set`] would find it, without building its set.
+pub(crate) fn has_property(ucd: &'static Ucd, expr: &str) -> bool {
+    let category = |value: &str| category_name(value).is_some_and(|name| ucd.has_category(name));
+    if let Some((name, value)) = expr.split_once('=') {
+        return match name {
+            "General_Category" | "gc" => category(value),
+            "Script" | "sc" => ucd.has_script(value),
+            "Script_Extensions" | "scx" => ucd.has_script_extensions(value),
+            _ => false,
+        };
+    }
+    category(expr)
+        || match binary_name(expr) {
+            Some("ASCII" | "Any") => true,
+            Some(canonical) => ucd.has_binary(canonical),
+            None => false,
+        }
+}
+
+/// Whether a name is that of a property of strings, as [`string_property`] would find it, without building it.
+pub(crate) fn has_string_property(ucd: &'static Ucd, name: &str) -> bool {
+    name == "RGI_Emoji" || ucd.data.strings.iter().any(|(n, _, _)| *n == name)
+}
+
 fn category_pairs(ucd: &'static Ucd, value: &str) -> Option<Vec<Rune>> {
     ucd.category(category_name(value)?).map(|t| t.pairs())
 }
