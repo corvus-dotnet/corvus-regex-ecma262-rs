@@ -337,9 +337,9 @@ impl Regex {
     /// would, it does not apply this engine's limits of size ([`MAX_PATTERN_LENGTH`](crate::MAX_PATTERN_LENGTH),
     /// [`MAX_NESTING`](crate::MAX_NESTING), [`MAX_SIZE`](crate::MAX_SIZE)), so a pattern too large to compile is valid
     /// here. It reads the pattern in place with stacks of its own, so no pattern can overflow the stack of the thread,
-    /// and it allocates nothing unless the pattern's groups nest more than 32 deep or it has more than 12 named groups.
-    /// The u and v flags choose the grammar, and the others do not change it. It is `false` too when the flags and the
-    /// edition are not valid together.
+    /// its memory is in proportion to the pattern, and it allocates nothing unless the pattern's groups nest more than
+    /// 64 deep, it has more than 63 groups, or it has more than 12 named groups. The u and v flags choose the grammar,
+    /// and the others do not change it. It is `false` too when the flags and the edition are not valid together.
     ///
     /// ```
     /// use corvus_regex_ecma262::{Edition, Flags, Regex, UnicodeVersion};
