@@ -5,8 +5,9 @@
 //! It reads the pattern where it lies, decoding a character only where the grammar needs it. It keeps the groups and
 //! the nested classes of the v flag on stacks of its own rather than recursing, so that no pattern can overflow the
 //! stack of the thread, and it keeps a group name as its place in the pattern. Each stack holds its first entries in
-//! place and moves to the heap only beyond them, which takes groups nested more deeply than 32, or more than 12
-//! named groups (or their paths) at once. It asks the grammar only: the parser's limits of size (the length of the
+//! place and moves to the heap only beyond them, which takes groups nested more deeply than 64, more than 63 groups,
+//! or more than 12 named groups. A named group keeps the disjunction and the alternative it lies in, never a copy of the
+//! path to it, so the memory is in proportion to the pattern however deeply the named groups nest. It asks the grammar only: the parser's limits of size (the length of the
 //! pattern, the nesting of groups, the size it counts) belong to compiling a pattern, and none of them applies here.
 //!
 //! Each method follows the method of the parser with the same name, and makes the same decision at each step. A
@@ -28,6 +29,13 @@ const KIND_LOOKBEHIND: usize = 2;
 
 // A frame of a class of the v flag: whether it is negated, its phase, its operator, whether it may contain strings.
 const CLASS_FRAME: usize = 4;
+/// The entries of a disjunction in `disjunction_table`.
+const DISJUNCTION_FRAME: usize = 4;
+
+/// The place in `disjunction_table` of a disjunction's entries.
+fn frame(disjunction: usize) -> usize {
+    (disjunction - 1) * DISJUNCTION_FRAME
+}
 const PHASE_START: usize = 0;
 const PHASE_UNION: usize = 1;
 const PHASE_OPERANDS: usize = 2;
@@ -116,14 +124,18 @@ struct Validator<'a> {
     has_names: bool,
     group_count: i64,
     disjunctions: usize,
-    /// The alternatives that enclose the position, as disjunction and alternative (the parser's path).
+    /// The disjunctions open at the position, outermost first (the parser's path, whose alternatives are in
+    /// `disjunction_table`).
     path: Stack<64>,
     /// The groups open at the position: the kind of each.
-    frames: Stack<32>,
-    /// Each named group: the start and the end of its name, the start and the length of its path in `name_paths`,
+    frames: Stack<64>,
+    /// Each named group: the start and the end of its name, the disjunction and the alternative it lies directly in,
     /// and the hash of its name.
     names: Stack<64>,
-    name_paths: Stack<64>,
+    /// Each disjunction, by its number from 1, as `DISJUNCTION_FRAME` entries: the disjunction it lies in (0 for the
+    /// pattern's own) and the alternative of that one it lies in, its own current alternative, and whether it is still
+    /// open. A closed disjunction's first two entries may be moved on to an ancestor (see `separate_alternatives`).
+    disjunction_table: Stack<256>,
     names_table: NameTable,
     distinct_names: usize,
     /// Each named reference: the start and the end of its name.
@@ -169,7 +181,7 @@ impl<'a> Validator<'a> {
             path: Stack::new(),
             frames: Stack::new(),
             names: Stack::new(),
-            name_paths: Stack::new(),
+            disjunction_table: Stack::new(),
             names_table: NameTable { inline: [0; 32], heap: Vec::new() },
             distinct_names: 0,
             references: Stack::new(),
@@ -248,8 +260,8 @@ impl<'a> Validator<'a> {
             let c = self.peek();
             if c == ch('|') {
                 self.next();
-                let last = self.path.len - 1;
-                self.path.items_mut()[last] += 1;
+                let frame = frame(self.path.items()[self.path.len - 1]);
+                self.disjunction_table.items_mut()[frame + 2] += 1;
                 continue;
             }
             if c == ch(')') {
@@ -258,7 +270,8 @@ impl<'a> Validator<'a> {
                     return false;
                 }
                 self.next();
-                self.path.truncate(self.path.len - 2);
+                let frame = frame(self.path.pop());
+                self.disjunction_table.items_mut()[frame + 3] = 0;
                 let kind = self.frames.pop();
                 // Annex B lets a quantifier follow a lookahead. The u flag does not, and neither lets one follow a
                 // lookbehind.
@@ -299,9 +312,13 @@ impl<'a> Validator<'a> {
     }
 
     fn push_disjunction(&mut self) {
+        let up = if self.path.len == 0 { 0 } else { self.path.items()[self.path.len - 1] };
+        let up_alternative = if up == 0 { 0 } else { self.disjunction_table.items()[frame(up) + 2] };
+        for v in [up, up_alternative, 0, 1] {
+            self.disjunction_table.push(v);
+        }
         self.disjunctions += 1;
         self.path.push(self.disjunctions);
-        self.path.push(0);
     }
 
     /// Counts the capturing groups of the pattern and notes whether any is named.
@@ -493,18 +510,16 @@ impl<'a> Validator<'a> {
         let found = self.find_name(start, stop, hash);
         if let Ok(slot) = found {
             let last = self.names_table.slots()[slot] - 1;
-            let (path_start, path_len) = (self.names.items()[last + 2], self.names.items()[last + 3]);
-            if self.es2020 || !self.separate_alternatives(path_start, path_len) {
+            let (disjunction, alternative) = (self.names.items()[last + 2], self.names.items()[last + 3]);
+            if self.es2020 || !self.separate_alternatives(disjunction, alternative) {
                 return None;
             }
         }
         let entry = self.names.len;
-        for v in [start, stop, self.name_paths.len, self.path.len, hash] {
+        let disjunction = self.path.items()[self.path.len - 1];
+        let alternative = self.disjunction_table.items()[frame(disjunction) + 2];
+        for v in [start, stop, disjunction, alternative, hash] {
             self.names.push(v);
-        }
-        for k in 0..self.path.len {
-            let v = self.path.items()[k];
-            self.name_paths.push(v);
         }
         match found {
             Ok(slot) => self.names_table.slots_mut()[slot] = entry + 1,
@@ -513,19 +528,24 @@ impl<'a> Validator<'a> {
         Some(KIND_GROUP)
     }
 
-    /// Whether a named group (by the start and the length of its path) and the current position lie in different
-    /// alternatives of some disjunction.
-    fn separate_alternatives(&self, other_start: usize, other_len: usize) -> bool {
-        let (other, path) = (&self.name_paths.items()[other_start..other_start + other_len], self.path.items());
-        for (x, y) in other.as_chunks::<2>().0.iter().zip(path.as_chunks::<2>().0) {
-            if x[0] != y[0] {
-                break;
+    /// Whether a named group, by the disjunction and the alternative it lies directly in, and the current position lie
+    /// in different alternatives of some disjunction: of the innermost disjunction around the group that is still
+    /// open, which is the innermost around both. A disjunction never opens again once closed, so the walk out of
+    /// closed ones moves each one it passes on to its grandparent, and the walks take time in proportion to the
+    /// pattern in all.
+    fn separate_alternatives(&mut self, mut disjunction: usize, mut alternative: usize) -> bool {
+        let table = self.disjunction_table.items_mut();
+        while table[frame(disjunction) + 3] == 0 {
+            let at = frame(disjunction);
+            let up = frame(table[at]);
+            if table[up + 3] == 0 {
+                table[at] = table[up];
+                table[at + 1] = table[up + 1];
             }
-            if x[1] != y[1] {
-                return true;
-            }
+            alternative = table[at + 1];
+            disjunction = table[at];
         }
-        false
+        table[frame(disjunction) + 2] != alternative
     }
 
     /// Reads the modifiers of a group such as `(?i:...)` or `(?s-i:...)`, after the `(?`, to its `:`.
